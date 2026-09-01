@@ -320,6 +320,10 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           value: originalMethod.name,
           configurable: true,
         });
+        Object.defineProperty(boundFn, "length", {
+          value: originalMethod.length,
+          configurable: true,
+        });
         const metadataKeys = Reflect.getMetadataKeys(originalMethod);
         for (const key of metadataKeys) {
           const metadata = Reflect.getMetadata(key, originalMethod);

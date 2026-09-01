@@ -71,6 +71,10 @@ describe("createInstanceDecorator", () => {
       async findAsync() {
         return "async-ok";
       }
+
+      store(_req: unknown, _meta: unknown, _done: unknown) {
+        return "stored";
+      }
     }
 
     it("records a trace step named after the class and method", () => {
@@ -193,6 +197,14 @@ describe("createInstanceDecorator", () => {
       const service = decorate(new UserService()) as UserService;
 
       expect(service.findAll.name).toEqual("findAll");
+    });
+
+    it("keeps the original arity on the returned wrapper", () => {
+      // Libraries such as passport-oauth2 read `fn.length` to choose which
+      // arguments to pass, thus a wrapper reporting 0 changes the call.
+      const service = decorate(new UserService()) as UserService;
+
+      expect(service.store.length).toEqual(3);
     });
 
     it("forwards arguments and preserves `this`", () => {
