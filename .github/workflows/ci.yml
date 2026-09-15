@@ -31,9 +31,9 @@ jobs:
         # the regression nobody notices locally.
         node: ["20.19", "22", "24"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4.4.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
