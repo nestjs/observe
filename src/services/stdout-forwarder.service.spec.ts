@@ -1,3 +1,4 @@
+import { ConsoleLogger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
@@ -51,8 +52,16 @@ describe("StdoutForwarderService", () => {
   };
 
   /** Feeds a chunk through the same path a stdout write takes. */
-  const write = (service: StdoutForwarderService, chunk: string) =>
-    (service as unknown as { consume(chunk: string): void }).consume(chunk);
+  const write = (
+    service: StdoutForwarderService,
+    chunk: string,
+    stream: "stdout" | "stderr" = "stdout",
+  ) =>
+    (
+      service as unknown as {
+        consume(chunk: string, stream: "stdout" | "stderr"): void;
+      }
+    ).consume(chunk, stream);
 
   describe("chunk reassembly", () => {
     it("forwards a complete line", () => {
@@ -301,6 +310,45 @@ describe("StdoutForwarderService", () => {
       );
     });
 
+    it("forwards stderr too, so error lines are not lost", () => {
+      const service = build();
+      // ConsoleLogger writes `error` to stderr and every other level to stdout.
+      const logger = new ConsoleLogger("Payments", { json: true });
+      // A no-op underneath the patch keeps the stack trace out of the test
+      // output while still exercising the real wrapper.
+      const realStderr = process.stderr.write;
+      const silent = (() => true) as typeof process.stderr.write;
+      process.stderr.write = silent;
+
+      try {
+        service.start();
+        expect(process.stderr.write).not.toBe(silent);
+        logger.error("charge failed", new Error("declined").stack);
+        service.onModuleDestroy();
+        expect(process.stderr.write).toBe(silent);
+      } finally {
+        process.stderr.write = realStderr;
+      }
+
+      expect(
+        buffer.entries.map((entry) => [entry.level, entry.text]),
+      ).toContainEqual(["error", "charge failed"]);
+    });
+
+    it("keeps a fragment on stdout apart from one on stderr", () => {
+      const service = build();
+
+      write(service, "half of stdout ", "stdout");
+      write(service, "half of stderr ", "stderr");
+      write(service, "done\n", "stdout");
+      write(service, "done\n", "stderr");
+
+      expect(buffer.entries.map((entry) => entry.text)).toEqual([
+        "half of stdout done",
+        "half of stderr done",
+      ]);
+    });
+
     it("does not patch twice", () => {
       const service = build();
 
@@ -347,6 +395,7 @@ describe("StdoutForwarderService", () => {
 
     it("survives repeated start and restore cycles", () => {
       const original = process.stdout.write;
+      const originalStderr = process.stderr.write;
 
       for (let i = 0; i < 3; i++) {
         const service = build();
@@ -355,6 +404,7 @@ describe("StdoutForwarderService", () => {
       }
 
       expect(process.stdout.write).toBe(original);
+      expect(process.stderr.write).toBe(originalStderr);
     });
 
     it("restores stdout even if it was never patched", () => {

@@ -39,18 +39,30 @@ const MAX_PARTIAL_LINE_LENGTH = 8 * 1024;
  */
 const MAX_PARSED_LINE_LENGTH = 16 * 1024;
 
+const FORWARDED_STREAMS = ["stdout", "stderr"] as const;
+type ForwardedStream = (typeof FORWARDED_STREAMS)[number];
+
 @Injectable()
 export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(StdoutForwarderService.name);
 
   /**
-   * stdout arrives in chunks, not lines: a single write can carry half a line,
+   * Output arrives in chunks, not lines: a single write can carry half a line,
    * several lines, or a line split across two calls. Parsing a chunk directly
    * would mangle every log that straddles a boundary, so the trailing fragment
    * is held here until its newline shows up.
+   *
+   * One fragment per stream: stdout and stderr interleave freely, and joining
+   * the tail of one onto the head of the other would fuse two unrelated lines.
    */
-  private partialLine = "";
-  private originalWrite: typeof process.stdout.write | null = null;
+  private readonly partialLines: Record<ForwardedStream, string> = {
+    stdout: "",
+    stderr: "",
+  };
+  private originalWrites: Record<
+    ForwardedStream,
+    typeof process.stdout.write
+  > | null = null;
 
   /**
    * Null only when redaction has been switched off explicitly. Defaulting to on
@@ -86,28 +98,44 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     this.restore();
   }
 
+  /**
+   * Patches both stdout and stderr. Nest's `ConsoleLogger` writes `error` to
+   * stderr and every other level to stdout, so a stdout-only patch forwarded
+   * warnings and fatals but never a single error - including the line the
+   * exceptions handler writes for every unhandled exception.
+   */
   start() {
-    if (this.originalWrite) {
+    if (this.originalWrites) {
       return;
     }
 
-    // The unbound original is kept, so `restore` puts back exactly what was
+    // The unbound originals are kept, so `restore` puts back exactly what was
     // there. Storing the bound copy instead meant every start/restore cycle
     // left one more `bind` wrapper on the stream - and this module is designed
     // to be torn down and recreated.
-    this.originalWrite = process.stdout.write;
-    const originalWrite = process.stdout.write.bind(process.stdout);
+    this.originalWrites = {
+      stdout: process.stdout.write,
+      stderr: process.stderr.write,
+    };
+    for (const name of FORWARDED_STREAMS) {
+      this.patch(name);
+    }
+  }
 
-    process.stdout.write = ((
+  private patch(name: ForwardedStream) {
+    const stream = process[name];
+    const originalWrite = stream.write.bind(stream);
+
+    stream.write = ((
       chunk: string | Uint8Array,
       encoding?: BufferEncoding,
       callback?: (err?: Error | null) => void,
     ) => {
       if (typeof chunk === "string") {
         // Never let a forwarding failure take down the write it wrapped -
-        // stdout has to keep working even if telemetry does not.
+        // the stream has to keep working even if telemetry does not.
         try {
-          this.consume(chunk);
+          this.consume(chunk, name);
         } catch {
           // Intentionally silent: logging here would re-enter this same patched
           // write and recurse.
@@ -118,28 +146,30 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Restores the original stdout.write.
+   * Restores the original stdout and stderr writes.
    *
    * Without this the patch outlives the module - which matters in tests, where
    * a torn-down app would keep pushing into a buffer nobody drains, and in any
    * process that recreates the Nest application.
    */
   private restore() {
-    if (!this.originalWrite) {
+    if (!this.originalWrites) {
       return;
     }
-    this.flushPartial();
-    process.stdout.write = this.originalWrite;
-    this.originalWrite = null;
+    for (const name of FORWARDED_STREAMS) {
+      this.flushPartial(name);
+      process[name].write = this.originalWrites[name];
+    }
+    this.originalWrites = null;
   }
 
-  private consume(chunk: string) {
-    const combined = this.partialLine + chunk;
+  private consume(chunk: string, name: ForwardedStream = "stdout") {
+    const combined = this.partialLines[name] + chunk;
     const segments = combined.split("\n");
 
     // The final segment has no newline yet, so it is either an incomplete line
     // or the empty string left by a chunk that ended cleanly.
-    this.partialLine = segments.pop() ?? "";
+    this.partialLines[name] = segments.pop() ?? "";
 
     const entries = segments
       .filter((line) => line.trim().length > 0)
@@ -149,18 +179,18 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       this.observeAgentSharedBuffer.pushLogs(entries);
     }
 
-    if (this.partialLine.length > MAX_PARTIAL_LINE_LENGTH) {
-      this.flushPartial();
+    if (this.partialLines[name].length > MAX_PARTIAL_LINE_LENGTH) {
+      this.flushPartial(name);
     }
   }
 
-  private flushPartial() {
-    if (this.partialLine.trim().length === 0) {
-      this.partialLine = "";
+  private flushPartial(name: ForwardedStream) {
+    const partialLine = this.partialLines[name];
+    this.partialLines[name] = "";
+    if (partialLine.trim().length === 0) {
       return;
     }
-    this.observeAgentSharedBuffer.pushLogs([this.toLogEntry(this.partialLine)]);
-    this.partialLine = "";
+    this.observeAgentSharedBuffer.pushLogs([this.toLogEntry(partialLine)]);
   }
 
   private toLogEntry(rawLine: string) {

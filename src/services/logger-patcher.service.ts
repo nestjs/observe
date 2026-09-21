@@ -87,28 +87,27 @@ export class LoggerPatcherService implements OnModuleInit {
 
     ConsoleLogger.prototype["formatMessage"] = function (
       this: ConsoleLogger,
-      logLevel: LogLevel,
-      message: unknown,
-      pidMessage: string,
-      formattedLogLevel: string,
-      contextMessage: string,
-      timestampDiff: string,
+      // Everything Nest passes is forwarded untouched. Naming the parameters
+      // once pinned this wrapper to one release's signature: Nest 12 added a
+      // seventh (`params`), and a wrapper that forwarded six silently dropped
+      // every structured param from text-mode output.
+      ...args: Parameters<typeof originalFormatMessage>
     ) {
+      const output: string = originalFormatMessage.apply(this, args);
       const store = asyncLocalStorage.getStore();
       const requestId = store?.get(options.traceIdKey);
-      const output = originalFormatMessage.call(
-        this,
-        logLevel,
-        message,
-        pidMessage,
-        formattedLogLevel,
-        contextMessage,
-        timestampDiff,
-      );
-      if (requestId) {
-        return `${output}   Trace ID: ${this.colorize(requestId, logLevel)}\n`;
+      if (!requestId) {
+        return output;
       }
-      return output;
+      // The suffix has to sit before the line's own newline. Appended after
+      // it, the id lands on a line of its own - which the stdout forwarder
+      // then ships as a separate, level-less entry, and the parser (which
+      // reads the id off the end of the log line) never sees it.
+      const [logLevel] = args;
+      const suffix = `   Trace ID: ${this.colorize(requestId, logLevel)}`;
+      return output.endsWith("\n")
+        ? `${output.slice(0, -1)}${suffix}\n`
+        : `${output}${suffix}`;
     };
 
     // Add watermark to flag that the logger has been patched
