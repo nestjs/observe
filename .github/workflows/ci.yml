@@ -105,20 +105,21 @@ jobs:
       # of them would show.
       #
       # Nothing here is silenced. The first version sent every command's output
-      # to /dev/null and failed on CI with a bare exit code 254 and no way to
-      # tell which command had produced it. The tarball name comes from
-      # `--json` rather than the last line of whatever `npm pack` prints, the
-      # build is not run a second time (`--ignore-scripts`: the job built
-      # above), and the scratch package is written by hand rather than by
-      # `npm init -y`, which names it after a random temp directory. Which of
-      # those was the culprit is not known - the old step could not say - so
-      # all three are gone, and the next failure will name itself.
+      # to /dev/null and failed on CI with a bare exit code and no way to tell
+      # which command had produced it.
+      #
+      # The tarball is found on disk, in a directory of its own, rather than
+      # read off `npm pack`'s stdout: npm 10 runs `prepare` even under
+      # `--ignore-scripts`, and husky's "HUSKY=0 skip install" lands in
+      # whatever is being parsed - the last line, or `--json`. The scratch
+      # package is written by hand rather than by `npm init -y`, which names it
+      # after a random temp directory.
       - name: backward compatibility with Nest 11
         run: |
           set -euo pipefail
-          TARBALL="$GITHUB_WORKSPACE/$(npm pack --ignore-scripts --json \
-            | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename')"
-          test -f "$TARBALL"
+          PACKED="$(mktemp -d)"
+          npm pack --ignore-scripts --pack-destination "$PACKED"
+          TARBALL="$(ls "$PACKED"/*.tgz)"
           cd "$(mktemp -d)"
           echo '{ "name": "nest11-compat", "private": true }' > package.json
           npm install --no-audit --no-fund --loglevel=error "$TARBALL" \
