@@ -83,7 +83,13 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      - run: npm ci
+      # The lockfile is written with `legacy-peer-deps` on, and has to be read
+      # the same way: the dev tree holds ORMs and queue libraries side by side
+      # whose optional peers disagree (typeorm wants ioredis 5, bullmq runs on
+      # 6), which npm 10 refuses outright and npm 11 lets through. On this
+      # step only - the consumer installs below resolve peers strictly, since
+      # that is what someone installing the package gets.
+      - run: npm ci --legacy-peer-deps
 
       - run: npm run lint
 
@@ -93,24 +99,38 @@ jobs:
 
       - run: npm run test:int
 
-      # The package ships ESM but promises CommonJS consumers can require() it.
-      # Nothing else in the suite would catch a stray top-level await, which
-      # breaks that silently and only for CJS users.
       # The suites above run on the newest Nest. This runs the packed SDK on
       # the oldest major it supports, where the newer framework hooks it
       # feature-tests do not exist - the only place a hard dependency on one
       # of them would show.
+      #
+      # Nothing here is silenced. The first version sent every command's output
+      # to /dev/null and failed on CI with a bare exit code 254 and no way to
+      # tell which command had produced it. The tarball name comes from
+      # `--json` rather than the last line of whatever `npm pack` prints, the
+      # build is not run a second time (`--ignore-scripts`: the job built
+      # above), and the scratch package is written by hand rather than by
+      # `npm init -y`, which names it after a random temp directory. Which of
+      # those was the culprit is not known - the old step could not say - so
+      # all three are gone, and the next failure will name itself.
       - name: backward compatibility with Nest 11
         run: |
-          TARBALL="$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)"
+          set -euo pipefail
+          TARBALL="$GITHUB_WORKSPACE/$(npm pack --ignore-scripts --json \
+            | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename')"
+          test -f "$TARBALL"
           cd "$(mktemp -d)"
-          npm init -y >/dev/null 2>&1
-          npm install --no-audit --no-fund "$TARBALL" reflect-metadata rxjs ws \
+          echo '{ "name": "nest11-compat", "private": true }' > package.json
+          npm install --no-audit --no-fund --loglevel=error "$TARBALL" \
+            reflect-metadata rxjs ws \
             @nestjs/common@11 @nestjs/core@11 @nestjs/platform-express@11 \
             @nestjs/microservices@11 @nestjs/websockets@11 \
-            @nestjs/platform-ws@11 >/dev/null 2>&1
+            @nestjs/platform-ws@11
           node "$GITHUB_WORKSPACE/scripts/nest11-compat.cjs"
 
+      # The package ships ESM but promises CommonJS consumers can require() it.
+      # Nothing else in the suite would catch a stray top-level await, which
+      # breaks that silently and only for CJS users.
       - name: require(esm) from CommonJS
         run: |
           cd "$(mktemp -d)"
