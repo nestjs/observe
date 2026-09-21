@@ -56,11 +56,7 @@ export function loadOptionalPeer<T>(
   try {
     return { installed: true, module: require(specifier) as T };
   } catch (error) {
-    const withinPackage = resolveWithinPackage(
-      require,
-      packageName,
-      specifier,
-    );
+    const withinPackage = resolveWithinPackage(require, packageName, specifier);
     if (withinPackage) {
       try {
         return { installed: true, module: require(withinPackage) as T };
@@ -91,6 +87,38 @@ function resolveWithinPackage(
   try {
     const manifest = require.resolve(`${packageName}/package.json`);
     return join(dirname(manifest), specifier.slice(prefix.length));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Loads `specifier` the way another installed package would resolve it, or
+ * `undefined` when that package is absent or resolves nothing of its own.
+ *
+ * For a driver that an ORM depends on directly. npm gives the ORM a nested
+ * copy whenever the application's own version of the driver is outside the
+ * range the ORM asks for - `mongodb@6` beside a Mongoose that wants 7 - and a
+ * patch applied to the copy *this* package resolves never touches the one the
+ * ORM runs on. Queries through the ORM would then go unrecorded with nothing
+ * to say why. When both resolve to the same file the caller patches one
+ * prototype twice, which `patchMethod` is built to shrug off.
+ */
+export function loadAsResolvedBy<T>(
+  dependentPackage: string,
+  specifier: string,
+): T | undefined {
+  try {
+    const require = createRequire(import.meta.url);
+    let anchor: string;
+    try {
+      anchor = require.resolve(`${dependentPackage}/package.json`);
+    } catch {
+      // An `exports` map that does not list its own package.json. Any file
+      // inside the package anchors resolution equally well.
+      anchor = require.resolve(dependentPackage);
+    }
+    return createRequire(anchor)(specifier) as T;
   } catch {
     return undefined;
   }

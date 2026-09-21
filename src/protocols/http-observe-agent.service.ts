@@ -5,17 +5,22 @@ import {
   OnModuleInit,
   RequestMethod,
 } from "@nestjs/common";
+import {
+  captureRequest,
+  shouldCaptureRequest,
+} from "../utils/capture-request.util.js";
 import { HttpAdapterHost } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { Subscription } from "rxjs";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { RequestSnapshot } from "../interfaces/index.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
-import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { OBSERVE_OPTIONS, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { redactUrlQuery } from "../utils/redact-url-query.js";
+import { uuidv7 } from "../utils/uuid-v7.util.js";
 
 /**
  * How long an aborted request's handler gets to finish its spans before the
@@ -72,7 +77,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         if (!store) {
           return;
         }
-        const traceId = store.get(this.options.traceIdKey);
+        const traceId =
+          store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
+          store.get(this.options.traceIdKey);
         if (!traceId) {
           return;
         }
@@ -163,20 +170,37 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // disclosure either way. A configured regex still applies, on top rather
       // than instead - it exists for the keys only that deployment knows
       // about.
-      const redactedUrl = redactUrlQuery(req.url);
+      const redactedUrl = redactUrlQuery(
+        req.url,
+        this.operationTraceRegistry.getRedactor(),
+      );
       const originalUrl = this.queryParamsObfuscateRegex
         ? redactedUrl.replaceAll(this.queryParamsObfuscateRegex, "[REDACTED]")
         : redactedUrl;
 
-      this.operationTraceRegistry.startTrace(traceId, {
-        protocol: req.protocol,
-        tags: this.options.http?.tags,
-        attributes: {
-          method: req.method,
-          originalUrl,
+      // An adopted `x-request-id` is not unique to this request: a caller
+      // that fans out, or retries, sends the same id twice, and both requests
+      // can be open here at once. The second gets a registry key of its own -
+      // only the second, so the ordinary request is still keyed by its id.
+      let registryKey = traceId;
+      if (this.operationTraceRegistry.hasTrace(traceId)) {
+        registryKey = uuidv7();
+        store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, registryKey);
+      }
+
+      this.operationTraceRegistry.startTrace(
+        registryKey,
+        {
+          protocol: req.protocol,
+          tags: this.options.http?.tags,
+          attributes: {
+            method: req.method,
+            originalUrl,
+          },
         },
-      });
-      this.evictTraceOnClientAbort(res, traceId);
+        traceId,
+      );
+      this.evictTraceOnClientAbort(res, registryKey);
       done();
     });
   }
@@ -186,7 +210,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     if (!store) {
       return;
     }
-    const traceId = store.get(this.options.traceIdKey);
+    const traceId =
+      store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
+      store.get(this.options.traceIdKey);
     if (!traceId) {
       return;
     }
@@ -203,6 +229,16 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const snapshot = await this.operationTraceRegistry.pluckSnapshot(traceId);
       if (!snapshot) {
         return;
+      }
+      if (shouldCaptureRequest(snapshot, this.options.http?.capture)) {
+        const captured = captureRequest(
+          req,
+          this.options.http?.capture,
+          this.operationTraceRegistry.getRedactor(),
+        );
+        if (captured) {
+          (snapshot as RequestSnapshot).request = captured;
+        }
       }
       this.observeAgentSharedBuffer.insertRequestSnapshot(
         snapshot as RequestSnapshot,

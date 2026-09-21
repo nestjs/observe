@@ -38,6 +38,13 @@ interface LoadedMap {
   mapDir: string;
 }
 
+/**
+ * Cap on distinct compiled files held. A parsed map is the largest thing this
+ * package keeps, and the key is a path off a stack trace - so the cache is
+ * bounded like the source cache beside it rather than trusted to stay small.
+ */
+const MAX_CACHED_MAPS = 200;
+
 /** Parsed maps by compiled-file path; null marks "looked, found none". */
 const mapCache = new Map<string, LoadedMap | null>();
 
@@ -95,6 +102,12 @@ function getMap(file: string): LoadedMap | null {
     return mapCache.get(file)!;
   }
   const loaded = readMapFor(file);
+  if (mapCache.size >= MAX_CACHED_MAPS) {
+    const oldest = mapCache.keys().next().value;
+    if (oldest !== undefined) {
+      mapCache.delete(oldest);
+    }
+  }
   mapCache.set(file, loaded);
   return loaded;
 }

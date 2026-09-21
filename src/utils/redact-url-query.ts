@@ -1,44 +1,20 @@
+import {
+  isSensitiveKeyByDefault,
+  normaliseKey,
+  SensitiveKeyMatcher,
+} from "./sensitive-keys.js";
+
 /**
- * Query-string keys whose values never belong in stored telemetry.
+ * Query-string keys masked on top of the shared list in `sensitive-keys.ts`.
  *
- * Deliberately the same list the log redactor works from, spelled for query
- * parameters: a password-reset link is as sensitive in a URL as the same token
- * is in a log line, and two lists that drift apart mean one of the two paths
- * quietly stops protecting something.
- *
- * Matched case-insensitively, ignoring `-` and `_`, so `access_token`,
- * `accessToken` and `access-token` are one entry.
+ * These are sensitive in a URL and ordinary anywhere else, which is why they
+ * are not in the shared list: `?code=` is an OAuth authorization code and
+ * `?key=` an API key, but a log attribute called `code` is an error code and
+ * masking it would cost more than it protects.
  */
-const SENSITIVE_QUERY_KEYS = new Set([
-  "password",
-  "passwd",
-  "pwd",
-  "secret",
-  "token",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
-  "apikey",
-  "apitoken",
-  "authorization",
-  "auth",
-  "code",
-  "credential",
-  "credentials",
-  "privatekey",
-  "accesskey",
-  "secretkey",
-  "sessionid",
-  "sig",
-  "signature",
-  "state",
-]);
+const URL_ONLY_SENSITIVE_KEYS = new Set(["code", "state", "sig", "key"]);
 
 export const REDACTED = "[REDACTED]";
-
-function normaliseKey(key: string): string {
-  return key.toLowerCase().replace(/[-_]/g, "");
-}
 
 /**
  * Masks the values of sensitive query parameters in a request URL.
@@ -57,7 +33,15 @@ function normaliseKey(key: string): string {
  * anywhere in a URL mangles ordinary path segments and ids, and a redactor that
  * mangles real data is one somebody switches off.
  */
-export function redactUrlQuery(url: string): string {
+export function redactUrlQuery(
+  url: string,
+  /**
+   * The deployment's redactor, so its `redaction.keys` apply to a URL as they
+   * do to a log attribute. Without one the built-in rules still apply: masking
+   * a URL is not something `redaction.enabled: false` switches off.
+   */
+  redactor?: { isSensitiveKey: SensitiveKeyMatcher } | null,
+): string {
   const separator = url.indexOf("?");
   if (separator === -1) {
     return url;
@@ -81,7 +65,10 @@ export function redactUrlQuery(url: string): string {
   // iterator walks, so the keys have to be materialised before the loop starts.
   // oxlint-disable-next-line unicorn/no-useless-spread
   for (const key of [...params.keys()]) {
-    if (SENSITIVE_QUERY_KEYS.has(normaliseKey(key))) {
+    if (
+      URL_ONLY_SENSITIVE_KEYS.has(normaliseKey(key)) ||
+      (redactor ? redactor.isSensitiveKey(key) : isSensitiveKeyByDefault(key))
+    ) {
       params.set(key, REDACTED);
       redactedAny = true;
     }

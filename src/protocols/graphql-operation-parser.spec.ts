@@ -67,7 +67,7 @@ describe("parseGraphQLOperation", () => {
       fieldName: "orders",
       operationName: "Search",
       sanitizedDocument:
-        "query Search($filter: Filter = { paid: true }, $limit: Int = 10) { orders { id } }",
+        "query Search($filter: Filter = { paid: true }, $limit: Int = _) { orders { id } }",
     });
   });
 
@@ -169,6 +169,19 @@ describe("parseGraphQLOperation", () => {
           'mutation { login(email: "user@example.com") { token } }',
         )?.sanitizedDocument,
       ).toBe("mutation { login(email: _) { token } }");
+    });
+
+    it("blanks number literals, and leaves digits that belong to a name", () => {
+      expect(
+        parseGraphQLOperation(
+          "mutation { verifyOtp(code: 489213, ratio: -1.5e+3) { field2 } }",
+        )?.sanitizedDocument,
+      ).toBe("mutation { verifyOtp(code: _, ratio: _) { field2 } }");
+      expect(
+        parseGraphQLOperation(
+          "query($v1: Int = 5) { orders(first: $v1) { id } }",
+        )?.sanitizedDocument,
+      ).toBe("query($v1: Int = _) { orders(first: $v1) { id } }");
     });
 
     it("drops comments", () => {

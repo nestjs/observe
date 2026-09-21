@@ -30,6 +30,51 @@ jobs:
         # being flagged. It is tested precisely because dropping below it is
         # the regression nobody notices locally.
         node: ["20.19", "22", "24"]
+    # The queue suites need a real Redis, and the query-span suites a real
+    # Postgres, MySQL and MongoDB. Each skips itself when its server does not
+    # answer - which, without these, would be every CI run.
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      mongo:
+        image: mongo:8
+        ports:
+          - 27027:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres-whisprr
+        ports:
+          - 54321:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +96,21 @@ jobs:
       # The package ships ESM but promises CommonJS consumers can require() it.
       # Nothing else in the suite would catch a stray top-level await, which
       # breaks that silently and only for CJS users.
+      # The suites above run on the newest Nest. This runs the packed SDK on
+      # the oldest major it supports, where the newer framework hooks it
+      # feature-tests do not exist - the only place a hard dependency on one
+      # of them would show.
+      - name: backward compatibility with Nest 11
+        run: |
+          TARBALL="$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)"
+          cd "$(mktemp -d)"
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund "$TARBALL" reflect-metadata rxjs ws \
+            @nestjs/common@11 @nestjs/core@11 @nestjs/platform-express@11 \
+            @nestjs/microservices@11 @nestjs/websockets@11 \
+            @nestjs/platform-ws@11 >/dev/null 2>&1
+          node "$GITHUB_WORKSPACE/scripts/nest11-compat.cjs"
+
       - name: require(esm) from CommonJS
         run: |
           cd "$(mktemp -d)"

@@ -21,6 +21,7 @@ const SNAPSHOT_KEY_MAP = {
   tags: "tg",
   error: "e",
   userId: "u",
+  request: "rq",
 } as const satisfies Record<keyof RequestSnapshot, string>;
 
 export type EncodedAttributes = {

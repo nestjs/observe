@@ -117,6 +117,14 @@ export class OperationTraceRegistry {
   }
 
   /**
+   * The redactor error payloads go through, for a caller adding to one - so
+   * what it adds is held to the same rules as the rest of the payload.
+   */
+  getRedactor(): LogRedactor | null {
+    return this.redactor;
+  }
+
+  /**
    * Builds the error payload attached to a span or snapshot, including the source
    * around each in-app frame when source context is enabled.
    */
@@ -125,9 +133,7 @@ export class OperationTraceRegistry {
       error instanceof Error
         ? { message: error.message, stack: error.stack }
         : { message: String(error), stack: undefined };
-    // Redacted here, at the one point every error payload passes through,
-    // and before code frames are read: the frames are keyed off the stack's
-    // file positions, which the redactor leaves alone.
+    // Redacted here, at the one point every error payload passes through.
     const payload = this.redactor
       ? {
           message: this.redactor.redactMessage(raw.message),
@@ -152,13 +158,36 @@ export class OperationTraceRegistry {
 
     if (this.sourceContext !== false) {
       const settings = this.sourceContext === true ? {} : this.sourceContext;
-      const codeFrames = collectCodeFrames(payload.stack, settings ?? {});
+      // Read off the raw stack with the raw message: the message is what marks
+      // where the frames start, and it only matches the stack it came from.
+      // Nothing of either is shipped from here - just the file positions.
+      const codeFrames = collectCodeFrames(raw.stack, {
+        ...settings,
+        message: raw.message,
+      });
       if (codeFrames) {
-        result.codeFrames = codeFrames;
+        // Source is as likely to hold a literal secret as a message is, and
+        // goes to the same place.
+        const redactor = this.redactor;
+        result.codeFrames = redactor
+          ? codeFrames.map((frame) => ({
+              ...frame,
+              lines: redactor.redactSource(frame.lines),
+            }))
+          : codeFrames;
       }
     }
 
     return result;
+  }
+
+  /**
+   * Whether a trace is open under this key - for a caller about to open one
+   * under an id it adopted rather than minted, which a second operation in
+   * this process may already hold.
+   */
+  hasTrace(traceId: TraceId): boolean {
+    return this.traceSnapshots.has(traceId);
   }
 
   startTrace(
@@ -169,6 +198,11 @@ export class OperationTraceRegistry {
           "traces" | "startTimestamp" | "calledAt" | "traceId"
         >
       | Omit<JobSnapshot, "duration">,
+    /**
+     * The trace id the snapshot reports under, when it is not the registry
+     * key - a job inheriting the id of the operation that enqueued it.
+     */
+    reportedTraceId: string = traceId,
   ): void {
     if (this.traceSnapshots.has(traceId)) {
       this.logger.warn(
@@ -180,7 +214,7 @@ export class OperationTraceRegistry {
 
     const snapshot: SnapshotWithSignal = {
       ...data,
-      traceId,
+      traceId: reportedTraceId,
       calledAt: new Date().toISOString(),
       startTimestamp: performance.now(),
       traces: [],

@@ -85,6 +85,7 @@ const REQUEST_SNAPSHOT: Shape = {
   u: { type: "string" },
   tg: { type: "object" },
   e: { type: "object" },
+  rq: { type: "object" },
   a: { type: "object", shape: REQUEST_ATTRIBUTES },
   t: { type: "object", array: true, shape: TRACE_NODE },
 };

@@ -7,7 +7,11 @@ import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { Path, PathValue } from "../types/path-value.type.js";
-import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "../observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  OBSERVE_OPTIONS,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 
 @Injectable()
@@ -121,7 +125,9 @@ export class TracerService<
       );
     }
 
-    const traceId = store.get(this.options.traceIdKey);
+    const traceId =
+      store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
+      store.get(this.options.traceIdKey);
     if (typeof traceId !== "string") {
       // Reporting an error must not raise one. The registry warned and gave up
       // in this case anyway, so the outcome is unchanged.
@@ -371,7 +377,9 @@ export class TracerService<
     store: Map<KeyOf<Store>, unknown>,
     method: string,
   ): string {
-    const traceId = store.get(this.options.traceIdKey);
+    const traceId =
+      store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
+      store.get(this.options.traceIdKey);
     if (typeof traceId !== "string") {
       throw new Error(
         `No trace id found in the current context. Ensure that you are using the "${method}" method within a traced operation.`,

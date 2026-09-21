@@ -1,7 +1,10 @@
 import { AsyncLocalStorage } from "async_hooks";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
-import { CALLER_METADATA_KEY } from "../observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 
 /**
  * Stand-in "class name" for instrumented standalone functions. Unlike methods,
@@ -79,7 +82,8 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       }
 
       const store = als.getStore();
-      const requestId = store?.get(options.traceIdKey);
+      const requestId =
+        store?.get(TRACE_REGISTRY_KEY) ?? store?.get(options.traceIdKey);
       if (!requestId) {
         return callUntraced(this, args);
       }

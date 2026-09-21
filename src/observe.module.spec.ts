@@ -50,6 +50,51 @@ describe("createObserveModule#ObserveInstrument", () => {
     expect(decoratorOf(ObserveInstrument)(provider)).toBe(provider);
   });
 
+  describe("against a Nest release without the microservice dispatch hook", () => {
+    // Trace-id propagation over a microservice client uses
+    // `ClientProxy#setOnDispatchHook`, which only newer Nest releases have.
+    // The SDK's floor is older than that, so its absence has to be the
+    // ordinary case - nothing thrown, nothing logged, the client untouched -
+    // and never a reason a supported application fails to boot.
+    class LegacyClientProxy {
+      sent: unknown[] = [];
+      send(pattern: string, data: unknown) {
+        this.sent.push({ pattern, data });
+        return "sent";
+      }
+    }
+
+    it("leaves a client that has no such hook exactly as it found it", () => {
+      const { ObserveInstrument } = createObserveModule();
+      const client = new LegacyClientProxy();
+      const before = Object.getOwnPropertyNames(client).sort();
+
+      const decorated = decoratorOf(ObserveInstrument)(
+        client,
+      ) as LegacyClientProxy;
+
+      expect(Object.getOwnPropertyNames(client).sort()).toEqual(before);
+      expect(decorated.send("orders.report", { id: 1 })).toBe("sent");
+      expect(client.sent).toEqual([
+        { pattern: "orders.report", data: { id: 1 } },
+      ]);
+    });
+
+    it("uses the hook where the framework provides one", () => {
+      const { ObserveInstrument } = createObserveModule();
+      const setOnDispatchHook = vi.fn();
+
+      decoratorOf(ObserveInstrument)({ setOnDispatchHook });
+
+      expect(setOnDispatchHook).toHaveBeenCalledOnce();
+      // And a hook run outside any trace adds nothing to the packet.
+      const [hook] = setOnDispatchHook.mock.calls[0];
+      const packet: { metadata?: unknown } = {};
+      hook(packet);
+      expect(packet.metadata).toBeUndefined();
+    });
+  });
+
   it("excludes providers via the skipInstrumentation option", () => {
     class OptedOutService {
       run() {}

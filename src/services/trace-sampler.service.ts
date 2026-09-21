@@ -32,8 +32,14 @@ export class TraceSamplerService {
     attributes: { operationId: string },
   ): boolean;
   shouldCapture(
-    protocol: "http" | "rpc" | "grpc" | "graphql",
+    protocol: "ws",
+    attributes: { gateway: string; pattern: string },
+  ): boolean;
+  shouldCapture(
+    protocol: "http" | "rpc" | "grpc" | "graphql" | "ws",
     attributes: {
+      gateway?: string;
+      pattern?: string;
       url?: string;
       method?: string;
       transport?: string;

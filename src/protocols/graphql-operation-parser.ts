@@ -56,10 +56,10 @@ export interface ParsedGraphQLOperation {
   /** The operation's name, when the document gave it one. */
   operationName?: string;
   /**
-   * The document with comments dropped, string literals blanked to `_`, and
-   * whitespace collapsed. What a trace records as the shape of the request:
-   * stable across formatting, and stripped of the one token kind that
-   * routinely carries user data inline.
+   * The document with comments dropped, string and number literals blanked to
+   * `_`, and whitespace collapsed. What a trace records as the shape of the
+   * request: stable across formatting, and stripped of the token kinds that
+   * carry user data inline.
    */
   sanitizedDocument: string;
 }
@@ -212,8 +212,10 @@ function truncate(document: string): string {
     return document;
   }
   return (
-    document.slice(0, MAX_SANITIZED_DOCUMENT_LENGTH - TRUNCATION_SUFFIX.length) +
-    TRUNCATION_SUFFIX
+    document.slice(
+      0,
+      MAX_SANITIZED_DOCUMENT_LENGTH - TRUNCATION_SUFFIX.length,
+    ) + TRUNCATION_SUFFIX
   );
 }
 
@@ -262,8 +264,8 @@ function readFirstFieldName(source: string, from: number): string | undefined {
 }
 
 /**
- * Blanks out comments and strings, so neither can be mistaken for a name or a
- * brace. Offsets are not preserved - nothing downstream maps back to the
+ * Blanks out comments, strings and numbers, so none can be mistaken for a name
+ * or a brace. Offsets are not preserved - nothing downstream maps back to the
  * original text.
  */
 function stripIgnoredTokens(document: string): string {
@@ -297,11 +299,42 @@ function stripIgnoredTokens(document: string): string {
       continue;
     }
 
+    // Numbers go the same way as strings. An inline `verifyOtp(code: 489213)`
+    // or `charge(amount: 1999)` is user data exactly as a string literal is,
+    // and blanking it also keeps `first: 10` and `first: 20` one shape. A
+    // digit that continues a name (`field2`, `$var1`) is not a literal.
+    const startsNumber =
+      isDigit(char) || (char === "-" && isDigit(document[index + 1] ?? ""));
+    if (startsNumber && !isNameChar(out[out.length - 1] ?? "")) {
+      index += 1;
+      while (index < document.length && isNumberChar(document, index)) {
+        index += 1;
+      }
+      out += "_";
+      continue;
+    }
+
     out += char;
     index += 1;
   }
 
   return out;
+}
+
+function isDigit(char: string): boolean {
+  return char >= "0" && char <= "9";
+}
+
+/** Digits, the fraction point, and an exponent with its sign: `-1.5e+3`. */
+function isNumberChar(document: string, index: number): boolean {
+  const char = document[index];
+  if (isDigit(char) || char === "." || char === "e" || char === "E") {
+    return true;
+  }
+  const previous = document[index - 1];
+  return (
+    (char === "+" || char === "-") && (previous === "e" || previous === "E")
+  );
 }
 
 function skipBalanced(

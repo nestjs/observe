@@ -10,6 +10,7 @@ describe("HttpObserveAgentService", () => {
   let startedTraces: Array<{
     traceId: string;
     data: { attributes?: { originalUrl?: string } };
+    reportedTraceId?: string;
   }>;
 
   const createService = (
@@ -17,8 +18,19 @@ describe("HttpObserveAgentService", () => {
   ) => {
     startedTraces = [];
     const registry = {
-      startTrace: (traceId: string, data: unknown) => {
-        startedTraces.push({ traceId, data } as (typeof startedTraces)[number]);
+      getRedactor: () => null,
+      hasTrace: (traceId: string) =>
+        startedTraces.some((started) => started.traceId === traceId),
+      startTrace: (
+        traceId: string,
+        data: unknown,
+        reportedTraceId?: string,
+      ) => {
+        startedTraces.push({
+          traceId,
+          data,
+          reportedTraceId,
+        } as (typeof startedTraces)[number]);
       },
     } as unknown as OperationTraceRegistry;
 
@@ -92,6 +104,24 @@ describe("HttpObserveAgentService", () => {
       expect(startedTraces[0].data.attributes?.originalUrl).toEqual(
         "/items?x=1",
       );
+    });
+  });
+
+  describe("a trace id two open requests share", () => {
+    it("keys the first request by its trace id, and the second by a key of its own, both reporting under the id", () => {
+      // The generator stands in for an adopted `x-request-id`: a caller that
+      // fans out sends the same one on every call.
+      const service = createService();
+
+      trace(service, "/items?page=1");
+      trace(service, "/items?page=2");
+
+      expect(startedTraces[0].traceId).toBe("trace-1");
+      expect(startedTraces[1].traceId).not.toBe("trace-1");
+      expect(startedTraces.map((started) => started.reportedTraceId)).toEqual([
+        "trace-1",
+        "trace-1",
+      ]);
     });
   });
 });

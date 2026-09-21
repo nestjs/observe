@@ -201,6 +201,42 @@ children, `s` spanId and `so` startOffset. A collector that does not know the
 tag stores it like any other and attributes the node as one call of its class
 rather than as the number it carries.
 
+## What it records without any code
+
+Once the module and the instrument are in place, the agent reports, with no further changes to your application:
+
+- **Requests, GraphQL operations, RPC messages, WebSocket gateway messages, queue jobs and scheduled jobs**, each with its tree of provider method calls.
+- **Database queries**, as a span under the method that ran them, for `pg`, `mysql2` and `mongodb`. Anything built on those drivers is covered without being known by name: TypeORM, Drizzle, MikroORM and Mongoose are tested in this repository, and others (Knex, Sequelize) go through the same driver calls. The statement is recorded with every value removed (`SELECT "o"."id" FROM "orders" "o" WHERE "o"."customer_id" = $1`). Prisma's Rust query engine does not go through these drivers and is not covered yet.
+- **Outbound HTTP calls** made with `fetch`/`undici` or `node:http`/`https` (so Axios too), as `POST api.stripe.com`. The current trace id is forwarded as `x-request-id`, so a service that also runs the agent continues the same trace; a header you set yourself is never overwritten.
+- **Trace ids across queues**: a BullMQ or Bull job enqueued while handling a request carries that request's trace id, so the request and its job show up as one trace. Repeatable (cron) jobs start their own.
+
+Query and outbound-HTTP spans are not billed as events. Turn them off with `outgoing: false`, or one side with `outgoing: { database: false }` / `outgoing: { http: false }`.
+
+## Capturing failed and slow requests
+
+The inputs behind a failing request are usually the fastest way to reproduce it. The agent keeps them only for the requests worth it - never for ordinary traffic:
+
+```ts
+ObserveModule.forRoot({
+  // ...
+  http: {
+    capture: {
+      // Also capture requests that took at least this long, failed or not.
+      slowerThanMs: 2000,
+      // Off by default: a body is your users' data. Capped at 2 KB unless
+      // you pass `{ maxBytes }` (at most 16 KB).
+      body: true,
+      // Defaults to a short list with nothing that authenticates or
+      // identifies anyone: accept, content-type, user-agent, ...
+      // Pass your own list, or `false` for none.
+      headers: ["content-type", "user-agent", "x-tenant-id"],
+    },
+  },
+});
+```
+
+A failed request is always captured (headers only, unless `body` is on); `capture: false` turns the feature off. Everything captured goes through the same redaction as error messages and logs before it leaves the process - sensitive keys by name, secrets by pattern - so naming `authorization` in `headers` records `[REDACTED]`.
+
 ## Optional peer dependencies
 
 Protocol integrations are only loaded when you use them, and their packages are optional peers:
@@ -208,6 +244,8 @@ Protocol integrations are only loaded when you use them, and their packages are 
 - `@nestjs/microservices` - RPC/microservice instrumentation
 - `@nestjs/graphql` - GraphQL operation instrumentation
 - `@nestjs/bullmq` and `bullmq` - queue/job instrumentation
+- `@nestjs/bull` and `bull` - the same, for legacy Bull
+- `@nestjs/websockets` - WebSocket gateway instrumentation (`ws` and socket.io adapters)
 - `@nestjs/schedule` - scheduled job (`@Cron`, `@Interval`, `@Timeout`) instrumentation
 
 ## Test

@@ -1,7 +1,6 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import type { Job, Processor } from "bullmq";
-import { uuidv7 } from "../utils/uuid-v7.util.js";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import {
   JobSnapshot,
@@ -10,6 +9,7 @@ import {
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { JobTraceRunner } from "./job-trace-runner.js";
 import {
   describePeerLoadError,
   loadOptionalPeer,
@@ -27,16 +27,22 @@ interface ProcessorDecoratorServiceLike {
 @Injectable()
 export class QueueObserveAgentService<Store extends Record<string, unknown>> {
   private readonly logger = new Logger(QueueObserveAgentService.name);
+  private readonly runner: JobTraceRunner<Store>;
 
   constructor(
-    private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
+    observeAgentSharedBuffer: ObserveAgentSharedBuffer,
     @Inject(OBSERVE_OPTIONS)
-    private readonly options: ObserveModuleOptionsWithDefaults,
-    private readonly operationTraceRegistry: OperationTraceRegistry,
-    private readonly asyncLocalStorage: AsyncLocalStorage<
-      Map<KeyOf<Store>, any>
-    >,
+    options: ObserveModuleOptionsWithDefaults,
+    operationTraceRegistry: OperationTraceRegistry,
+    asyncLocalStorage: AsyncLocalStorage<Map<KeyOf<Store>, any>>,
   ) {
+    this.runner = new JobTraceRunner(
+      observeAgentSharedBuffer,
+      options,
+      operationTraceRegistry,
+      asyncLocalStorage,
+      this.logger,
+    );
     this.patchDecorate();
   }
 
@@ -63,7 +69,11 @@ export class QueueObserveAgentService<Store extends Record<string, unknown>> {
       // for a delayed job the gap between the two is a schedule the caller asked
       // for - not a queue that fell behind. Counting it would report a job dated
       // a week out as a week of backlog and drag `job_wait_p95` with it.
-      const availableAt = job.timestamp + (job.delay ?? 0);
+      //
+      // Read off the options when `job.delay` is zero: BullMQ resets that
+      // field as it promotes a delayed job, so by the time a worker holds the
+      // job it says 0 whatever was asked for.
+      const availableAt = job.timestamp + (job.delay || job.opts?.delay || 0);
       metadata.waitDuration = Math.max(0, startedAt - availableAt);
     }
 
@@ -124,102 +134,43 @@ export class QueueObserveAgentService<Store extends Record<string, unknown>> {
     }
 
     ProcessorDecoratorService.prototype["decorate"] =
-      (processor: Processor<unknown, unknown>) => (job: Job) => {
-        const hasOuterContext = this.asyncLocalStorage
-          .getStore()
-          ?.has(this.options.traceIdKey);
-
-        // The same map `run` is given, rather than `getStore()` inside the
-        // callback: identical object, one lookup fewer, and it is known to exist.
-        const store = new Map<KeyOf<Store>, any>();
-        return this.asyncLocalStorage.run(store, () => {
-          if (hasOuterContext) {
-            // If the outer context already has a trace ID
-            // ignore the inner context
-            if (this.options.debug) {
-              this.logger.debug(
-                `Outer context already has a trace ID. Skipping inner context for job "${job.name}" job.id: ${job.id}`,
-              );
-            }
-
-            return processor(job);
-          }
-          const traceId = uuidv7();
-          store.set(this.options.traceIdKey, traceId);
-
-          if (this.options.jobs?.setAttributes) {
-            const attributes = this.options.jobs?.setAttributes?.({
-              queueName: job.queueName,
-              name: job.name,
-              id: job.id,
-            });
-            if (attributes) {
-              for (const [key, value] of Object.entries(attributes)) {
-                store.set(key, value);
-              }
-            }
-          }
-
-          // setImmediate(() => {
-          this.operationTraceRegistry.startTrace(traceId, {
-            tags: this.options.jobs?.tags,
+      (processor: Processor<unknown, unknown>) => (job: Job) =>
+        this.runner.run(
+          {
             queueName: job.queueName,
             name: job.name,
-            id: typeof job.id === "number" ? `${job.id}` : job.id,
-            ...this.readQueueMetadata(job),
-          } as JobSnapshot);
-          // });
+            id: job.id,
+            opts: job.opts as Record<string, unknown> | undefined,
+            metadata: this.readQueueMetadata(job),
+          },
+          () => processor(job),
+        );
 
-          const endTrace = (status: JobSnapshot["status"]) => {
-            setTimeout(async () => {
-              this.operationTraceRegistry.endTrace(traceId, { status });
+    this.patchQueue();
+  }
 
-              const snapshot = (await this.operationTraceRegistry.pluckSnapshot(
-                traceId,
-              )) as JobSnapshot | undefined;
-
-              // `pluckSnapshot` deletes what it returns, so a trace already
-              // plucked - a job whose handler resolved and rejected, a retry
-              // reusing the id - answers undefined. The `!` here asserted
-              // otherwise, and the encoder dereferenced it inside a
-              // `setTimeout`, where no try/catch can reach: an unhandled
-              // TypeError that took the whole process down. A worker deployment
-              // could not finish booting, because draining a queue was enough
-              // to trigger it.
-              //
-              // Dropped rather than reported: there is no snapshot, so there is
-              // nothing to send, and losing one job's self-instrumentation is
-              // not worth a crash loop.
-              if (!snapshot) {
-                return;
-              }
-              this.observeAgentSharedBuffer.insertJobSnapshot(snapshot);
-            }, 0);
-          };
-
-          try {
-            const returnValue = processor(job);
-            if (returnValue instanceof Promise) {
-              return returnValue
-                .then((ret) => {
-                  endTrace("completed");
-                  return ret;
-                })
-                .catch((error: Error) => {
-                  console.error("ending trace with error:", error);
-                  endTrace("failed");
-                  throw error;
-                });
-            }
-
-            endTrace("completed");
-            return returnValue;
-          } catch (error) {
-            console.error("rethrowing again?");
-            endTrace("failed");
-            throw error;
-          }
-        });
-      };
+  /**
+   * The enqueuing half: without it a worker has no way to learn which
+   * operation a job came from, and every run opens an unrelated trace.
+   *
+   * `bullmq` is loaded the way `@nestjs/bullmq` loads it, so the prototype
+   * patched here is the one behind every `@InjectQueue()`.
+   */
+  private patchQueue() {
+    const result = loadOptionalPeer<{
+      Queue?: { prototype?: Record<string | symbol, unknown> };
+    }>("bullmq");
+    if (!result.installed) {
+      return;
+    }
+    const prototype = result.module?.Queue?.prototype;
+    if (!prototype) {
+      this.logger.warn(
+        `bullmq is installed but its Queue could not be loaded, so jobs will not inherit the trace that enqueued them${result.error ? `: ${describePeerLoadError(result.error)}` : "."}`,
+      );
+      return;
+    }
+    // add(name, data, opts)
+    this.runner.patchEnqueue(prototype, () => 2);
   }
 }

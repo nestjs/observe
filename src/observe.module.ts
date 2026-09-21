@@ -27,9 +27,12 @@ import {
 import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "./observe.constants.js";
 import { GraphQLObserveAgentService } from "./protocols/graphql-observe-agent.service.js";
 import { HttpObserveAgentService } from "./protocols/http-observe-agent.service.js";
+import { OutgoingObserveAgentService } from "./outgoing/outgoing-observe-agent.service.js";
+import { BullObserveAgentService } from "./protocols/bull-observe-agent.service.js";
 import { QueueObserveAgentService } from "./protocols/queue-observe-agent.service.js";
 import { RpcObserveAgentService } from "./protocols/rpc-observe-agent.service.js";
 import { ScheduleObserveAgentService } from "./protocols/schedule-observe-agent.service.js";
+import { WsObserveAgentService } from "./protocols/ws-observe-agent.service.js";
 import { LoggerPatcherService } from "./services/logger-patcher.service.js";
 import { NodeRuntimeMetricsService } from "./services/node-runtime-metrics.service.js";
 import { resolveSpanCollapseSettings } from "./services/collapse-repeated-spans.util.js";
@@ -118,9 +121,14 @@ export function createObserveModule<Store extends Record<string, unknown>>(
       // `forwardLogs` is enabled, and it redacts before anything is buffered.
       StdoutForwarderService,
       QueueObserveAgentService,
+      // A no-op unless bull - the driver behind @nestjs/bull - is installed.
+      BullObserveAgentService,
       // A no-op unless @nestjs/schedule is installed; it patches the explorer
       // from its constructor so the patch lands before any handler is found.
       ScheduleObserveAgentService,
+      // A no-op unless @nestjs/websockets is installed.
+      WsObserveAgentService,
+      OutgoingObserveAgentService,
     ],
     exports: [AsyncLocalStorage, TracerService],
   })
@@ -233,6 +241,8 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         instance instanceof GraphQLObserveAgentService ||
         // Same reason: its wrapper runs inside the job traces it opens.
         instance instanceof ScheduleObserveAgentService ||
+        instance instanceof WsObserveAgentService ||
+        instance instanceof OutgoingObserveAgentService ||
         // Nest's discovery machinery, which the GraphQL agent walks to map
         // root fields back to their resolver classes. It has to stay
         // unproxied: ModulesContainer extends Map, and a Map method invoked
@@ -268,17 +278,60 @@ export function createObserveModule<Store extends Record<string, unknown>>(
       // skip hook to avoid duplicating APIs). Newer cores additionally wrap
       // this in a safety net that falls back to the undecorated instance,
       // with a warning, should it ever throw.
-      instanceDecorator: createInstanceDecorator<Store>(
-        asyncLocalStorage,
-        operationTraceRegistry,
-        {
-          traceIdKey: options.traceIdKey,
-          skipInstrumentation,
-        },
-      ),
+      instanceDecorator: (() => {
+        const decorate = createInstanceDecorator<Store>(
+          asyncLocalStorage,
+          operationTraceRegistry,
+          {
+            traceIdKey: options.traceIdKey,
+            skipInstrumentation,
+          },
+        );
+        return (instance: unknown) => {
+          propagateTraceIdThrough(instance, () =>
+            asyncLocalStorage.getStore()?.get(options.traceIdKey as never),
+          );
+          return decorate(instance as never);
+        };
+      })(),
     } as NestApplicationOptions["instrument"],
     ObserveModule,
   };
+}
+
+/**
+ * Makes a microservice client send the current trace id with every packet.
+ *
+ * `setOnDispatchHook` is the client-side counterpart of the server's
+ * processing hooks, and only exists on `@nestjs/microservices` versions that
+ * carry packet metadata - so this is a feature test, and a no-op on every
+ * version before. The id goes out under the same name an HTTP hop uses, and
+ * `defaultTraceIdGenerator` reads it back from the receiving context.
+ */
+function propagateTraceIdThrough(
+  instance: unknown,
+  currentTraceId: () => unknown,
+): void {
+  const client = instance as {
+    setOnDispatchHook?: (
+      hook: (packet: { metadata?: Record<string, string> }) => void,
+    ) => void;
+  };
+  try {
+    if (typeof client?.setOnDispatchHook !== "function") {
+      return;
+    }
+  } catch {
+    // A provider whose mere inspection throws - the decorator's own
+    // exclusions deal with it; it is certainly not a microservice client.
+    return;
+  }
+  client.setOnDispatchHook((packet) => {
+    const traceId = currentTraceId();
+    if (typeof traceId === "string" && !packet.metadata?.["x-request-id"]) {
+      packet.metadata = { ...packet.metadata, "x-request-id": traceId };
+    }
+  });
 }
 
 /**

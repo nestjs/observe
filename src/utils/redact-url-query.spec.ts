@@ -1,3 +1,4 @@
+import { LogRedactor } from "./log-redactor.js";
 import { redactUrlQuery } from "./redact-url-query.js";
 
 describe("redactUrlQuery", () => {
@@ -60,5 +61,29 @@ describe("redactUrlQuery", () => {
     expect(redactUrlQuery("/users?id=ghp_abcdefghijklmnop")).toEqual(
       "/users?id=ghp_abcdefghijklmnop",
     );
+  });
+
+  it("masks compound credential names, not just the bare word", () => {
+    for (const key of [
+      "resetToken",
+      "inviteToken",
+      "client_secret",
+      "jwt",
+      "key",
+      "cookie",
+      "X-Amz-Signature",
+      "X-Amz-Security-Token",
+    ]) {
+      expect(redactUrlQuery(`/x?${key}=sensitive`)).not.toContain("sensitive");
+    }
+  });
+
+  it("applies the keys the deployment configured", () => {
+    const redactor = new LogRedactor({ keys: ["tenant_ref"] });
+
+    expect(redactUrlQuery("/x?tenantRef=acme&page=2", redactor)).toEqual(
+      "/x?tenantRef=%5BREDACTED%5D&page=2",
+    );
+    expect(redactUrlQuery("/x?tenantRef=acme")).toEqual("/x?tenantRef=acme");
   });
 });

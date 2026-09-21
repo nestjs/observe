@@ -1,4 +1,4 @@
-import { loadOptionalPeer } from "./optional-peer.util.js";
+import { loadAsResolvedBy, loadOptionalPeer } from "./optional-peer.util.js";
 
 describe("loadOptionalPeer", () => {
   it("reports a package that is not installed", () => {
@@ -39,5 +39,23 @@ describe("loadOptionalPeer", () => {
     expect(result.installed).toBe(true);
     expect(result.installed && result.module).toBeUndefined();
     expect(result.installed && result.error).toBeDefined();
+  });
+});
+
+describe("loadAsResolvedBy", () => {
+  it("loads a module the way another installed package resolves it", () => {
+    const viaMongoose = loadAsResolvedBy<{ version: string }>(
+      "mongoose",
+      "mongodb/package.json",
+    );
+
+    // Whichever copy Mongoose runs on - here the hoisted one, in an
+    // application with an older direct dependency a nested one.
+    expect(viaMongoose?.version).toEqual(expect.any(String));
+  });
+
+  it("answers undefined for a package that is not installed, or a path it cannot resolve", () => {
+    expect(loadAsResolvedBy("not-a-real-orm", "mongodb")).toBeUndefined();
+    expect(loadAsResolvedBy("mongoose", "mongodb/nope.js")).toBeUndefined();
   });
 });

@@ -1,3 +1,4 @@
+import type { CapturedRequest } from "../utils/capture-request.util.js";
 import {
   CompleteTraceEventNode,
   OngoingTraceEventNode,
@@ -64,6 +65,14 @@ export interface RequestSnapshot {
     stack?: string;
     tags?: Record<string, string | number | boolean>;
   };
+
+  /**
+   * The request's own inputs - headers, and the body when asked for - when
+   * `http.capture` decides this request is worth them: it failed, or it ran
+   * past `slowerThanMs`. A field of its own rather than part of `error`, so
+   * that what triggered the capture never decides where it is read from.
+   */
+  request?: CapturedRequest;
 
   /**
    * Optional user identifier associated with the request.

@@ -1,4 +1,8 @@
 import { RedactionOptions } from "../interfaces/observe-options.interface.js";
+import {
+  createSensitiveKeyMatcher,
+  SensitiveKeyMatcher,
+} from "./sensitive-keys.js";
 
 /**
  * Strips secrets out of log lines before they leave the process.
@@ -23,35 +27,10 @@ import { RedactionOptions } from "../interfaces/observe-options.interface.js";
 const DEFAULT_REPLACEMENT = "[REDACTED]";
 
 /**
- * Attribute keys whose values are masked outright, whatever they contain.
- * Matched case-insensitively, ignoring `-` and `_`.
- */
-const DEFAULT_SENSITIVE_KEYS = [
-  "password",
-  "passwd",
-  "pwd",
-  "secret",
-  "token",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
-  "apikey",
-  "authorization",
-  "auth",
-  "credential",
-  "credentials",
-  "privatekey",
-  "accesskey",
-  "secretkey",
-  "sessionid",
-  "cookie",
-  "setcookie",
-];
-
-/**
  * Key names recognised inside free text, as `key=value` or `"key": "value"`.
- * Kept in step with DEFAULT_SENSITIVE_KEYS but spelled for a regex, where the
- * separators are still present.
+ * Spelled for a regex, where the separators are still present. Unanchored on
+ * the left, so a compound name - `resetToken=`, `client_secret=` - matches on
+ * its ending, the same way `sensitive-keys.ts` matches a structured key.
  */
 const TEXT_KEY_ALTERNATION = [
   "password",
@@ -84,7 +63,17 @@ interface CompiledRule {
   replace: (replacement: string, ...groups: string[]) => string;
 }
 
-function buildDefaultRules(): CompiledRule[] {
+/**
+ * `literalValuesOnly` is the variant for source code, where the text either
+ * side of a `:` or `=` is mostly identifiers: `const token = await sign(user)`
+ * assigns no secret, and masking `await` would shred every frame that mentions
+ * a credential by name. In source a secret is a literal, so only a quoted
+ * value is masked there.
+ */
+function buildDefaultRules(literalValuesOnly = false): CompiledRule[] {
+  const value = literalValuesOnly
+    ? "(?:\"[^\"\\n]*\"|'[^'\\n]*'|`[^`]*`)"
+    : "(?:\"[^\"]*\"|'[^']*'|(?:Bearer|Basic|Token)\\s+\\S+|[^\\s,;&}\"']+)";
   return [
     // PEM blocks first: they span lines and would otherwise be partially eaten
     // by the narrower rules below.
@@ -111,7 +100,7 @@ function buildDefaultRules(): CompiledRule[] {
     // a single `[REDACTED]` rather than stacking two.
     {
       pattern: new RegExp(
-        `((?:${TEXT_KEY_ALTERNATION})"?\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|(?:Bearer|Basic|Token)\\s+\\S+|[^\\s,;&}"']+)`,
+        `((?:${TEXT_KEY_ALTERNATION})["']?\\s*[:=]\\s*)${value}`,
         "gi",
       ),
       replace: (replacement, prefix) => `${prefix}${replacement}`,
@@ -169,7 +158,8 @@ const MAX_ATTRIBUTE_DEPTH = 8;
 
 export class LogRedactor {
   private readonly rules: CompiledRule[];
-  private readonly sensitiveKeys: Set<string>;
+  private readonly sourceRules: CompiledRule[];
+  private readonly matchesSensitiveKey: SensitiveKeyMatcher;
   private readonly replacement: string;
   private readonly redactCards: boolean;
 
@@ -189,19 +179,56 @@ export class LogRedactor {
     }));
 
     this.rules = [...defaults, ...extra];
-    this.sensitiveKeys = new Set(
-      [...DEFAULT_SENSITIVE_KEYS, ...(options.keys ?? [])].map(normaliseKey),
-    );
+    this.sourceRules = [
+      ...(options.useDefaultPatterns === false ? [] : buildDefaultRules(true)),
+      ...extra,
+    ];
+    this.matchesSensitiveKey = createSensitiveKeyMatcher(options.keys);
+  }
+
+  /**
+   * Whether a key names a credential - the built-in rules plus the configured
+   * `keys`. Exposed so a caller masking by key somewhere this class does not
+   * reach (a URL's query string) is held to the same list.
+   */
+  isSensitiveKey(key: string): boolean {
+    return this.matchesSensitiveKey(key);
   }
 
   redactMessage(message: string): string {
-    let output = message;
+    return this.apply(message, this.rules, false);
+  }
 
-    for (const rule of this.rules) {
+  /**
+   * Redacts lines of source code read for a code frame.
+   *
+   * Source is shipped for the same reason a message is, and a literal in it -
+   * `password: "hunter2"`, a pasted key - is as much a secret there as in a
+   * log line. The lines are redacted as one text so a block spanning several
+   * (a PEM key in a template literal) is still seen whole, and every match
+   * keeps its newlines so the result has the same line count: a frame's
+   * `firstLine` and highlighted `line` index into this array.
+   */
+  redactSource(lines: string[]): string[] {
+    return this.apply(lines.join("\n"), this.sourceRules, true).split("\n");
+  }
+
+  private apply(
+    text: string,
+    rules: CompiledRule[],
+    keepNewlines: boolean,
+  ): string {
+    let output = text;
+    const keep = (match: string, masked: string) =>
+      keepNewlines
+        ? masked + "\n".repeat(match.split("\n").length - 1)
+        : masked;
+
+    for (const rule of rules) {
       output = output.replace(rule.pattern, (...args) => {
         // String.replace passes offset and the whole string after the groups.
         const groups = args.slice(1, -2).map((group) => group ?? "");
-        return rule.replace(this.replacement, ...groups);
+        return keep(args[0], rule.replace(this.replacement, ...groups));
       });
     }
 
@@ -244,7 +271,7 @@ export class LogRedactor {
           // A sensitive key masks its value whatever the shape - an object under
           // `credentials` is exactly what must not be walked into and partially
           // preserved.
-          this.sensitiveKeys.has(normaliseKey(key))
+          this.matchesSensitiveKey(key)
             ? this.replacement
             : this.redactValue(item, depth + 1),
         ]),
@@ -252,8 +279,4 @@ export class LogRedactor {
     }
     return value;
   }
-}
-
-function normaliseKey(key: string): string {
-  return key.toLowerCase().replace(/[-_]/g, "");
 }

@@ -60,6 +60,12 @@ class OrdersResolver {
     throw new Error("deliberate");
   }
 
+  @Query(() => Order)
+  async slowOrder(): Promise<Order> {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    return { id: 7, name: "slow" };
+  }
+
   @Mutation(() => Order)
   createOrder(@Args("name") name: string): Order {
     return { id: 99, name };
@@ -348,5 +354,26 @@ describe("ObserveModule: GraphQL collection", () => {
 
     await waitForSnapshot(collected, () => collected.items.length >= 3);
     expect(collected.items).toHaveLength(3);
+  });
+
+  it("reports both of two concurrent operations that arrive under one x-request-id", async () => {
+    // A caller that fans out sends its trace id twice. The HTTP agent keys the
+    // second request apart, and the operation has to find its trace under
+    // that key rather than under the id the two share.
+    await Promise.all([
+      gql("{ slowOrder { id } }").set("x-request-id", "shared-trace-1"),
+      gql("{ slowOrder { id } }").set("x-request-id", "shared-trace-1"),
+    ]);
+
+    await waitForSnapshot(collected, () => collected.items.length >= 2);
+    for (const snapshot of collected.items) {
+      expect(snapshot.traceId).toBe("shared-trace-1");
+      expect(snapshot.operationId).toBe("Query.slowOrder");
+      expect(snapshot.traces).toHaveLength(1);
+      expect(snapshot.traces[0]).toMatchObject({
+        className: "OrdersResolver",
+        methodKey: "slowOrder",
+      });
+    }
   });
 });

@@ -149,6 +149,35 @@ describe("ObserveModule: HTTP collection", () => {
     expect(snapshot.attributes?.statusCode).toBe(500);
   });
 
+  it("attaches the default header allow-list to a failed request, and nothing to a successful one", async () => {
+    await request(app.getHttpServer())
+      .get("/boom")
+      .set("user-agent", "observe-int")
+      .set("authorization", "Bearer should-never-leave")
+      .expect(500);
+    await request(app.getHttpServer())
+      .get("/orders")
+      .set("user-agent", "observe-int")
+      .expect(200);
+
+    const failed = await waitForSnapshot(
+      collected,
+      (item) => item.operationId === "/boom",
+    );
+    expect(failed.request?.headers).toMatchObject({
+      "user-agent": "observe-int",
+    });
+    expect(JSON.stringify(failed)).not.toContain("should-never-leave");
+    expect(failed.request?.body).toBeUndefined();
+
+    const succeeded = await waitForSnapshot(
+      collected,
+      (item) => item.operationId === "/orders",
+    );
+    expect(succeeded.error).toBeUndefined();
+    expect(succeeded.request).toBeUndefined();
+  });
+
   it("collects one snapshot per request", async () => {
     await request(app.getHttpServer()).get("/orders").expect(200);
     await request(app.getHttpServer()).get("/orders").expect(200);

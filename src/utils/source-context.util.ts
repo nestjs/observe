@@ -1,4 +1,4 @@
-import { readFileSync } from "fs";
+import { readFileSync, realpathSync } from "fs";
 import { resolve, sep } from "path";
 import { resolveOriginalPosition } from "./source-map-resolver.util.js";
 
@@ -45,12 +45,16 @@ const MAX_FRAMES = 20;
  */
 const sourceCache = new Map<string, string[] | null>();
 
+/** What opens every V8 frame line. */
+const FRAME_PREFIX = /^\s*at\s+/;
+
 /**
- * V8 stack frame lines, both shapes:
- *   at fn (/abs/path/file.ts:42:31)
- *   at /abs/path/file.ts:42:31
+ * Longest line read as a frame, and most frame lines read from one stack. A
+ * real frame is a function name and a path; a real stack is `stackTraceLimit`
+ * of them. Anything past either is not something V8 wrote.
  */
-const FRAME_PATTERN = /^\s*at\s+(?:.*?\s+\()?(.+?):(\d+):(\d+)\)?\s*$/;
+const MAX_FRAME_LINE_LENGTH = 1024;
+const MAX_FRAME_LINES = 100;
 
 interface ParsedFrame {
   file: string;
@@ -81,25 +85,124 @@ const READABLE_EXTENSIONS = /\.(?:js|cjs|mjs|jsx|ts|cts|mts|tsx)$/;
  * the application's own root, with an extension the runtime can execute, are
  * eligible - which is also precisely the set of files worth rendering.
  */
-function isReadableSourcePath(file: string): boolean {
+function isReadableSourcePath(
+  file: string,
+  root: string = resolve(process.cwd()),
+): boolean {
   if (!READABLE_EXTENSIONS.test(file)) {
     return false;
   }
-  const root = resolve(process.cwd());
   const resolved = resolve(file);
   return resolved === root || resolved.startsWith(root + sep);
 }
 
-function parseFrames(stack: string): ParsedFrame[] {
+/**
+ * The lines of a stack that V8 wrote, as opposed to the ones the message did.
+ *
+ * `Error#stack` is `${name}: ${message}` followed by the frames, and nothing in
+ * the string marks where one ends and the other starts: a message carrying
+ * `"\n    at f (/app/dist/config.js:1:1)"` - a request parameter interpolated
+ * into a validation or driver error is enough - reads as a frame, and sits
+ * above the real ones. So the boundary is taken from the error itself: the
+ * message has to be found on the stack's first line and run to the end of a
+ * line, and only the unbroken run of frame lines directly after it counts.
+ * That run also ends before anything appended later (`Caused by: ...`), which
+ * is one more message.
+ *
+ * Fails closed. An error whose message was reassigned after construction no
+ * longer matches its own stack and gets no code frames, which costs a nicety;
+ * guessing the boundary instead is what the paragraph above is about.
+ *
+ * With `message` undefined the whole string is treated as frames - only for a
+ * stack the caller wrote itself.
+ */
+function frameLines(stack: string, message: string | undefined): string[] {
+  if (message === undefined) {
+    return stack.split("\n", MAX_FRAME_LINES);
+  }
+
+  let headerEnd: number;
+  if (message === "") {
+    headerEnd = stack.indexOf("\n");
+  } else {
+    const at = stack.indexOf(message);
+    if (at === -1 || stack.lastIndexOf("\n", at) !== -1) {
+      return [];
+    }
+    headerEnd = at + message.length;
+  }
+  if (headerEnd === -1 || stack[headerEnd] !== "\n") {
+    return [];
+  }
+
+  const lines: string[] = [];
+  for (const line of stack.slice(headerEnd + 1).split("\n", MAX_FRAME_LINES)) {
+    if (!FRAME_PREFIX.test(line)) {
+      break;
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+/**
+ * Reads one V8 frame line, in either shape:
+ *   at fn (/abs/path/file.ts:42:31)
+ *   at /abs/path/file.ts:42:31
+ *
+ * Taken apart by index rather than by one pattern. The pattern this replaces
+ * had two lazy groups that could each claim the same text, which made a line
+ * with no position quadratic to reject - seconds of event loop for a 100KB
+ * line, and the line came from whoever wrote the error message.
+ */
+function parseFrameLine(raw: string): ParsedFrame | undefined {
+  if (raw.length > MAX_FRAME_LINE_LENGTH) {
+    return undefined;
+  }
+  const prefix = FRAME_PREFIX.exec(raw);
+  if (!prefix) {
+    return undefined;
+  }
+
+  let location = raw.slice(prefix[0].length).trimEnd();
+  if (location.endsWith(")")) {
+    const open = location.indexOf(" (");
+    if (open !== -1) {
+      location = location.slice(open + 2, -1);
+    }
+  }
+
+  const columnAt = location.lastIndexOf(":");
+  const lineAt = location.lastIndexOf(":", columnAt - 1);
+  if (lineAt <= 0) {
+    return undefined;
+  }
+  const line = location.slice(lineAt + 1, columnAt);
+  const column = location.slice(columnAt + 1);
+  if (!/^\d+$/.test(line) || !/^\d+$/.test(column)) {
+    return undefined;
+  }
+
+  return {
+    file: location.slice(0, lineAt),
+    line: Number(line),
+    column: Number(column),
+  };
+}
+
+function parseFrames(
+  stack: string,
+  message: string | undefined,
+): ParsedFrame[] {
   const frames: ParsedFrame[] = [];
 
-  for (const raw of stack.split("\n")) {
-    const match = FRAME_PATTERN.exec(raw);
-    if (!match) {
+  for (const raw of frameLines(stack, message)) {
+    const parsed = parseFrameLine(raw);
+    if (!parsed) {
       continue;
     }
 
-    const [, file, line, column] = match;
+    const { file, line, column } = parsed;
     if (isIgnored(file)) {
       continue;
     }
@@ -114,7 +217,7 @@ function parseFrames(stack: string): ParsedFrame[] {
       continue;
     }
 
-    frames.push({ file, line: Number(line), column: Number(column) });
+    frames.push({ file, line, column });
   }
 
   return frames;
@@ -127,7 +230,15 @@ function readSource(file: string): string[] | null {
 
   let lines: string[] | null = null;
   try {
-    lines = readFileSync(file, "utf8").split("\n");
+    // The path was checked as written; what gets opened is where it leads. A
+    // symlink under the root - `current -> /releases/42`, or something less
+    // innocent - passes a lexical check while pointing anywhere, so the
+    // resolved path has to clear the same gate. The root is resolved too: a
+    // working directory reached through a link is otherwise outside itself.
+    const real = realpathSync(file);
+    if (isReadableSourcePath(real, realpathSync(process.cwd()))) {
+      lines = readFileSync(real, "utf8").split("\n");
+    }
   } catch {
     // Unreadable for any reason - bundled away, permissions, deleted since
     // build. Cached as a miss so it is not retried on the next throw.
@@ -165,6 +276,12 @@ export function collectCodeFrames(
     linesOfContext?: number;
     maxFrames?: number;
     sourceMaps?: boolean;
+    /**
+     * The error's own `message`, which is how the frames are told apart from
+     * message text that looks like one - see `frameLines`. Always pass it for
+     * a stack that came off an error.
+     */
+    message?: string;
   } = {},
 ): CodeFrame[] | undefined {
   if (!stack) {
@@ -193,7 +310,7 @@ export function collectCodeFrames(
   const maxFrames = options.maxFrames ?? 5;
 
   try {
-    const frames = parseFrames(stack).slice(0, maxFrames);
+    const frames = parseFrames(stack, options.message).slice(0, maxFrames);
     const codeFrames: CodeFrame[] = [];
 
     for (const frame of frames) {

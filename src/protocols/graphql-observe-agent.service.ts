@@ -7,7 +7,11 @@ import {
   RequestSnapshot,
 } from "../interfaces/index.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
-import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "../observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  OBSERVE_OPTIONS,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
@@ -248,7 +252,11 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     };
 
     const store = this.asyncLocalStorage.getStore();
-    const traceId = store?.get(this.options.traceIdKey);
+    // The registry key, where the transport in front gave the request one
+    // of its own; the trace id otherwise, which is then the key as well.
+    const traceId =
+      store?.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
+      store?.get(this.options.traceIdKey);
 
     if (traceId) {
       return this.startWithinRequest(

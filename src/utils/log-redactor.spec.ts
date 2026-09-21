@@ -261,6 +261,65 @@ describe("LogRedactor", () => {
     });
   });
 
+  describe("compound attribute keys", () => {
+    it("masks a credential named for what it is", () => {
+      expect(
+        redactor.redactAttributes({
+          clientSecret: "s3cr3t",
+          resetToken: "abc",
+          maxTokens: 4096,
+        }),
+      ).toEqual({
+        clientSecret: "[REDACTED]",
+        resetToken: "[REDACTED]",
+        maxTokens: 4096,
+      });
+    });
+  });
+
+  describe("source lines", () => {
+    it("masks a literal assigned to a sensitive name", () => {
+      expect(
+        redactor.redactSource([
+          "export default {",
+          '  dbPassword: "hunter2",',
+          "  apiKey: 'sk_live_abcdef',",
+          "};",
+        ]),
+      ).toEqual([
+        "export default {",
+        "  dbPassword: [REDACTED],",
+        "  apiKey: [REDACTED],",
+        "};",
+      ]);
+    });
+
+    it("leaves code that only names a credential as it was written", () => {
+      const lines = [
+        "const token = await this.auth.sign(user);",
+        "if (password !== confirmation) {",
+        "  return { secret: process.env.APP_SECRET };",
+      ];
+
+      expect(redactor.redactSource(lines)).toEqual(lines);
+    });
+
+    it("keeps the line count when a match spans lines", () => {
+      const lines = [
+        "const key = `-----BEGIN PRIVATE KEY-----",
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+        "-----END PRIVATE KEY-----`;",
+        "after();",
+      ];
+
+      const output = redactor.redactSource(lines);
+
+      expect(output).toHaveLength(lines.length);
+      expect(output.join("\n")).not.toContain("MIIEvQ");
+      expect(output[3]).toBe("after();");
+    });
+  });
+
   describe("configuration", () => {
     it("uses a custom replacement string", () => {
       const custom = new LogRedactor({ replacement: "***" });

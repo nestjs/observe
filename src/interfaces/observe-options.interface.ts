@@ -1,3 +1,5 @@
+import type { OutgoingHttpOptions } from "../outgoing/http.integration.js";
+import type { HttpCaptureOptions } from "../utils/capture-request.util.js";
 import {
   FactoryProvider,
   ModuleMetadata,
@@ -24,9 +26,15 @@ export interface RedactionOptions {
   patterns?: RegExp[];
 
   /**
-   * Extra attribute keys whose values are masked outright, on top of the
-   * built-in list. Compared case-insensitively, ignoring `-` and `_`, so
-   * "apiKey", "api_key" and "API-KEY" are one entry.
+   * Extra keys whose values are masked outright, on top of the built-in
+   * rules - wherever masking is by key: log attributes, captured headers and
+   * bodies, and the query string of a recorded URL. Compared
+   * case-insensitively, ignoring `-` and `_`, so "apiKey", "api_key" and
+   * "API-KEY" are one entry.
+   *
+   * The built-in rules already match a name by what it ends in (`resetToken`,
+   * `client_secret`, `X-Amz-Signature`), so this is for names that do not say
+   * what they hold.
    */
   keys?: string[];
 
@@ -274,7 +282,7 @@ export interface ObserveOptions {
   tracesSampleRate?:
     | number
     | ((
-        protocal: "http" | "rpc" | "grpc" | "graphql",
+        protocal: "http" | "rpc" | "grpc" | "graphql" | "ws",
         attributes: any,
       ) => boolean);
 
@@ -397,6 +405,19 @@ export interface ObserveOptions {
      * @default undefined
      */
     queryParamsObfuscateRegex?: RegExp;
+    /**
+     * What to record of the request itself - the inputs that tell a
+     * reproducible problem from a one-off - for a request that **failed**, or
+     * one slower than `slowerThanMs` when that is set. Never recorded for an
+     * ordinary request.
+     *
+     * By default a short allow-list of headers that neither authenticate nor
+     * identify the caller (`user-agent`, `content-type`, `referer`, ...) and
+     * no body. Everything recorded passes through `redaction` first. Set to
+     * `false` to record nothing.
+     * @example { headers: ['user-agent', 'x-tenant-id'], body: { maxBytes: 4096 }, slowerThanMs: 2000 }
+     */
+    capture?: HttpCaptureOptions | false;
     /**
      * A function to associate a user identifier with the HTTP request.
      * This function receives the request object and should return a string representing the user ID.
@@ -543,6 +564,62 @@ export interface ObserveOptions {
     getUserId?: (call: any) => string;
   };
   /**
+   * Spans for what leaves the process: database queries (`pg`, `mysql2`,
+   * `mongodb` - and so every ORM built on them) and outbound HTTP requests
+   * (`fetch`/undici and `node:http`, so axios too). On by default; `false`
+   * switches all of it off.
+   *
+   * A query span is named after its verb and table (`SELECT users`) and
+   * carries the statement with every literal removed; bound parameters are
+   * never read. An HTTP span is named after the method and host, and carries
+   * the URL with sensitive query parameters masked.
+   */
+  outgoing?:
+    | false
+    | {
+        /** @default true */
+        database?: boolean;
+        /** @default true */
+        http?: boolean | OutgoingHttpOptions;
+      };
+  /**
+   * WebSocket gateway configuration options for the Observe APM.
+   *
+   * The unit is one inbound message handled by a `@SubscribeMessage()`
+   * method, reported as a request whose operation id is
+   * `GatewayClass:pattern`. Connection and disconnection are not operations
+   * and are not reported. A message has no carrier for a trace id, so each one
+   * opens a trace of its own.
+   */
+  ws?: {
+    /**
+     * A function that determines whether to skip tracing a given message.
+     * @example (message) => message.pattern === 'ping'
+     * @default () => false
+     */
+    ignore?: (message: WsMessageContext) => boolean;
+    /**
+     * Tags to be added to every gateway message trace.
+     * @default {}
+     */
+    tags?: Record<string, string | number | boolean>;
+    /**
+     * A function to generate additional attributes for a message. These can be
+     * retrieved later within the trace.
+     * @default () => ({})
+     */
+    setAttributes?: (message: WsMessageContext) => {
+      [key: string]: string | number | boolean;
+    };
+    /**
+     * A function to associate a user identifier with the message - typically
+     * read from whatever the connection handler attached to the client.
+     * @example (message) => message.client.data?.userId
+     * @default undefined
+     */
+    getUserId?: (message: WsMessageContext) => string | undefined;
+  };
+  /**
    * Jobs configuration options for the Observe APM.
    *
    * Covers every handler reported as a job: BullMQ processors, and the
@@ -607,4 +684,16 @@ export interface ObserveModuleAsyncOptions
    * Set to true to register ObserveModule as a global module
    */
   global?: boolean;
+}
+
+/** What a `ws` option hook is told about the message being handled. */
+export interface WsMessageContext {
+  /** Class name of the gateway handling the message. */
+  gateway: string;
+  /** The `@SubscribeMessage()` pattern. */
+  pattern: string;
+  /** The client socket, as the platform adapter hands it to the gateway. */
+  client: any;
+  /** The message payload. Never recorded - it is here for the hooks only. */
+  data: unknown;
 }
