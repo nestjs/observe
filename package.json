@@ -134,7 +134,7 @@
     "@nestjs/testing": "12.0.1",
     "@nestjs/websockets": "12.0.3",
     "@swc/core": "1.16.1",
-    "@types/node": "22.20.1",
+    "@types/node": "22.20.4",
     "@types/pg": "8.23.1",
     "@types/supertest": "7.2.1",
     "@types/ws": "8.18.1",
