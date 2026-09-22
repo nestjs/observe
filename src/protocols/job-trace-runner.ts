@@ -146,6 +146,22 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
   }
 
   /**
+   * Whether `jobs.ignore` matches this run. A predicate that throws is
+   * reported and read as "trace it": a bug in tracing configuration must not
+   * stop the job itself from running.
+   */
+  private isIgnored(context: JobContext): boolean {
+    try {
+      return Boolean(this.options.jobs?.ignore?.(context));
+    } catch (error) {
+      this.logger.warn(
+        `"jobs.ignore" threw for job "${context.name}" (queue "${context.queueName}"); tracing it anyway: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
    * Runs one job under a trace.
    *
    * `invoke` is handed `settle` for drivers whose handlers finish through a
@@ -197,7 +213,7 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         }
       }
 
-      if (this.options.jobs?.ignore?.(context)) {
+      if (this.isIgnored(context)) {
         // The trace id stays in the store so logs and jobs enqueued from here
         // still correlate; nothing is registered under the registry key, so
         // its spans have no trace to join.
