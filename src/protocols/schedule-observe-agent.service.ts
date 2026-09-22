@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "async_hooks";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import {
+  JobContext,
   JobSnapshot,
   ObserveModuleOptionsWithDefaults,
 } from "../interfaces/index.js";
@@ -234,18 +235,21 @@ export class ScheduleObserveAgentService<
 
         // Every firing is its own job run, so every firing gets its own id.
         const id = uuidv7();
+        const context: JobContext = { queueName, name, id };
 
         if (this.options.jobs?.setAttributes) {
-          const attributes = this.options.jobs.setAttributes({
-            queueName,
-            name,
-            id,
-          });
+          const attributes = this.options.jobs.setAttributes(context);
           if (attributes) {
             for (const [key, value] of Object.entries(attributes)) {
               store.set(key, value);
             }
           }
+        }
+
+        if (this.options.jobs?.ignore?.(context)) {
+          // Still under a trace id of its own, so logs correlate; with no
+          // trace started, its spans have nothing to join.
+          return methodRef.call(instance, ...args);
         }
 
         this.operationTraceRegistry.startTrace(traceId, {

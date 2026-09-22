@@ -43,6 +43,14 @@ class TasksService {
   everySecond() {
     return "tick";
   }
+
+  ignoredRuns = 0;
+
+  @Timeout("ignored-report", 20)
+  ignoredReport() {
+    this.ignoredRuns++;
+    return this.ledger.reconcile();
+  }
 }
 
 @Module({
@@ -52,6 +60,7 @@ class TasksService {
       testObserveOptions({
         jobs: {
           tags: { environment: "test" },
+          ignore: (job) => job.name === "ignored-report",
           setAttributes: (job) => ({ jobName: job.name, jobId: job.id! }),
         },
       }),
@@ -160,6 +169,21 @@ describe("ObserveModule: @nestjs/schedule collection", () => {
       className: "TasksService",
       methodKey: "everySecond",
     });
+  });
+
+  it("runs a handler matched by jobs.ignore without reporting it", async () => {
+    // Fires alongside nightlyReport, so once that one has shipped the ignored
+    // one has had every chance to.
+    await waitForJobSnapshot(
+      collected,
+      (item) => item.name === "TasksService.nightlyReport",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(app.get(TasksService).ignoredRuns).toBe(1);
+    expect(
+      collected.items.filter((s) => s.name === "ignored-report"),
+    ).toHaveLength(0);
   });
 });
 

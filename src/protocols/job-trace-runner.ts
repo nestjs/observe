@@ -2,6 +2,7 @@ import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import {
+  JobContext,
   JobSnapshot,
   ObserveModuleOptionsWithDefaults,
 } from "../interfaces/index.js";
@@ -183,24 +184,31 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       store.set(this.options.traceIdKey, traceId);
       store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, registryKey);
 
-      const attributes = this.options.jobs?.setAttributes?.({
+      const context: JobContext = {
         queueName: job.queueName,
         name: job.name,
-        id: job.id as string,
-      });
+        id: typeof job.id === "number" ? `${job.id}` : job.id,
+      };
+
+      const attributes = this.options.jobs?.setAttributes?.(context);
       if (attributes) {
         for (const [key, value] of Object.entries(attributes)) {
           store.set(key, value);
         }
       }
 
+      if (this.options.jobs?.ignore?.(context)) {
+        // The trace id stays in the store so logs and jobs enqueued from here
+        // still correlate; nothing is registered under the registry key, so
+        // its spans have no trace to join.
+        return invoke(() => undefined);
+      }
+
       this.operationTraceRegistry.startTrace(
         registryKey,
         {
           tags: this.options.jobs?.tags,
-          queueName: job.queueName,
-          name: job.name,
-          id: typeof job.id === "number" ? `${job.id}` : job.id,
+          ...context,
           ...job.metadata,
         } as JobSnapshot,
         traceId,
