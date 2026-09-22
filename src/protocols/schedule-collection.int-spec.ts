@@ -2,6 +2,7 @@ import { INestApplication, Injectable, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { Cron, Interval, ScheduleModule, Timeout } from "@nestjs/schedule";
 import { createObserveModule } from "../observe.module.js";
+import { TracerService } from "../services/tracer.service.js";
 import {
   CollectedJobSnapshots,
   collectJobSnapshots,
@@ -20,7 +21,10 @@ class LedgerService {
 
 @Injectable()
 class TasksService {
-  constructor(private readonly ledger: LedgerService) {}
+  constructor(
+    private readonly ledger: LedgerService,
+    private readonly tracer: TracerService,
+  ) {}
 
   @Timeout(20)
   async nightlyReport() {
@@ -43,6 +47,16 @@ class TasksService {
   everySecond() {
     return "tick";
   }
+
+  ignoredRuns = 0;
+
+  @Timeout("ignored-report", 20)
+  async ignoredReport() {
+    // Tagging the span must keep working when nothing is recording it.
+    (await this.tracer.activeSpan()).setTag("report", "ignored");
+    this.ignoredRuns++;
+    return this.ledger.reconcile();
+  }
 }
 
 @Module({
@@ -52,6 +66,7 @@ class TasksService {
       testObserveOptions({
         jobs: {
           tags: { environment: "test" },
+          ignore: (job) => job.name === "ignored-report",
           setAttributes: (job) => ({ jobName: job.name, jobId: job.id! }),
         },
       }),
@@ -160,6 +175,21 @@ describe("ObserveModule: @nestjs/schedule collection", () => {
       className: "TasksService",
       methodKey: "everySecond",
     });
+  });
+
+  it("runs a handler matched by jobs.ignore without reporting it", async () => {
+    // Fires alongside nightlyReport, so once that one has shipped the ignored
+    // one has had every chance to.
+    await waitForJobSnapshot(
+      collected,
+      (item) => item.name === "TasksService.nightlyReport",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(app.get(TasksService).ignoredRuns).toBe(1);
+    expect(
+      collected.items.filter((s) => s.name === "ignored-report"),
+    ).toHaveLength(0);
   });
 });
 

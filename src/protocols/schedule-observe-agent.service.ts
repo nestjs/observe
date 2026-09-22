@@ -13,6 +13,7 @@ import {
   describePeerLoadError,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
+import { JobTraceRunner } from "./job-trace-runner.js";
 
 /**
  * `@nestjs/schedule`'s metadata keys and scheduler-type enum, inlined so the
@@ -73,16 +74,22 @@ export class ScheduleObserveAgentService<
   Store extends Record<string, unknown>,
 > {
   private readonly logger = new Logger(ScheduleObserveAgentService.name);
+  private readonly runner: JobTraceRunner<Store>;
 
   constructor(
-    private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
+    observeAgentSharedBuffer: ObserveAgentSharedBuffer,
     @Inject(OBSERVE_OPTIONS)
-    private readonly options: ObserveModuleOptionsWithDefaults,
-    private readonly operationTraceRegistry: OperationTraceRegistry,
-    private readonly asyncLocalStorage: AsyncLocalStorage<
-      Map<KeyOf<Store>, any>
-    >,
+    options: ObserveModuleOptionsWithDefaults,
+    operationTraceRegistry: OperationTraceRegistry,
+    asyncLocalStorage: AsyncLocalStorage<Map<KeyOf<Store>, any>>,
   ) {
+    this.runner = new JobTraceRunner(
+      observeAgentSharedBuffer,
+      options,
+      operationTraceRegistry,
+      asyncLocalStorage,
+      this.logger,
+    );
     this.patchScheduleExplorer();
   }
 
@@ -210,93 +217,18 @@ export class ScheduleObserveAgentService<
   ): ScheduledHandler {
     const { queueName, name } = this.describeHandler(methodRef, instance);
 
-    return (...args: unknown[]) => {
-      const hasOuterContext = this.asyncLocalStorage
-        .getStore()
-        ?.has(this.options.traceIdKey);
-
-      const store = new Map<KeyOf<Store>, any>();
-      return this.asyncLocalStorage.run(store, () => {
-        if (hasOuterContext) {
-          // Already inside a trace - a handler invoked by hand from a request,
-          // say. The outer trace owns the spans; opening a second one would
-          // report the same work twice.
-          if (this.options.debug) {
-            this.logger.debug(
-              `Outer context already has a trace ID. Skipping inner context for scheduled job "${name}"`,
-            );
-          }
-          return methodRef.call(instance, ...args);
-        }
-
-        const traceId = uuidv7();
-        store.set(this.options.traceIdKey, traceId);
-
-        // Every firing is its own job run, so every firing gets its own id.
-        const id = uuidv7();
-
-        if (this.options.jobs?.setAttributes) {
-          const attributes = this.options.jobs.setAttributes({
-            queueName,
-            name,
-            id,
-          });
-          if (attributes) {
-            for (const [key, value] of Object.entries(attributes)) {
-              store.set(key, value);
-            }
-          }
-        }
-
-        this.operationTraceRegistry.startTrace(traceId, {
-          tags: this.options.jobs?.tags,
+    // The explorer's own wrapper is outside this one, so a throwing or
+    // rejecting handler is still logged by the scheduler as it always was.
+    return (...args: unknown[]) =>
+      this.runner.run(
+        {
           queueName,
           name,
-          id,
-        } as JobSnapshot);
-
-        const endTrace = (status: JobSnapshot["status"]) => {
-          setTimeout(async () => {
-            this.operationTraceRegistry.endTrace(traceId, { status });
-
-            const snapshot = (await this.operationTraceRegistry.pluckSnapshot(
-              traceId,
-            )) as JobSnapshot | undefined;
-
-            // Absent when the registry discarded the trace - a handler on a
-            // provider the instance decorator never wrapped records no spans,
-            // and a trace with no spans is dropped rather than shipped empty.
-            if (!snapshot) {
-              return;
-            }
-            this.observeAgentSharedBuffer.insertJobSnapshot(snapshot);
-          }, 0);
-        };
-
-        try {
-          const returnValue = methodRef.call(instance, ...args);
-          if (returnValue instanceof Promise) {
-            return returnValue.then(
-              (ret) => {
-                endTrace("completed");
-                return ret;
-              },
-              (error: unknown) => {
-                endTrace("failed");
-                // The explorer's own wrapper is outside this one and logs the
-                // rejection as it always did.
-                throw error;
-              },
-            );
-          }
-
-          endTrace("completed");
-          return returnValue;
-        } catch (error) {
-          endTrace("failed");
-          throw error;
-        }
-      });
-    };
+          // Every firing is its own job run, so every firing gets its own id.
+          id: uuidv7(),
+          metadata: {},
+        },
+        () => methodRef.call(instance, ...args),
+      );
   }
 }

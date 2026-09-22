@@ -12,6 +12,7 @@ import {
   collectJobSnapshots,
   collectSnapshots,
   testObserveOptions,
+  waitFor,
   waitForJobSnapshot,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
@@ -34,6 +35,9 @@ const redisReachable = await new Promise<boolean>((resolve) => {
 const QUEUE_NAME = `observe-bull-int-${process.pid}`;
 
 const { ObserveModule, ObserveInstrument } = createObserveModule();
+
+/** How many times the processor `jobs.ignore` matches has run. */
+let ignoredRuns = 0;
 
 @Injectable()
 class MailerService {
@@ -58,6 +62,17 @@ class MailProcessor {
 
   @Process("orphan-mail")
   async orphan(_job: Job) {
+    return this.mailer.deliver();
+  }
+
+  @Process("ignored-mail")
+  async ignored(_job: Job) {
+    ignoredRuns++;
+    return this.mailer.deliver();
+  }
+
+  @Process("after-ignored-mail")
+  async afterIgnored(_job: Job) {
     return this.mailer.deliver();
   }
 
@@ -99,7 +114,11 @@ class SignupController {
       redis: { host: REDIS_HOST, port: REDIS_PORT },
     }),
     BullModule.registerQueue({ name: QUEUE_NAME }),
-    ObserveModule.forRoot(testObserveOptions()),
+    ObserveModule.forRoot(
+      testObserveOptions({
+        jobs: { ignore: (job) => job.name === "ignored-mail" },
+      }),
+    ),
   ],
   controllers: [SignupController],
   providers: [MailerService, MailProcessor],
@@ -188,6 +207,20 @@ describe.skipIf(!redisReachable)(
         (item) => item.name === "orphan-mail",
       );
       expect(job.traceId).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it("runs a job matched by jobs.ignore without reporting it", async () => {
+      await queue.add("ignored-mail", {});
+      await waitFor(() => ignoredRuns === 1, 5_000, "the ignored-mail run");
+
+      // Enqueued once the ignored run is under way: had it a snapshot, it would
+      // land well before this job has made the round trip through Redis.
+      await queue.add("after-ignored-mail", {});
+      await waitForJobSnapshot(
+        jobs,
+        (item) => item.name === "after-ignored-mail",
+      );
+      expect(jobs.items.map((item) => item.name)).not.toContain("ignored-mail");
     });
 
     it("reports a throwing processor as failed", async () => {

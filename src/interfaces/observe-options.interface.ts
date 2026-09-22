@@ -631,6 +631,18 @@ export interface ObserveOptions {
    */
   jobs?: {
     /**
+     * A function that determines whether to skip tracing a given job run.
+     * Receives the same descriptor as `setAttributes`, so it can match on the
+     * queue (or scheduler type) and the job name.
+     *
+     * An ignored run still executes under a trace id of its own - log lines
+     * stay correlated, and jobs it enqueues inherit that id - but no trace is
+     * opened for it, so none of its spans are recorded and nothing is shipped.
+     * @example (job) => job.queueName === 'interval' && job.name === 'heartbeat'
+     * @default () => false
+     */
+    ignore?: (job: JobContext) => boolean;
+    /**
      * Tags to be added to all job requests.
      * These tags can be used to provide additional context for the requests.
      * @example { 'environment': 'production', 'version': '1.0.0' }
@@ -644,16 +656,7 @@ export interface ObserveOptions {
      * @example (job) => ({ 'queueName': job.queueName, 'jobName': job.name })
      * @default (job) => ({})
      */
-    setAttributes?: (job: {
-      /** The BullMQ queue, or the scheduler type for a scheduled handler. */
-      queueName: string;
-      name: string;
-      /**
-       * Absent until the queue driver has assigned one. Always present for a
-       * scheduled handler, where it identifies this particular firing.
-       */
-      id: string | undefined;
-    }) => {
+    setAttributes?: (job: JobContext) => {
       [key: string]: string | number | boolean;
     };
   };
@@ -684,6 +687,18 @@ export interface ObserveModuleAsyncOptions
    * Set to true to register ObserveModule as a global module
    */
   global?: boolean;
+}
+
+/** What a `jobs` option hook is told about the run being started. */
+export interface JobContext {
+  /** The BullMQ queue, or the scheduler type for a scheduled handler. */
+  queueName: string;
+  name: string;
+  /**
+   * Absent until the queue driver has assigned one. Always present for a
+   * scheduled handler, where it identifies this particular firing.
+   */
+  id: string | undefined;
 }
 
 /** What a `ws` option hook is told about the message being handled. */

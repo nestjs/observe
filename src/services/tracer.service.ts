@@ -66,7 +66,9 @@ export class TracerService<
   /**
    * Retrieves the active span for the current request.
    * This method should be called within an async context where the AsyncLocalStorage is active.
-   * If no active span is found, an error is thrown.
+   * If the operation is traced but no span is active, an error is thrown. An
+   * operation that is not being recorded (ignored or sampled out) gets a
+   * detached delegate whose tags go nowhere, as `createSpan` does.
    * @returns {Promise<TraceSpanDelegate>} A promise that resolves to the active span delegate.
    */
   async activeSpan(): Promise<TraceSpanDelegate> {
@@ -84,6 +86,13 @@ export class TracerService<
       traceId,
       callerId,
     );
+    if (!activeOngoingEvent && !this.operationTraceRegistry.hasTrace(traceId)) {
+      // The store carries the id for log correlation, but no trace was opened
+      // under it: `http.ignore`, `jobs.ignore`, or the sampler said no. Which
+      // operations get recorded is configuration; a handler tagging its span
+      // must not start failing because someone changed it.
+      return new TraceSpanDelegate("", undefined, {});
+    }
     if (!activeOngoingEvent) {
       throw new Error(
         `No active span found for traceId: ${traceId}. Ensure that a span is created before calling "activeSpan".`,
