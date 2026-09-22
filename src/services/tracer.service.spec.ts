@@ -183,12 +183,28 @@ describe("TracerService", () => {
       });
     });
 
-    it("fails clearly when there is no active span", async () => {
+    it("fails clearly when the trace is open but no span is active", async () => {
+      registry.startTrace("a3", {
+        operationId: "GET /orders",
+        protocol: "http",
+        attributes: { method: "GET", originalUrl: "/orders" },
+        tags: {},
+      });
+
       await expect(
-        als.run(new Map([[TRACE_ID_KEY, "unknown"]]), () =>
-          tracer.activeSpan(),
-        ),
+        als.run(new Map([[TRACE_ID_KEY, "a3"]]), () => tracer.activeSpan()),
       ).rejects.toThrow(/No active span found/);
+    });
+
+    it("hands back a detached delegate when the operation is not recorded", async () => {
+      // An ignored or sampled-out operation: the id is in the store for log
+      // correlation, but no trace was ever opened under it.
+      const span = await als.run(new Map([[TRACE_ID_KEY, "unrecorded"]]), () =>
+        tracer.activeSpan(),
+      );
+
+      expect(() => span.setTag("tenant", "acme")).not.toThrow();
+      expect(registry.hasTrace("unrecorded")).toBe(false);
     });
 
     it("fails clearly outside any async context", async () => {

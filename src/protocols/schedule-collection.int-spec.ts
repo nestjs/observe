@@ -2,6 +2,7 @@ import { INestApplication, Injectable, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { Cron, Interval, ScheduleModule, Timeout } from "@nestjs/schedule";
 import { createObserveModule } from "../observe.module.js";
+import { TracerService } from "../services/tracer.service.js";
 import {
   CollectedJobSnapshots,
   collectJobSnapshots,
@@ -20,7 +21,10 @@ class LedgerService {
 
 @Injectable()
 class TasksService {
-  constructor(private readonly ledger: LedgerService) {}
+  constructor(
+    private readonly ledger: LedgerService,
+    private readonly tracer: TracerService,
+  ) {}
 
   @Timeout(20)
   async nightlyReport() {
@@ -47,7 +51,9 @@ class TasksService {
   ignoredRuns = 0;
 
   @Timeout("ignored-report", 20)
-  ignoredReport() {
+  async ignoredReport() {
+    // Tagging the span must keep working when nothing is recording it.
+    (await this.tracer.activeSpan()).setTag("report", "ignored");
     this.ignoredRuns++;
     return this.ledger.reconcile();
   }
