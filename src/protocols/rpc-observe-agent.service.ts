@@ -110,6 +110,10 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
   }
 
   registerRpcHooks(target: Server) {
+    // Return `done()`'s promise, as Nest's default hook does. Nest's servers
+    // hand it back from their message handlers: kafkajs waits on it to commit
+    // the offset or retry the message, and recent Nest versions log its
+    // rejection for most other transports.
     target.setOnProcessingStartHook(
       (
         transportId: Transport | symbol,
@@ -117,10 +121,17 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         done: () => Promise<any>,
       ) => {
         if (transportId === this.microservices!.Transport.GRPC) {
-          this.startGrpcRequestTracing(transportId, ctx as GrpcCall, done);
-          return;
+          return this.startGrpcRequestTracing(
+            transportId,
+            ctx as GrpcCall,
+            done,
+          );
         }
-        this.startRpcRequestTracing(transportId, ctx as BaseRpcContext, done);
+        return this.startRpcRequestTracing(
+          transportId,
+          ctx as BaseRpcContext,
+          done,
+        );
       },
     );
 
@@ -151,11 +162,11 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     transportId: Transport | symbol,
     ctx: BaseRpcContext,
     done: () => Promise<any>,
-  ) {
+  ): Promise<unknown> {
     // The same map `run` is given, rather than `getStore()` inside the callback:
     // identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
-    this.asyncLocalStorage.run(store, () => {
+    return this.asyncLocalStorage.run(store, () => {
       const traceId = this.options.traceIdGenerator(ctx);
       store.set(this.options.traceIdKey, traceId);
 
@@ -185,7 +196,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         operationId: this.getOperationIdFromContext(ctx),
         tags: this.options.rpc?.tags,
       });
-      done();
+      return done();
       // });
     });
   }
@@ -194,10 +205,10 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     transportId: Transport | symbol,
     call: GrpcCall,
     done: () => Promise<any>,
-  ) {
+  ): Promise<unknown> {
     // As above: the map `run` is given, not looked back up.
     const store = new Map<KeyOf<Store>, any>();
-    this.asyncLocalStorage.run(store, () => {
+    return this.asyncLocalStorage.run(store, () => {
       const traceId = this.options.traceIdGenerator(call);
       store.set(this.options.traceIdKey, traceId);
 
@@ -210,24 +221,26 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         }
       }
 
-      setTimeout(() => {
-        if (this.options.grpc?.ignore?.(call)) {
-          return done();
-        }
+      return new Promise<unknown>((resolve) => {
+        setTimeout(() => {
+          if (this.options.grpc?.ignore?.(call)) {
+            return resolve(done());
+          }
 
-        const shouldCapture = this.traceSamplerService.shouldCapture("grpc", {
-          call,
-        });
-        if (!shouldCapture) {
-          return done();
-        }
-        this.operationTraceRegistry.startTrace(traceId, {
-          protocol: this.toProtocolName(transportId),
-          operationId: call.operationId,
-          tags: this.options.grpc?.tags,
-        });
-        done();
-      }, 0);
+          const shouldCapture = this.traceSamplerService.shouldCapture("grpc", {
+            call,
+          });
+          if (!shouldCapture) {
+            return resolve(done());
+          }
+          this.operationTraceRegistry.startTrace(traceId, {
+            protocol: this.toProtocolName(transportId),
+            operationId: call.operationId,
+            tags: this.options.grpc?.tags,
+          });
+          resolve(done());
+        }, 0);
+      });
     });
   }
 
