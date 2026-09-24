@@ -44,7 +44,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">= 20.19.0"
+    "node": "v26.10.0"
   },
   "scripts": {
     "build": "rimraf dist && tsc -p tsconfig.build.json",
