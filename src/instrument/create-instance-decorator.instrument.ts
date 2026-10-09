@@ -13,6 +13,9 @@ import {
  */
 const STANDALONE_FUNCTION_LABEL = "Function";
 
+/** Class name for an instance that has no constructor function. */
+const FALLBACK_CLASS_NAME = "Object";
+
 type AnyFunction = (...args: any[]) => any;
 
 interface TracedCallSpec {
@@ -268,7 +271,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           return Reflect.get(target, prop);
         }
 
-        const className = target.constructor.name;
+        const className = classNameOf(target);
         const methodName = String(prop);
         const frameName = `${className}.${methodName}`;
 
@@ -566,6 +569,16 @@ function declaresPrivateMembers(ctor: Function): boolean {
   }
 }
 
+/**
+ * The class name that labels an instance's spans. A null-prototype object or
+ * an ES module namespace has no `constructor`, and some objects hold a
+ * non-function there. Both fall back to `Object`.
+ */
+function classNameOf(instance: object): string {
+  const ctor: unknown = Reflect.get(instance, "constructor");
+  return typeof ctor === "function" ? ctor.name : FALLBACK_CLASS_NAME;
+}
+
 function generateSpanId(instance: object, methodKey: string): string {
-  return `${instance.constructor.name}#${methodKey}`;
+  return `${classNameOf(instance)}#${methodKey}`;
 }
