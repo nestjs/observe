@@ -1,4 +1,4 @@
-import { Controller, Get, Module } from "@nestjs/common";
+import { Controller, Get, Inject, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { NestExpressApplication } from "@nestjs/platform-express";
 import { ClsModule, ClsService } from "nestjs-cls";
@@ -63,5 +63,51 @@ describe("ObserveModule: bootstrap alongside nestjs-cls proxy providers", () => 
       ok: true,
       hasRequestId: true,
     });
+  });
+});
+
+// A native ES module namespace has no prototype, so no `constructor`. A
+// `data:` module reaches Node's loader as it is, where a file in the repo
+// would go through Vitest's transform.
+const utilsUrl =
+  "data:text/javascript,export const greet = (name) => `hello ${name}`";
+const utilsNamespace: { greet: (name: string) => string } = await import(
+  utilsUrl
+);
+
+@Controller()
+class GreetController {
+  constructor(@Inject("UTILS") private readonly utils: typeof utilsNamespace) {}
+
+  @Get("greet")
+  greet() {
+    return { message: this.utils.greet("you") };
+  }
+}
+
+@Module({
+  imports: [ObserveModule.forRoot(testObserveOptions())],
+  controllers: [GreetController],
+  providers: [{ provide: "UTILS", useValue: utilsNamespace }],
+})
+class NamespaceProviderModule {}
+
+describe("ObserveModule: a module namespace registered as a value provider", () => {
+  let app: NestExpressApplication;
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  it("serves a request that calls a method on the namespace", async () => {
+    app = await NestFactory.create<NestExpressApplication>(
+      NamespaceProviderModule,
+      { instrument: ObserveInstrument, logger: false },
+    );
+    await app.init();
+
+    await request(app.getHttpServer())
+      .get("/greet")
+      .expect(200, { message: "hello you" });
   });
 });

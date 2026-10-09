@@ -598,6 +598,67 @@ describe("createInstanceDecorator", () => {
     });
   });
 
+  describe("when the instance has no usable constructor", () => {
+    const nullPrototypeProvider = () =>
+      Object.assign(Object.create(null) as Record<string, unknown>, {
+        greet: (name: string) => `hello ${name}`,
+      }) as { greet: (name: string) => string };
+
+    it("traces a null-prototype object under the Object label", () => {
+      const provider = decorate(nullPrototypeProvider()) as {
+        greet: (name: string) => string;
+      };
+
+      const result = withTrace(() => provider.greet("you"));
+
+      expect(result).toEqual("hello you");
+      expect(startedSteps).toEqual([
+        { className: "Object", methodName: "greet" },
+      ]);
+      expect(endedSteps).toEqual([{ spanId: "Object#greet" }]);
+    });
+
+    it("calls a null-prototype object outside a trace", () => {
+      const provider = decorate(nullPrototypeProvider()) as {
+        greet: (name: string) => string;
+      };
+
+      expect(provider.greet("you")).toEqual("hello you");
+      expect(startedSteps).toEqual([]);
+    });
+
+    it("traces an ES module namespace", async () => {
+      // A native namespace object has no prototype, so no `constructor`. A
+      // `data:` module reaches Node's loader as it is. A file in the repo
+      // would go through Vitest's transform and no longer be a native one.
+      const moduleUrl =
+        "data:text/javascript,export const greet = (name) => `hello ${name}`";
+      const namespace: { greet: (name: string) => string } = await import(
+        moduleUrl
+      );
+      expect(Object.getPrototypeOf(namespace)).toBeNull();
+      const decorated = decorate(namespace) as typeof namespace;
+
+      const result = withTrace(() => decorated.greet("you"));
+
+      expect(result).toEqual("hello you");
+      expect(startedSteps).toEqual([
+        { className: "Object", methodName: "greet" },
+      ]);
+      expect(endedSteps).toEqual([{ spanId: "Object#greet" }]);
+    });
+
+    it("uses the Object label when `constructor` is not a function", () => {
+      const provider = decorate({
+        constructor: { name: "Fake" },
+        fn: () => "ok",
+      }) as { fn: () => string };
+
+      expect(withTrace(() => provider.fn())).toEqual("ok");
+      expect(startedSteps).toEqual([{ className: "Object", methodName: "fn" }]);
+    });
+  });
+
   describe("when decorating a standalone function", () => {
     function sendEmail(to: string) {
       return `sent:${to}`;
