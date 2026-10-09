@@ -146,7 +146,36 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           try {
             const result = call(this, args);
             if (result instanceof Promise) {
-              return result.then(onReturnValue).catch(onError);
+              // Watch the promise on a side branch and hand it back untouched.
+              // A `.then().catch()` chain would return a new promise, and the
+              // caller would lose every member the original carries (`json()`
+              // on a `got` request, `cancel()` on a cancelable promise) and
+              // the object identity and the own members of a Promise subclass.
+              // The caller's chain must see the same value and the same
+              // rejection as without the span. `onError` re-throws by design,
+              // so both handlers swallow here: a throw on the side branch
+              // would surface as an unhandled rejection the caller never
+              // caused. The side branch also marks the promise as handled, as
+              // `OutgoingSpanRecorder.endWhenSettled` does.
+              result.then(
+                (value) => {
+                  try {
+                    onReturnValue(value);
+                  } catch {
+                    // The span is a side effect; a failure here must not reach
+                    // the caller.
+                  }
+                },
+                (err) => {
+                  try {
+                    onError(err);
+                  } catch {
+                    // `onError` re-throws the rejection the caller already
+                    // sees; a failure here must not reach the caller either.
+                  }
+                },
+              );
+              return result;
             }
             return onReturnValue(result);
           } catch (err) {
