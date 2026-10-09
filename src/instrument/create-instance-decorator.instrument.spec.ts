@@ -13,6 +13,7 @@ describe("createInstanceDecorator", () => {
     error?: unknown;
     stackAtRecord?: string;
   }>;
+  let endFailure: Error | undefined;
   let decorate: (instance: unknown) => unknown;
 
   const withTrace = <T>(fn: () => T): T =>
@@ -22,6 +23,7 @@ describe("createInstanceDecorator", () => {
     als = new AsyncLocalStorage();
     startedSteps = [];
     endedSteps = [];
+    endFailure = undefined;
 
     const registry = {
       internalStartTraceStep: (
@@ -40,6 +42,9 @@ describe("createInstanceDecorator", () => {
         _callerId: string,
         error?: unknown,
       ) => {
+        if (endFailure) {
+          throw endFailure;
+        }
         // Snapshot the stack as the real registry does - it serializes it into
         // the span payload at this moment, not by holding on to the error.
         endedSteps.push({
@@ -238,6 +243,110 @@ describe("createInstanceDecorator", () => {
         "async-ok",
       );
       expect(endedSteps).toEqual([{ spanId: "UserService#findAsync" }]);
+    });
+
+    describe("when a method returns a promise", () => {
+      const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+      class PromiseService {
+        withMember<P extends Promise<string>>(promise: P): P {
+          return promise;
+        }
+      }
+
+      it("returns the very promise the method returned, members included", async () => {
+        const cancel = () => undefined;
+        const original = Object.assign(Promise.resolve("p"), { cancel });
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const returned = withTrace(() => service.withMember(original));
+
+        expect(returned).toBe(original);
+        expect(returned.cancel).toBe(cancel);
+        await expect(returned).resolves.toBe("p");
+        await settle();
+        expect(endedSteps).toEqual([{ spanId: "PromiseService#withMember" }]);
+      });
+
+      it("hands the caller the original rejection and records it on the span", async () => {
+        const failure = new Error("rejected");
+        const service = decorate(new PromiseService()) as PromiseService;
+        const returned = withTrace(() =>
+          service.withMember(Promise.reject(failure)),
+        );
+
+        await expect(returned).rejects.toBe(failure);
+        await settle();
+
+        expect(endedSteps).toHaveLength(1);
+        expect(endedSteps[0].error).toBe(failure);
+      });
+
+      it("ends the span when the promise settles, not when it is returned", async () => {
+        let resolveLater!: (value: string) => void;
+        const pending = new Promise<string>((resolve) => {
+          resolveLater = resolve;
+        });
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        void withTrace(() => service.withMember(pending));
+        await settle();
+        expect(endedSteps).toEqual([]);
+
+        resolveLater("done");
+        await settle();
+        expect(endedSteps).toHaveLength(1);
+      });
+
+      it("keeps the caller's value when closing the span throws", async () => {
+        endFailure = new Error("registry failed");
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const returned = withTrace(() =>
+          service.withMember(Promise.resolve("p")),
+        );
+
+        await expect(returned).resolves.toBe("p");
+        await settle();
+      });
+
+      it("keeps the caller's rejection when closing the span throws", async () => {
+        endFailure = new Error("registry failed");
+        const failure = new Error("rejected");
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const returned = withTrace(() =>
+          service.withMember(Promise.reject(failure)),
+        );
+
+        await expect(returned).rejects.toBe(failure);
+        await settle();
+      });
+
+      it("builds only one derived promise from a Promise subclass", () => {
+        let constructed = 0;
+        class CountingPromise<T> extends Promise<T> {
+          constructor(
+            executor: (
+              resolve: (value: T | PromiseLike<T>) => void,
+              reject: (reason?: unknown) => void,
+            ) => void,
+          ) {
+            super(executor);
+            constructed += 1;
+          }
+        }
+        const original = CountingPromise.resolve("p");
+        constructed = 0;
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const returned = withTrace(() => service.withMember(original));
+
+        expect(returned).toBe(original);
+        // Observing a promise derives one instance through Symbol.species.
+        // The old `.then().catch()` chain derived two.
+        expect(constructed).toBe(1);
+      });
     });
 
     it("does not record steps outside of an active trace", () => {
