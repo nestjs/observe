@@ -586,6 +586,13 @@ export class OperationTraceRegistry {
     snapshot.operationId = path;
   }
 
+  setOperationId(traceId: TraceId, operationId: string): void {
+    const snapshot = this.traceSnapshots.get(traceId);
+    if (snapshot && "protocol" in snapshot) {
+      snapshot.operationId = operationId;
+    }
+  }
+
   /**
    * Labels a trace with the GraphQL root field being resolved.
    *
