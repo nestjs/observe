@@ -4,6 +4,7 @@ import { HttpAdapterHost } from "@nestjs/core";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
+import { TracerService } from "../services/tracer.service.js";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { HttpObserveAgentService } from "./http-observe-agent.service.js";
 
@@ -198,5 +199,79 @@ describe("HttpObserveAgentService", () => {
         "trace-1",
       ]);
     });
+  });
+
+  describe("a request that is not recorded", () => {
+    const createTracedService = (
+      ignore: NonNullable<ObserveModuleOptionsWithDefaults["http"]>["ignore"],
+      shouldCapture: (url: string) => boolean,
+    ) => {
+      const als = new AsyncLocalStorage<Map<string, any>>();
+      const options = {
+        traceIdKey: "traceId",
+        traceIdGenerator: () => "trace-1",
+        http: { ignore },
+      } as unknown as ObserveModuleOptionsWithDefaults;
+      const registry = new OperationTraceRegistry(als as never, false);
+      const service = new HttpObserveAgentService(
+        {} as HttpAdapterHost,
+        als,
+        options,
+        registry,
+        {} as ObserveAgentSharedBuffer,
+        {
+          shouldCapture: (_: string, { url }: { url: string }) =>
+            shouldCapture(url),
+        } as unknown as TraceSamplerService,
+      );
+      const tracer = new TracerService(
+        registry,
+        als as never,
+        {} as ObserveAgentSharedBuffer,
+        options,
+      );
+      const handle = (url: string, operationId: string) =>
+        service.startHttpRequestTracing(
+          { url, method: "GET", protocol: "http" },
+          {},
+          () => tracer.setOperationId(operationId),
+        );
+      return { registry, handle };
+    };
+
+    it.each([
+      ["ignored", ["/health"], (url: string) => url !== "/health"],
+      ["sampled out", [], (url: string) => url !== "/health"],
+    ] as const)(
+      "when %s, does not reach a recorded request sharing its trace id",
+      async (_, ignore, shouldCapture) => {
+        const { registry, handle } = createTracedService(
+          [...ignore],
+          shouldCapture,
+        );
+
+        handle("/orders", "orders.list");
+        handle("/health", "health");
+        // A trace with no spans is dropped when it ends.
+        const spanId = registry.internalStartTraceStep(
+          "trace-1",
+          "OrdersController",
+          "findAll",
+          undefined,
+        );
+        registry.internalEndTraceStep(
+          "trace-1",
+          spanId,
+          "OrdersController",
+          "findAll",
+          spanId,
+        );
+        registry.endTrace("trace-1", { statusCode: 200 });
+
+        await expect(registry.pluckSnapshot("trace-1")).resolves.toMatchObject({
+          operationId: "orders.list",
+        });
+      },
+    );
   });
 });

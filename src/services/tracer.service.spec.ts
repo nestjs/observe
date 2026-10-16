@@ -2,7 +2,10 @@ import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { CustomMetric } from "../interfaces/index.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
-import { CALLER_METADATA_KEY } from "../observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { TracerService } from "./tracer.service.js";
 
@@ -12,9 +15,9 @@ import { TracerService } from "./tracer.service.js";
  * Two things matter beyond the obvious. Metrics are registry-backed: calling
  * `counter("orders")` twice must hand back the *same* counter, or every call
  * site accumulates its own total and the reported figure is whichever one
- * flushed last. And every trace method depends on the async store being
- * present, so the failure when it is not has to be a clear error rather than an
- * undefined trace id quietly written to a row.
+ * flushed last. Trace methods also depend on the async store: methods that
+ * require a context fail clearly, while optional accessors and naming are safe
+ * outside a recorded operation.
  */
 describe("TracerService", () => {
   const TRACE_ID_KEY = "traceId";
@@ -156,6 +159,95 @@ describe("TracerService", () => {
 
     it("returns null when the store exists but carries no trace id", () => {
       expect(als.run(new Map(), () => tracer.currentTraceId())).toBeNull();
+    });
+  });
+
+  describe("setOperationId", () => {
+    it("renames the active request using the configured trace id key", async () => {
+      const customKeyTracer = new TracerService(
+        registry,
+        als as never,
+        {} as ObserveAgentSharedBuffer,
+        { traceIdKey: "requestId" } as ObserveModuleOptionsWithDefaults,
+      );
+      await inTrace("custom-key", async (spanId) => {
+        await als.run(new Map([["requestId", "custom-key"]]), async () => {
+          await Promise.resolve();
+          customKeyTracer.setOperationId("/rpc/orders.list");
+        });
+        registry.internalEndTraceStep(
+          "custom-key",
+          spanId,
+          "OrdersController",
+          "findAll",
+          spanId,
+        );
+      });
+      registry.endTrace("custom-key");
+
+      expect(await registry.pluckSnapshot("custom-key")).toMatchObject({
+        operationId: "/rpc/orders.list",
+      });
+    });
+
+    it("prefers the internal registry key over the reported trace id", async () => {
+      await inTrace("reported", async (reportedSpan) => {
+        await inTrace("internal", (internalSpan) => {
+          als.getStore()!.set(TRACE_REGISTRY_KEY, "internal");
+          als.getStore()!.set(TRACE_ID_KEY, "reported");
+          tracer.setOperationId("/rpc/orders.list");
+          registry.internalEndTraceStep(
+            "internal",
+            internalSpan,
+            "OrdersController",
+            "findAll",
+            internalSpan,
+          );
+        });
+        registry.internalEndTraceStep(
+          "reported",
+          reportedSpan,
+          "OrdersController",
+          "findAll",
+          reportedSpan,
+        );
+      });
+      registry.endTrace("internal");
+      registry.endTrace("reported");
+
+      expect(await registry.pluckSnapshot("internal")).toMatchObject({
+        operationId: "/rpc/orders.list",
+      });
+      expect(await registry.pluckSnapshot("reported")).toMatchObject({
+        operationId: "GET /orders",
+      });
+    });
+
+    it("is a no-op outside any async context", () => {
+      const setOperationId = vi.spyOn(registry, "setOperationId");
+
+      expect(() => tracer.setOperationId("/rpc/orders.list")).not.toThrow();
+      expect(setOperationId).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, 42])(
+      "is a no-op when the trace id is %s",
+      (traceId) => {
+        const setOperationId = vi.spyOn(registry, "setOperationId");
+
+        als.run(new Map([[TRACE_ID_KEY, traceId]]), () => {
+          expect(() => tracer.setOperationId("/rpc/orders.list")).not.toThrow();
+        });
+        expect(setOperationId).not.toHaveBeenCalled();
+      },
+    );
+
+    it("is a no-op for an unsampled request", () => {
+      als.run(new Map([[TRACE_ID_KEY, "unsampled"]]), () => {
+        expect(() => tracer.setOperationId("/rpc/orders.list")).not.toThrow();
+      });
+
+      expect(registry.hasTrace("unsampled")).toBe(false);
     });
   });
 

@@ -162,8 +162,16 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         }
       }
 
+      // A request that is not recorded still carries its trace id, which an
+      // adopted `x-request-id` can share with a recorded request. A registry
+      // key of its own, never registered, keeps its lookups off that trace.
+      const skip = () => {
+        store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, uuidv7());
+        done();
+      };
+
       if (this.shouldIgnoreRequest(req) || this.isUntracedPreflight(req)) {
-        return done();
+        return skip();
       }
 
       const shouldCapture = this.traceSamplerService.shouldCapture("http", {
@@ -171,7 +179,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         method: req.method,
       });
       if (!shouldCapture) {
-        return done();
+        return skip();
       }
       // Sensitive query parameters are masked whether or not the deployment
       // configured anything: an opt-in redactor protects only those who

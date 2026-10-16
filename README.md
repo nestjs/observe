@@ -287,6 +287,32 @@ ObserveModule.forRoot({
 
 A failed request is always captured (headers only, unless `body` is on); `capture: false` turns the feature off. Everything captured goes through the same redaction as error messages and logs before it leaves the process - sensitive keys by name, secrets by pattern - so naming `authorization` in `headers` records `[REDACTED]`.
 
+## Custom request operation IDs
+
+HTTP requests are grouped by their route path by default. If you want to report
+a different operation name for a request, inject `TracerService` and call
+`setOperationId()` from the handler:
+
+```ts
+import { TracerService } from "@nestjs/observe";
+
+// Inject TracerService in your controller's constructor:
+constructor(private readonly tracerService: TracerService) {}
+
+// Choose any naming scheme that suits your application:
+this.tracerService.setOperationId(`/rpc/${body.method}`);
+```
+
+For example, an RPC handler could distinguish `orders.list` from `orders.create`,
+even when both requests use the same route. This changes only the operation ID,
+not the URL, HTTP method, tags, or spans. A value set in the handler overrides
+the route or GraphQL name; subsequent calls replace it.
+
+The operation ID is an application-defined name; choose any scheme that fits
+your use case. Use stable, bounded names rather than per-request values such as
+user IDs or request IDs to avoid high-cardinality groups. The method is a no-op
+outside an active trace and for ignored or sampled-out requests.
+
 ## Declaring objectives in code
 
 `@Objective()` states what a route promises, next to the handler that has to keep it, and Observe turns each promise into an [SLO](https://www.observe.nestjs.com/documentation/slos). The objective is written, reviewed and versioned with the route it covers:

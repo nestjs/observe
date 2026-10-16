@@ -336,6 +336,21 @@ export class TracerService<
   }
 
   /**
+   * Sets the operation id reported for the current request trace.
+   * Call from the handler to override the route path or GraphQL operation name.
+   * Use a stable name, not a per-request value, so requests aggregate together.
+   * Does nothing when there is no active trace or the request is not recorded.
+   */
+  setOperationId(operationId: string): void {
+    const store = this.als.getStore();
+    const traceId =
+      store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
+    if (typeof traceId === "string") {
+      this.operationTraceRegistry.setOperationId(traceId, operationId);
+    }
+  }
+
+  /**
    * Sets an attribute on the current trace.
    * For example, you can use this to add metadata to the current request trace for later use and retrieval.
    * This method should be called within an async context where the AsyncLocalStorage is active.

@@ -556,6 +556,121 @@ describe("OperationTraceRegistry", () => {
     });
   });
 
+  describe("setOperationId", () => {
+    it("replaces the route name without changing request metadata or spans", async () => {
+      registry.startTrace("custom", {
+        protocol: "http",
+        attributes: { method: "POST", originalUrl: "/rpc" },
+        tags: { tenant: "acme" },
+      });
+      registry.addRouteMetadataToTrace("custom", 1, "/rpc");
+      const spanId = registry.internalStartTraceStep(
+        "custom",
+        "RpcController",
+        "handle",
+        undefined,
+      );
+
+      registry.setOperationId("custom", "/rpc/orders.get");
+      registry.setOperationId("custom", "/rpc/orders.list");
+      registry.internalEndTraceStep(
+        "custom",
+        spanId,
+        "RpcController",
+        "handle",
+        spanId,
+      );
+      registry.endTrace("custom", { statusCode: 201, userId: "u-1" });
+
+      const snapshot = await registry.pluckSnapshot("custom");
+      expect(snapshot).toMatchObject({
+        traceId: "custom",
+        protocol: "http",
+        operationId: "/rpc/orders.list",
+        attributes: { method: "POST", originalUrl: "/rpc", statusCode: 201 },
+        tags: { tenant: "acme" },
+        userId: "u-1",
+        traces: [{ spanId, className: "RpcController", methodKey: "handle" }],
+      });
+      expect(snapshot!.traces).toHaveLength(1);
+    });
+
+    it("overrides a GraphQL name and survives subsequent root field metadata", async () => {
+      registry.startTrace("graphql", { protocol: "graphql", tags: {} });
+      registry.addGraphQLMetadataToTrace("graphql", {
+        operationId: "Query.orders",
+      });
+      const spanId = registry.internalStartTraceStep(
+        "graphql",
+        "OrdersResolver",
+        "orders",
+        undefined,
+      );
+
+      registry.setOperationId("graphql", "OrdersOverview");
+      registry.addGraphQLMetadataToTrace("graphql", {
+        operationId: "Query.customers",
+      });
+      registry.internalEndTraceStep(
+        "graphql",
+        spanId,
+        "OrdersResolver",
+        "orders",
+        spanId,
+      );
+      registry.endTrace("graphql");
+
+      expect(await registry.pluckSnapshot("graphql")).toMatchObject({
+        operationId: "OrdersOverview",
+      });
+    });
+
+    it("does not create a snapshot for an unknown or unsampled trace", async () => {
+      expect(() =>
+        registry.setOperationId("unsampled", "/rpc/orders.list"),
+      ).not.toThrow();
+      expect(registry.hasTrace("unsampled")).toBe(false);
+      await expect(
+        registry.pluckSnapshot("unsampled"),
+      ).resolves.toBeUndefined();
+    });
+
+    it("leaves queue job names and metadata unchanged", async () => {
+      registry.startTrace("job", {
+        id: "job-1",
+        traceId: "job",
+        name: "sendEmail",
+        queueName: "mail",
+        traces: [],
+      });
+      const spanId = registry.internalStartTraceStep(
+        "job",
+        "MailProcessor",
+        "process",
+        undefined,
+      );
+
+      registry.setOperationId("job", "/rpc/orders.list");
+      registry.internalEndTraceStep(
+        "job",
+        spanId,
+        "MailProcessor",
+        "process",
+        spanId,
+      );
+      registry.endTrace("job", { status: "completed" });
+
+      const snapshot = await registry.pluckSnapshot("job");
+      expect(snapshot).toMatchObject({
+        id: "job-1",
+        name: "sendEmail",
+        queueName: "mail",
+        status: "completed",
+      });
+      expect(snapshot).not.toHaveProperty("operationId");
+    });
+  });
+
   describe("request outcome", () => {
     it("records the status code and user", async () => {
       startRequest("o1");

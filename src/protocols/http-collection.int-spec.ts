@@ -1,8 +1,9 @@
-import { Controller, Get, Module, Param, Post } from "@nestjs/common";
+import { Body, Controller, Get, Module, Param, Post } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { NestExpressApplication } from "@nestjs/platform-express";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { TracerService } from "../services/tracer.service.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -14,6 +15,8 @@ const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Controller()
 class OrdersController {
+  constructor(private readonly tracer: TracerService) {}
+
   @Get("orders")
   findAll() {
     return [{ id: 1 }];
@@ -32,6 +35,13 @@ class OrdersController {
   @Get("boom")
   boom() {
     throw new Error("deliberate");
+  }
+
+  @Post("rpc")
+  async rpc(@Body("method") method: string) {
+    await Promise.resolve();
+    this.tracer.setOperationId(`/rpc/${method}`);
+    return { ok: true };
   }
 }
 
@@ -147,6 +157,28 @@ describe("ObserveModule: HTTP collection", () => {
     );
 
     expect(snapshot.attributes?.statusCode).toBe(500);
+  });
+
+  it("keeps handler-defined operation ids separate on a shared route", async () => {
+    await Promise.all(
+      ["orders.list", "customers.get"].map((method) =>
+        request(app.getHttpServer()).post("/rpc").send({ method }).expect(201),
+      ),
+    );
+
+    for (const method of ["orders.list", "customers.get"]) {
+      const snapshot = await waitForSnapshot(
+        collected,
+        (item) => item.operationId === `/rpc/${method}`,
+      );
+      expect(snapshot).toMatchObject({
+        protocol: "http",
+        attributes: { method: "POST", originalUrl: "/rpc", statusCode: 201 },
+      });
+      expect(snapshot.traces.length).toBeGreaterThan(0);
+    }
+    expect(collected.items).toHaveLength(2);
+    expect(new Set(collected.items.map((item) => item.traceId)).size).toBe(2);
   });
 
   it("attaches the default header allow-list to a failed request, and nothing to a successful one", async () => {
