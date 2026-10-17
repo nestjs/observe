@@ -254,7 +254,7 @@ is told `protocol`, `operationId`, `method`, `statusCode`, `duration` and
 Once the module and the instrument are in place, the agent reports, with no further changes to your application:
 
 - **Requests, GraphQL operations, RPC messages, WebSocket gateway messages, queue jobs and scheduled jobs**, each with its tree of provider method calls.
-- **Database queries**, as a span under the method that ran them, for `pg`, `mysql2` and `mongodb`. Anything built on those drivers is covered without being known by name: TypeORM, Drizzle, MikroORM and Mongoose are tested in this repository, and others (Knex, Sequelize) go through the same driver calls. The statement is recorded with every value removed (`SELECT "o"."id" FROM "orders" "o" WHERE "o"."customer_id" = $1`). Prisma's Rust query engine does not go through these drivers and is not covered yet.
+- **Database queries**, as a span under the method that ran them, for `pg`, `mysql2`, `mssql` (SQL Server via tedious) and `mongodb`. Anything built on those drivers is covered without being known by name: TypeORM, Drizzle, MikroORM and Mongoose are tested in this repository, and others (Knex, Sequelize) go through the same driver calls. The statement is recorded with every value removed (`SELECT "o"."id" FROM "orders" "o" WHERE "o"."customer_id" = $1`). Prisma's Rust query engine does not go through these drivers and is not covered yet.
 - **Outbound HTTP calls** made with `fetch`/`undici` or `node:http`/`https` (so Axios too), as `POST api.stripe.com`. The current trace id is forwarded as `x-request-id` - by `fetch` on every supported Node version, by `node:http`/`https` from Node 22.12, the first to let a request's headers still be set at that point - so a service that also runs the agent continues the same trace; a header you set yourself is never overwritten.
 - **Trace ids across queues**: a BullMQ (Pro included) or Bull job enqueued while handling a request carries that request's trace id, so the request and its job show up as one trace. Repeatable (cron) jobs start their own.
 - **The code around an error's throw site**: for each in-app frame of a captured error, a few lines of source either side, read from the running process, so the dashboard shows the failing code next to the stack. This sends fragments of your application's source to Observe, stored with the error. Frames in `node_modules` and Node internals are never read. `createObserveModule({ sourceContext: false })` turns it off; the [documentation](https://www.observe.nestjs.com/documentation/sdk#error-source-context) covers tuning it instead.
@@ -388,7 +388,7 @@ $ npm run typecheck
 $ npm run test:int
 ```
 
-The queue suites need a Redis, and the query-span suites a PostgreSQL, MySQL and MongoDB. Each suite skips itself when its server does not answer, so without them `test:int` passes having tested less. CI starts them with these ports and credentials, which the suites default to:
+The MSSQL unit suite uses the real driver's public request APIs with stubbed transport methods and needs no SQL Server. The queue suites need a Redis, and the query-span integration suites a PostgreSQL, MySQL and MongoDB. Each integration suite skips itself when its server does not answer, so without them `test:int` passes having tested less. CI starts them with these ports and credentials, which the suites default to:
 
 ```bash
 $ docker run -d -p 6379:6379 redis:7-alpine

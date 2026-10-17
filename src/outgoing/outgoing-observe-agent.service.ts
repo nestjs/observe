@@ -14,6 +14,7 @@ import {
 } from "../utils/optional-peer.util.js";
 import { subscribeOutgoingHttp } from "./http.integration.js";
 import { patchMongodb } from "./mongodb.integration.js";
+import { patchMssql } from "./mssql.integration.js";
 import { patchMysql2 } from "./mysql2.integration.js";
 import { OutgoingSpanRecorder } from "./outgoing-span.recorder.js";
 import { patchPg } from "./pg.integration.js";
@@ -22,7 +23,7 @@ import { patchPg } from "./pg.integration.js";
  * Spans for what leaves the process: database queries and outbound HTTP.
  *
  * The drivers are instrumented, not the ORMs. Every ORM a Nest application is
- * likely to use ends in one of three drivers, so three small patches cover
+ * likely to use ends in a supported driver, so small patches cover
  * TypeORM, MikroORM, Prisma's driver adapters, Mongoose, Knex, Drizzle and
  * Sequelize alike, and none of them has to be known by name. Each driver is an
  * optional peer nobody is asked to install: it is looked up, and patched only
@@ -81,6 +82,9 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
         "mongodb/lib/cmap/connection",
         DRIVER_DEPENDENTS.mongodb,
         (module) => patchMongodb(module, recorder),
+      );
+      this.patchDriver("mssql", "mssql", [], (module) =>
+        patchMssql(module, recorder),
       );
     }
 

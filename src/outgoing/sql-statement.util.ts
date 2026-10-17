@@ -35,7 +35,7 @@ export interface SqlStatementDescription {
  * put request ids and user ids in them.
  */
 export function describeSqlStatement(sql: string): SqlStatementDescription {
-  const statement = sql
+  const sanitized = sql
     .slice(0, MAX_STATEMENT_LENGTH * 4)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/--[^\n]*/g, " ")
@@ -44,7 +44,15 @@ export function describeSqlStatement(sql: string): SqlStatementDescription {
     .replace(/\$([A-Za-z_]*)\$[\s\S]*?\$\1\$/g, "?")
     .replace(/'(?:[^'\\]|\\.|'')*'/g, "?")
     // A number that is not part of an identifier or a `$1` placeholder.
-    .replace(/(?<![\w$])-?\d+(?:\.\d+)?(?:e[+-]?\d+)?(?![\w])/gi, "?")
+    .replace(/(?<![\w$])-?\d+(?:\.\d+)?(?:e[+-]?\d+)?(?![\w])/gi, "?");
+  return describeSanitizedSqlStatement(sanitized);
+}
+
+/** Names and bounds SQL whose literals and comments have already been removed. */
+export function describeSanitizedSqlStatement(
+  sql: string,
+): SqlStatementDescription {
+  const statement = sql
     .replace(/\(\s*\?(?:\s*,\s*\?)+\s*\)/g, "(?)")
     .replace(/\(\s*\$\d+(?:\s*,\s*\$\d+)+\s*\)/g, "($n)")
     .replace(/\s+/g, " ")

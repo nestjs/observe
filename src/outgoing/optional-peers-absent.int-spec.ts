@@ -150,7 +150,7 @@ describe("ObserveModule: an application with no optional peers", () => {
 
   it("boots without a warning, having looked for each driver and found none", () => {
     expect(askedFor).toEqual(
-      expect.arrayContaining(["pg", "mysql2", "mongodb"]),
+      expect.arrayContaining(["pg", "mysql2", "mongodb", "mssql"]),
     );
     expect(bootOutput.join("")).toBe("");
   });

@@ -653,7 +653,7 @@ export interface ObserveOptions {
     getUserId?: (call: any) => string;
   };
   /**
-   * Spans for what leaves the process: database queries (`pg`, `mysql2`,
+   * Spans for what leaves the process: database queries (`pg`, `mysql2`, `mssql`,
    * `mongodb` - and so every ORM built on them) and outbound HTTP requests
    * (`fetch`/undici and `node:http`, so axios too). On by default; `false`
    * switches all of it off.
