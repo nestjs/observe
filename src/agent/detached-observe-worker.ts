@@ -109,7 +109,7 @@ export const detachedObserveWorker = (
     // like the prefixes: nothing in the agent reads it back, and a missing
     // config key would put a broken header on every batch. The value is
     // pinned by worker-degraded-reply.spec.ts.
-    "x-observe-ingest-modes": "reduced, trimmed, paced",
+    "x-observe-ingest-modes": "reduced, trimmed, paced, errors-only",
   };
   // Omitted rather than sent empty when unconfigured: a collector in
   // placeholder mode accepts an unauthenticated batch, and blank credentials
@@ -634,9 +634,11 @@ export const detachedObserveWorker = (
        * batch - an account past its plan's allowance, a paying one past its
        * trim threshold, or a Free one whose day passed its daily limit, keeps
        * its requests, jobs and errors and loses the trace trees of all but
-       * its notable traces. Nothing in the status says so, so the body is the
-       * only way to learn it, and an agent that does not look keeps building,
-       * serializing and gzipping trees that die on arrival.
+       * its notable traces. A paying account whose overage is paused keeps
+       * less again: its server errors, without their trees. Nothing in the
+       * status says so, so the body is the only way to learn it, and an agent
+       * that does not look keeps building, serializing and gzipping trees
+       * that die on arrival.
        *
        * Read defensively and treated as absent on anything unexpected: an
        * older collector returns no body at all, and a parse failure here must
@@ -645,23 +647,43 @@ export const detachedObserveWorker = (
       const accepted: unknown = await response.json().catch(() => undefined);
       const reply = (
         typeof accepted === "object" && accepted !== null ? accepted : {}
-      ) as { degraded?: unknown; trimmed?: unknown; paced?: unknown };
-      // `false`, `true`, `trimmed` or `paced`. `trimmed` and `paced` say only
-      // why the spans are discarded, so they count only beside `degraded`; a
-      // collector that sends neither gets exactly the line it always did.
+      ) as {
+        degraded?: unknown;
+        trimmed?: unknown;
+        paced?: unknown;
+        errorsOnly?: unknown;
+        reason?: unknown;
+      };
+      // `false`, `true`, `trimmed`, `paced` or `errors-only`. `trimmed`,
+      // `paced` and `errorsOnly` say only why or how the spans are discarded,
+      // so they count only beside `degraded`; a collector that sends none of
+      // them gets exactly the line it always did.
       //
-      // The collector never sends both - trimming is a paying account's, pacing
-      // a Free one's. Should a reply carry both, `trimmed` wins, in the order
-      // the collector itself checks them: it is the paying account's reading,
-      // and the one that promises nothing about 00:00 UTC.
+      // The collector never sends `trimmed` and `paced` together - trimming
+      // is a paying account's, pacing a Free one's. Should a reply carry both,
+      // `trimmed` wins, in the order the collector itself checks them: it is
+      // the paying account's reading, and the one that promises nothing about
+      // 00:00 UTC. `errorsOnly` wins over both, in the same order: a paused
+      // account is answered errors-only whatever else holds for it.
+      //
+      // The pause's reason rides after a colon, for the notice - but only a
+      // reason the main thread has words for. The value is the collector's;
+      // anything else leaves the bare `errors-only`, which withholds just the
+      // same and words the notice without a reason.
+      const pauseReason =
+        reply.reason === "spike" || reply.reason === "budget"
+          ? `:${reply.reason}`
+          : "";
       const verdict =
         reply.degraded !== true
           ? "false"
-          : reply.trimmed === true
-            ? "trimmed"
-            : reply.paced === true
-              ? "paced"
-              : "true";
+          : reply.errorsOnly === true
+            ? `errors-only${pauseReason}`
+            : reply.trimmed === true
+              ? "trimmed"
+              : reply.paced === true
+                ? "paced"
+                : "true";
 
       // A protocol line, not prose: the parent keys off the prefix and the
       // value, and is the side that decides what to do about it.

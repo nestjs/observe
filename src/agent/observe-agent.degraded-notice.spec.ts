@@ -6,8 +6,16 @@ import { ObserveAgentSharedBuffer } from "./observe-agent.shared-buffer.js";
 import { ObserveAgentWorker } from "./observe-agent.worker.js";
 
 /** The worker's line for one batch, as detached-observe-worker.ts posts it. */
-const verdict = (value: "true" | "false" | "trimmed" | "paced") =>
-  `${DEGRADED_MESSAGE_PREFIX}${value}`;
+const verdict = (
+  value:
+    | "true"
+    | "false"
+    | "trimmed"
+    | "paced"
+    | "errors-only"
+    | "errors-only:spike"
+    | "errors-only:budget",
+) => `${DEGRADED_MESSAGE_PREFIX}${value}`;
 
 const REDUCED_NOTICE =
   "Observe: this account has used its monthly allowance, so most traces now arrive without their spans. " +
@@ -25,6 +33,29 @@ const PACED_NOTICE =
   "See /dashboard/billing/usage.";
 
 const RECOVERED_NOTICE = "Observe: spans are being recorded again.";
+
+/** What every errors-only line says after its first sentence, the lift aside. */
+const ERRORS_ONLY_KEPT =
+  "Only server errors and failed jobs are sent now, without their spans; " +
+  "every other request and job, and every log line, is held back. Runtime and custom metrics are still recorded. ";
+
+const SPIKE_NOTICE =
+  "Observe: spike protection paused this account's overage. " +
+  ERRORS_ONLY_KEPT +
+  "Full collection returns when someone resumes it at /dashboard/billing/usage, or at 00:00 UTC on the 1st.";
+
+const BUDGET_NOTICE =
+  "Observe: this account's monthly overage budget is spent, so its overage is paused. " +
+  ERRORS_ONLY_KEPT +
+  "Full collection returns when someone resumes it or raises the budget at /dashboard/billing/usage, or at 00:00 UTC on the 1st.";
+
+const PAUSED_NOTICE =
+  "Observe: this account's overage is paused. " +
+  ERRORS_ONLY_KEPT +
+  "Full collection returns when someone resumes it at /dashboard/billing/usage, or at 00:00 UTC on the 1st.";
+
+const UNPAUSED_NOTICE =
+  "Observe: this account's overage is no longer paused, so everything is recorded again.";
 
 /**
  * What the agent tells the operator when the collector starts, changes or
@@ -161,6 +192,71 @@ describe("ObserveAgentWorker's notice while spans are withheld", () => {
 
     expect(warn.mock.calls).toEqual([[PACED_NOTICE], [REDUCED_NOTICE]]);
     expect(log).not.toHaveBeenCalled();
+    expect(buffer.isDegraded()).toBe(true);
+  });
+
+  it.each([
+    ["errors-only:spike", SPIKE_NOTICE],
+    ["errors-only:budget", BUDGET_NOTICE],
+    // The collector gave no reason, or one this agent has no words for.
+    ["errors-only", PAUSED_NOTICE],
+  ] as const)(
+    "tells a paused account why only server errors are sent, once (`%s`)",
+    (value, notice) => {
+      const { agent, buffer, warn, log } = boot();
+
+      batches(agent, verdict(value));
+
+      // Not the reduced line, which is what 0.3.12 says for the same pause:
+      // requests, jobs and logs are no longer recorded either.
+      expect(warn.mock.calls).toEqual([[notice]]);
+      expect(log).not.toHaveBeenCalled();
+      expect(buffer.isErrorsOnly()).toBe(true);
+    },
+  );
+
+  it("speaks again when the pause's reason changes, not otherwise", () => {
+    /*
+     * Spike protection paused the account, and the budget it set afterwards
+     * is spent too: still paused, but resuming alone no longer lifts it.
+     */
+    const { agent, buffer, warn, log } = boot();
+
+    batches(agent, verdict("errors-only:spike"));
+    batches(agent, verdict("errors-only:budget"));
+
+    expect(warn.mock.calls).toEqual([[SPIKE_NOTICE], [BUDGET_NOTICE]]);
+    expect(log).not.toHaveBeenCalled();
+    expect(buffer.isErrorsOnly()).toBe(true);
+  });
+
+  it("says everything is recorded again when the pause gives way to full ingest", () => {
+    const { agent, buffer, warn, log } = boot();
+    agent.handleMessage(verdict("errors-only:spike"));
+
+    batches(agent, verdict("false"));
+
+    // Not "spans are being recorded again": requests, jobs and logs are back
+    // too.
+    expect(warn.mock.calls).toEqual([[SPIKE_NOTICE]]);
+    expect(log.mock.calls).toEqual([[UNPAUSED_NOTICE]]);
+    expect(buffer.isErrorsOnly()).toBe(false);
+    expect(buffer.isDegraded()).toBe(false);
+  });
+
+  it("says what is kept when the pause gives way to trimmed traces", () => {
+    /*
+     * A resumed Pro account is back to being trimmed past its threshold:
+     * requests, jobs and errors are recorded again, most trees still are not.
+     */
+    const { agent, buffer, warn, log } = boot();
+    agent.handleMessage(verdict("errors-only:spike"));
+
+    batches(agent, verdict("trimmed"));
+
+    expect(warn.mock.calls).toEqual([[SPIKE_NOTICE], [TRIMMED_NOTICE]]);
+    expect(log).not.toHaveBeenCalled();
+    expect(buffer.isErrorsOnly()).toBe(false);
     expect(buffer.isDegraded()).toBe(true);
   });
 });

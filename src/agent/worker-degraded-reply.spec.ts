@@ -10,6 +10,7 @@ import {
   DEGRADED_MESSAGE_PREFIX,
   IngestMode,
   parseDegradedMessage,
+  parseOveragePauseReason,
 } from "./degraded-ingest.protocol.js";
 import {
   detachedWorkerData,
@@ -142,6 +143,12 @@ describe("what the detached worker makes of an accepted batch's reply", () => {
     // `degraded` alone decides that, as it always has.
     ["false", "`trimmed` without `degraded`", { trimmed: true }, "full"],
     ["false", "`paced` without `degraded`", { paced: true }, "full"],
+    [
+      "false",
+      "`errorsOnly` without `degraded`",
+      { errorsOnly: true, reason: "spike" },
+      "full",
+    ],
     // The collector never sends both. Should one, `trimmed` wins, in the order
     // the collector checks them: the reading that promises nothing about
     // 00:00 UTC.
@@ -160,6 +167,72 @@ describe("what the detached worker makes of an accepted batch's reply", () => {
 
       expect(verdict).toBe(`${DEGRADED_MESSAGE_PREFIX}${value}`);
       expect(parseDegradedMessage(verdict)).toBe(mode);
+      expect(parseOveragePauseReason(verdict)).toBeNull();
+    },
+    20_000,
+  );
+
+  // A paying account whose overage is paused, answered as an agent that
+  // lists `errors-only` is: value posted, the reply, its body, and the reason
+  // the main thread reads off the line.
+  it.each([
+    [
+      "errors-only:spike",
+      "an overage paused by spike protection",
+      { degraded: true, errorsOnly: true, reason: "spike" },
+      "spike",
+    ],
+    [
+      "errors-only:budget",
+      "an overage paused by a spent budget",
+      { degraded: true, errorsOnly: true, reason: "budget" },
+      "budget",
+    ],
+    // The collector leaves `reason` out when the pause it read gave none.
+    [
+      "errors-only",
+      "a pause without a reason",
+      { degraded: true, errorsOnly: true },
+      null,
+    ],
+    // The reason is the collector's, and words a log line: one the main
+    // thread has no words for is left off, and withholds just the same.
+    [
+      "errors-only",
+      "a reason this agent has no words for",
+      { degraded: true, errorsOnly: true, reason: "dunning" },
+      null,
+    ],
+    [
+      "errors-only",
+      "a reason that is not a string",
+      { degraded: true, errorsOnly: true, reason: { spike: true } },
+      null,
+    ],
+    // `errorsOnly` wins over both, in the order the collector checks them: a
+    // paused account is answered errors-only whatever else holds for it.
+    [
+      "errors-only:budget",
+      "a reply carrying `errorsOnly` beside `trimmed` and `paced`",
+      {
+        degraded: true,
+        errorsOnly: true,
+        trimmed: true,
+        paced: true,
+        reason: "budget",
+      },
+      "budget",
+    ],
+  ])(
+    "posts `%s` for %s",
+    async (value, _reply, body, reason) => {
+      respond = acceptWith(body);
+
+      const verdict = await verdictFor(endpoint);
+
+      expect(verdict).toBe(`${DEGRADED_MESSAGE_PREFIX}${value}`);
+      expect(parseDegradedMessage(verdict)).toBe("errors-only");
+      expect(parseOveragePauseReason(verdict)).toBe(reason);
     },
     20_000,
   );
@@ -173,6 +246,7 @@ describe("what the detached worker makes of an accepted batch's reply", () => {
     reduced: true,
     trimmed: true,
     paced: true,
+    "errors-only": true,
   };
 
   it.each([
@@ -192,7 +266,9 @@ describe("what the detached worker makes of an accepted batch's reply", () => {
       await verdictFor(endpoint, credentials);
 
       // The collector answers `paced` only to an agent that lists it here,
-      // and answers the rest of a paced account's batches as undegraded.
+      // and answers the rest of a paced account's batches as undegraded -
+      // and `errorsOnly` only to one that lists `errors-only`, answering the
+      // rest of a paused account's batches `{ degraded: true }`.
       expect(received?.["x-observe-ingest-modes"]).toBe(
         Object.keys(readableModes).join(", "),
       );

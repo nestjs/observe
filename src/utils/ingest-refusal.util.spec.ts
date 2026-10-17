@@ -62,6 +62,42 @@ describe("describeIngestRefusal", () => {
     );
   });
 
+  it("sends a $0 overage budget's stop to the budget, not the plan", () => {
+    // What the collector answers every batch, with Retry-After: 300, once an
+    // account that set its overage budget to $0 has used its included events.
+    const message = describeIngestRefusal({
+      code: "USAGE_LIMIT_REACHED",
+      limit: "observability_events",
+      reason: "overage_budget",
+      budget: 0,
+      plan: "pro",
+      included: 25_000_000,
+      used: 25_000_000,
+    });
+
+    // The plan already bills overage and the card is fine: the account asked
+    // for nothing past its plan, and the fix is the budget or the 1st.
+    expect(message).toBe(
+      "the account's overage budget is $0 and its included events for this period are used " +
+        "(25,000,000 of 25,000,000 included events used on the pro plan), so collection is stopped " +
+        "until the 1st (UTC) or until the overage budget is raised on the dashboard's Usage page",
+    );
+    expect(message).not.toContain("upgrade");
+    expect(message).not.toContain("declined");
+  });
+
+  it("copes with a $0 overage budget's body missing the counts", () => {
+    expect(
+      describeIngestRefusal({
+        code: "USAGE_LIMIT_REACHED",
+        reason: "overage_budget",
+      }),
+    ).toBe(
+      "the account's overage budget is $0 and its included events for this period are used, so collection is stopped " +
+        "until the 1st (UTC) or until the overage budget is raised on the dashboard's Usage page",
+    );
+  });
+
   it.each([
     ["a rate-cap body", { statusCode: 429, message: "Too Many Requests" }],
     ["a text body", "Too Many Requests"],
@@ -85,6 +121,9 @@ describe("describeIngestRefusal", () => {
     expect(
       rehydrated({ code: "USAGE_LIMIT_REACHED", reason: "payment_failed" }),
     ).toContain("declined");
+    expect(
+      rehydrated({ code: "USAGE_LIMIT_REACHED", reason: "overage_budget" }),
+    ).toContain("overage budget is $0");
     expect(rehydrated({ code: "CREDENTIALS_REJECTED" })).toContain(
       "appKey and appSecret were rejected",
     );

@@ -1,7 +1,9 @@
 import {
   countTraceNodes,
   DEGRADED_TTL_MS,
+  IngestMode,
   isNotableSnapshot,
+  isServerErrorSnapshot,
 } from "./degraded-ingest.protocol.js";
 import { MAX_BATCH_ITEMS } from "./telemetry-wire-contract.js";
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
@@ -149,6 +151,14 @@ interface AgentMetricsPayload {
    * account against. Without it, upgrading the agent would quietly earn an
    * account a longer reduced window - free service as a reward for behaving
    * well, which is the wrong incentive to build.
+   *
+   * While the account's overage is paused (`errors-only`) it carries
+   * everything withheld, in the units the meter bills: one per request or job
+   * not sent and one more for the error it carried, one per node of every
+   * tree - those stripped from the server errors that are sent included - and
+   * one per log record. The collector's design reuses this field for it: a
+   * paused account's batch adds it to what the pause held back, off the bill,
+   * which is the count the collector keeps when it does the filtering itself.
    */
   truncatedSpans?: number;
   /**
@@ -250,7 +260,10 @@ export class ObserveAgentSharedBuffer {
     }
 
     const maxPerBatch = this.maxOperationsPerBatch;
-    if (this._mainThreadBuffer.snapshots.length >= maxPerBatch) {
+    if (
+      this._mainThreadBuffer.snapshots.length + this.withheldSnapshots >=
+      maxPerBatch
+    ) {
       if (this.options.debug) {
         this.logger.debug(
           `Max snapshots per transaction reached: ${maxPerBatch}. Ignoring snapshot.`,
@@ -261,16 +274,28 @@ export class ObserveAgentSharedBuffer {
 
     const encodedSnapshot: EncodedRequestSnapshot =
       RequestSnapshotEncoder.encode(snapshot);
-    if (this.isDegraded() && !isNotableSnapshot(encodedSnapshot)) {
-      // The collector is discarding these on arrival; shipping them costs the
-      // application its own CPU and bandwidth for nothing. The snapshot still
-      // goes - the request, its duration and its error are what the charts
-      // are built from, and those are still being kept - and the count goes
-      // with it, because it is the only record these existed.
-      this.countTruncated(encodedSnapshot.t);
-      encodedSnapshot.t = [];
+    if (this.isErrorsOnly()) {
+      // Decided ahead of the rule below, which keeps more than a paused
+      // account does: a slow success is notable, and not a server error.
+      // Sent or not, the request still brings its handler's objectives due
+      // further down - they are not telemetry.
+      if (this.sendsWhileErrorsOnly(encodedSnapshot)) {
+        this._mainThreadBuffer.snapshots.push(encodedSnapshot);
+      } else {
+        this.withheldSnapshots += 1;
+      }
+    } else {
+      if (this.isDegraded() && !isNotableSnapshot(encodedSnapshot)) {
+        // The collector is discarding these on arrival; shipping them costs
+        // the application its own CPU and bandwidth for nothing. The snapshot
+        // still goes - the request, its duration and its error are what the
+        // charts are built from, and those are still being kept - and the
+        // count goes with it, because it is the only record these existed.
+        this.countTruncated(encodedSnapshot.t);
+        encodedSnapshot.t = [];
+      }
+      this._mainThreadBuffer.snapshots.push(encodedSnapshot);
     }
-    this._mainThreadBuffer.snapshots.push(encodedSnapshot);
 
     // Read off the raw snapshot: the handler's span carries `Class.method`,
     // which is what `@Objective` declarations are keyed by. Declarations are
@@ -302,7 +327,7 @@ export class ObserveAgentSharedBuffer {
     // the worker service - the process that sees every queue job - grows this
     // array for as long as the stall lasts.
     const maxPerBatch = this.maxOperationsPerBatch;
-    if (this._mainThreadBuffer.jobs.length >= maxPerBatch) {
+    if (this._mainThreadBuffer.jobs.length + this.withheldJobs >= maxPerBatch) {
       if (this.options.debug) {
         this.logger.debug(
           `Max job snapshots per transaction reached: ${maxPerBatch}. Ignoring snapshot.`,
@@ -313,13 +338,24 @@ export class ObserveAgentSharedBuffer {
 
     const encodedJobSnapshot: EncodedJobSnapshot =
       JobSnapshotEncoder.encode(jobSnapshot);
-    if (this.isDegraded() && !isNotableSnapshot(encodedJobSnapshot)) {
-      // A job carries no status code, so the same rule grades it on its error
-      // and its duration - which is what the collector does with it too.
-      this.countTruncated(encodedJobSnapshot.t);
-      encodedJobSnapshot.t = [];
+    if (this.isErrorsOnly()) {
+      // A job carries no status code, so the error it failed with is what
+      // makes it a server error - which is what the collector keeps of it too.
+      if (this.sendsWhileErrorsOnly(encodedJobSnapshot)) {
+        this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
+      } else {
+        this.withheldJobs += 1;
+      }
+    } else {
+      if (this.isDegraded() && !isNotableSnapshot(encodedJobSnapshot)) {
+        // A job carries no status code, so the same rule grades it on its
+        // error and its duration - which is what the collector does with it
+        // too.
+        this.countTruncated(encodedJobSnapshot.t);
+        encodedJobSnapshot.t = [];
+      }
+      this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
     }
-    this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
   }
 
   /**
@@ -333,19 +369,74 @@ export class ObserveAgentSharedBuffer {
   private degradedUntil = 0;
 
   /**
+   * Whether that answer was errors-only: the account's overage is paused, and
+   * only its server errors are kept. It holds as long as the window above and
+   * not a moment longer.
+   */
+  private errorsOnly = false;
+
+  /**
+   * Requests and jobs that errors-only ingest withheld from the batch being
+   * built, cleared with it.
+   *
+   * Counted against `maxTracesPerBatch` as though they had been sent, so a
+   * pause grades the same executions a batch would carry outside one: what
+   * is reported withheld is what the collector would have been sent and
+   * billed, and a busy service encodes no more per batch than it does
+   * outside a pause. A server error past the cap is lost, as it would be.
+   */
+  private withheldSnapshots = 0;
+  private withheldJobs = 0;
+
+  /**
    * Records what the collector said about the last batch.
    *
    * Refreshed on every reply rather than latched, so the window slides while
    * the account stays over its allowance and lapses on its own once it does
    * not - the collector has no way to announce the end of it, and an upgrade
    * must not need a restart to take effect.
+   *
+   * Each reply replaces the last whole: one that is not errors-only ends
+   * errors-only ingest at once, whatever it says instead.
    */
-  setDegraded(degraded: boolean) {
-    this.degradedUntil = degraded ? Date.now() + DEGRADED_TTL_MS : 0;
+  setIngestMode(mode: IngestMode) {
+    this.degradedUntil = mode === "full" ? 0 : Date.now() + DEGRADED_TTL_MS;
+    this.errorsOnly = mode === "errors-only";
   }
 
+  /**
+   * Whether trees the collector discards are being withheld: in every mode
+   * but `full`, until the window lapses.
+   */
   isDegraded(): boolean {
     return this.degradedUntil > Date.now();
+  }
+
+  /** Whether only server errors are being sent, until the same window lapses. */
+  isErrorsOnly(): boolean {
+    return this.errorsOnly && this.isDegraded();
+  }
+
+  /**
+   * What errors-only ingest makes of one execution: whether it is sent.
+   *
+   * Its tree never is, server error or not - the collector stores no tree of
+   * a paused account's, and a 5xx storm would otherwise ship every failure's
+   * whole waterfall - so its nodes are counted and the array emptied, as
+   * degraded ingest empties it. One that is not a server error is not sent at
+   * all, and counts itself and the error it carried on top: the same events,
+   * in the same units, as the collector counts when it filters a batch itself.
+   */
+  private sendsWhileErrorsOnly(
+    execution: EncodedRequestSnapshot | EncodedJobSnapshot,
+  ): boolean {
+    this.countTruncated(execution.t);
+    execution.t = [];
+    if (isServerErrorSnapshot(execution)) {
+      return true;
+    }
+    this.countWithheld(execution.e ? 2 : 1);
+    return false;
   }
 
   /**
@@ -357,11 +448,38 @@ export class ObserveAgentSharedBuffer {
    * actually produced.
    */
   private countTruncated(traces: unknown) {
+    this.countWithheld(countTraceNodes(traces));
+  }
+
+  /** Adds withheld events, in billed units, to the batch's `truncatedSpans`. */
+  private countWithheld(events: number) {
     if (!this._mainThreadBuffer) {
       return;
     }
     this._mainThreadBuffer.truncatedSpans =
-      (this._mainThreadBuffer.truncatedSpans ?? 0) + countTraceNodes(traces);
+      (this._mainThreadBuffer.truncatedSpans ?? 0) + events;
+  }
+
+  /**
+   * Takes the log records out of the outgoing batch while errors-only ingest
+   * holds, one withheld event each - error-level records too: a crash loop
+   * logs faster than it fails requests.
+   *
+   * Done as the batch is written rather than as lines arrive, so a batch
+   * counts exactly the records it would have carried - its share of the
+   * per-batch cap and of the backlog, as outside a pause - which is what the
+   * collector counts when it drops a batch's logs itself. Counted at the door,
+   * a chatty service would report lines the cap was always going to drop.
+   */
+  private withholdLogs() {
+    const batch = this._mainThreadBuffer;
+    if (!batch?.logs || !this.isErrorsOnly()) {
+      return;
+    }
+    if (batch.logs.length > 0) {
+      this.countWithheld(batch.logs.length);
+    }
+    delete batch.logs;
   }
 
   /**
@@ -576,6 +694,8 @@ export class ObserveAgentSharedBuffer {
   }
 
   encodeAndWrite() {
+    this.withholdLogs();
+
     if (this.options.debug) {
       if (this._mainThreadBuffer?.snapshots) {
         this.logger.debug(
@@ -620,6 +740,8 @@ export class ObserveAgentSharedBuffer {
 
   resetMainThreadBuffer() {
     this._mainThreadBuffer = null;
+    this.withheldSnapshots = 0;
+    this.withheldJobs = 0;
   }
 
   private createEmptyPayload(): AgentMetricsPayload {

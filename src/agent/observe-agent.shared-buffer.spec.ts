@@ -4,11 +4,24 @@ import { Summary } from "../custom-metrics/summary.js";
 import type { EncodedCustomMetric } from "../encoders/custom-metrics.encoder.js";
 import type { EncodedJobSnapshot } from "../encoders/job-snapshot.encoder.js";
 import type { EncodedRequestSnapshot } from "../encoders/request-snapshot.encoder.js";
+import {
+  EncodedNodeRuntimeMetrics,
+  RuntimeMetricsEncoder,
+} from "../encoders/runtime-metrics.encoder.js";
 import type { JobSnapshot } from "../interfaces/job-snapshot.interface.js";
+import type { NodeRuntimeMetrics } from "../interfaces/node-runtime-metrics.interface.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import type { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import type { CompleteTraceEventNode } from "../interfaces/trace-events.interfaces.js";
-import { DEGRADED_TTL_MS } from "./degraded-ingest.protocol.js";
+import type {
+  ObjectiveDeclaration,
+  ObjectivesRegistry,
+} from "../objectives/objectives.registry.js";
+import {
+  countTraceNodes,
+  DEGRADED_TTL_MS,
+  IngestMode,
+} from "./degraded-ingest.protocol.js";
 import { ObserveAgentSharedBuffer } from "./observe-agent.shared-buffer.js";
 import {
   createTelemetrySanitizer,
@@ -60,6 +73,9 @@ describe("ObserveAgentSharedBuffer", () => {
       snapshots: EncodedRequestSnapshot[];
       jobs: EncodedJobSnapshot[];
       custom?: EncodedCustomMetric[];
+      runtime?: EncodedNodeRuntimeMetrics;
+      logs?: unknown[];
+      objectives?: ObjectiveDeclaration[];
       truncatedSpans?: number;
     };
 
@@ -150,7 +166,7 @@ describe("ObserveAgentSharedBuffer", () => {
       "keeps operation rows with empty trace arrays at %i ms when degraded",
       (duration) => {
         const buffer = createBuffer();
-        buffer.setDegraded(true);
+        buffer.setIngestMode("reduced");
         insertOperations(buffer, { duration }, { duration });
 
         const batch = readBatch(buffer);
@@ -183,7 +199,7 @@ describe("ObserveAgentSharedBuffer", () => {
 
     it("keeps empty trace arrays without counting spans that do not exist", () => {
       const buffer = createBuffer();
-      buffer.setDegraded(true);
+      buffer.setIngestMode("reduced");
       insertOperations(buffer, { traces: [] }, { traces: [] });
 
       const batch = readBatch(buffer);
@@ -216,7 +232,7 @@ describe("ObserveAgentSharedBuffer", () => {
       },
     ])("keeps nested trees for $label when degraded", ({ request, job }) => {
       const buffer = createBuffer();
-      buffer.setDegraded(true);
+      buffer.setIngestMode("reduced");
       insertOperations(buffer, request, job);
 
       const batch = readBatch(buffer);
@@ -229,7 +245,7 @@ describe("ObserveAgentSharedBuffer", () => {
 
     it("still withholds fast HTTP client errors when degraded", () => {
       const buffer = createBuffer();
-      buffer.setDegraded(true);
+      buffer.setIngestMode("reduced");
       insertOperations(buffer, {
         attributes: { statusCode: 499 },
         error: { message: "client error" },
@@ -248,7 +264,7 @@ describe("ObserveAgentSharedBuffer", () => {
       (recovery) => {
         vi.useFakeTimers();
         const buffer = createBuffer();
-        buffer.setDegraded(true);
+        buffer.setIngestMode("reduced");
         insertOperations(buffer);
         const degraded = readBatch(buffer);
         expectTraceArrays(degraded);
@@ -257,7 +273,7 @@ describe("ObserveAgentSharedBuffer", () => {
 
         buffer.resetMainThreadBuffer();
         if (recovery === "cleared") {
-          buffer.setDegraded(false);
+          buffer.setIngestMode("full");
         } else {
           vi.advanceTimersByTime(DEGRADED_TTL_MS + 1);
         }
@@ -273,7 +289,7 @@ describe("ObserveAgentSharedBuffer", () => {
 
     it("keeps trace arrays and labeled metrics when repairing an unrelated field", () => {
       const buffer = createBuffer();
-      buffer.setDegraded(true);
+      buffer.setIngestMode("reduced");
       insertOperations(buffer);
       const counter = new Counter("task.runs", "Runs", ["result"]);
       counter.increment({ result: "completed" }, 3);
@@ -309,6 +325,397 @@ describe("ObserveAgentSharedBuffer", () => {
       expect(batch.snapshots[0].t).toEqual([]);
       expect(batch.jobs[0].t).toEqual([]);
       expect(batch.truncatedSpans).toBe(4);
+    });
+
+    /**
+     * A paying account whose overage is paused: the collector keeps its
+     * server errors, without their trees, and nothing else that is billed.
+     */
+    describe("while only server errors are kept", () => {
+      /** A tree of `nodes` spans: a handler and what it called. */
+      const tree = (nodes: number): CompleteTraceEventNode[] => [
+        {
+          name: "Handler.run",
+          origin: "auto",
+          className: "Handler",
+          methodKey: "run",
+          duration: 5,
+          children: Array.from({ length: nodes - 1 }, (_, index) => ({
+            name: `Repository.read${index}`,
+            origin: "auto" as const,
+            className: "Repository",
+            methodKey: `read${index}`,
+            duration: 1,
+            children: [],
+          })),
+        },
+      ];
+
+      /** A fast, successful request with a one-span tree, unless overridden. */
+      const request = (
+        name: string,
+        overrides: Partial<RequestSnapshot> = {},
+      ): RequestSnapshot => ({
+        traceId: name,
+        protocol: "http",
+        operationId: `/${name}`,
+        attributes: { method: "GET", statusCode: 200 },
+        duration: 10,
+        traces: tree(1),
+        ...overrides,
+      });
+
+      /** A fast job that completed, with a one-span tree, unless overridden. */
+      const job = (
+        name: string,
+        overrides: Partial<JobSnapshot> = {},
+      ): JobSnapshot => ({
+        id: name,
+        traceId: `${name}-trace`,
+        name,
+        queueName: "cron",
+        status: "completed",
+        duration: 10,
+        traces: tree(1),
+        ...overrides,
+      });
+
+      const runtime: NodeRuntimeMetrics = {
+        cpu: { user: 1, system: 2, percentageUsed: 33 },
+        memory: {
+          rss: 100,
+          heapTotal: 200,
+          heapUsed: 150,
+          external: 10,
+          percentageUsed: 44,
+        },
+        gc: { count: 3, totalDuration: 12 },
+        eventLoop: { lag: 7, utilization: 0.5 },
+      };
+
+      /** What the collector validates every batch against, unknown keys refused. */
+      const expectValid = (batch: SerializedBatch) => {
+        expect(
+          validateTelemetryPayload(batch, { forbidUnknown: true }),
+        ).toEqual([]);
+      };
+
+      const sentIds = (batch: SerializedBatch) =>
+        [...(batch.snapshots ?? []), ...(batch.jobs ?? [])].map(
+          (entry) => entry.ti,
+        );
+
+      it("sends the server errors alone, without their trees, and reports everything withheld in billed units", () => {
+        const declaration: ObjectiveDeclaration = {
+          handler: "HealthController.check",
+          operationId: "/health",
+          method: "GET",
+          objectives: [{ availability: 99.9 }],
+        };
+        const registry = {
+          declarationFor: (snapshot: RequestSnapshot) =>
+            snapshot.operationId === "/health" ? declaration : undefined,
+        } as unknown as ObjectivesRegistry;
+        const buffer = new ObserveAgentSharedBuffer(
+          {
+            serviceId: "svc-test",
+            forwardLogs: true,
+          } as ObserveModuleOptionsWithDefaults,
+          registry,
+        );
+        buffer.setIngestMode("errors-only");
+
+        // Each withheld event counts one, as the meter would have billed it.
+        // A fast success: the request and its 3 spans.                    4
+        buffer.insertRequestSnapshot(request("health", { traces: tree(3) }));
+        // A slow success is notable, and still no server error: 1 + 2.     3
+        buffer.insertRequestSnapshot(
+          request("report", { duration: 5_000, traces: tree(2) }),
+        );
+        // A client error: the request, the error it carried, 2 spans.      4
+        buffer.insertRequestSnapshot(
+          request("missing", {
+            attributes: { method: "GET", statusCode: 404 },
+            error: { message: "Not Found" },
+            traces: tree(2),
+          }),
+        );
+        // A server error is sent; its 5 spans are not.                      5
+        buffer.insertRequestSnapshot(
+          request("checkout", {
+            attributes: { method: "POST", statusCode: 503 },
+            error: { message: "payments unavailable" },
+            traces: tree(5),
+          }),
+        );
+        // A job that completed: the job and its span.                       2
+        buffer.insertJobSnapshot(job("sync"));
+        // A job that failed is sent; its 2 spans are not.                   2
+        buffer.insertJobSnapshot(
+          job("import", {
+            status: "failed",
+            error: { message: "import failed" },
+            traces: tree(2),
+          }),
+        );
+        // Every log record, error level included.                           3
+        buffer.pushLogs([
+          { timestamp: Date.now(), level: "log", text: "served /health" },
+          { timestamp: Date.now(), level: "warn", text: "report took 5 s" },
+          { timestamp: Date.now(), level: "error", text: "payments down" },
+        ]);
+        // Not events: these ride as ever.
+        buffer.addNodeRuntimeMetrics(runtime);
+        const placed = new Counter("orders.placed");
+        placed.increment();
+        buffer.upsertCustomMetric(placed);
+
+        const batch = readBatch(buffer);
+
+        expect(batch.snapshots).toEqual([
+          {
+            ti: "checkout",
+            p: "http",
+            op: "/checkout",
+            a: { m: "POST", sc: 503 },
+            d: 10,
+            e: { message: "payments unavailable" },
+            t: [],
+          },
+        ]);
+        expect(batch.jobs).toEqual([
+          {
+            i: "import",
+            ti: "import-trace",
+            n: "import",
+            q: "cron",
+            s: "failed",
+            d: 10,
+            e: { message: "import failed" },
+            t: [],
+          },
+        ]);
+        expect(batch).not.toHaveProperty("logs");
+        expect(batch.truncatedSpans).toBe(4 + 3 + 4 + 5 + 2 + 2 + 3);
+        expect(batch.runtime).toEqual(RuntimeMetricsEncoder.encode(runtime));
+        expect(batch.custom?.map((metric) => metric.n)).toEqual([
+          "orders.placed",
+        ]);
+        // Declarations are not telemetry: the health check was withheld and
+        // still brought its handler's objectives due.
+        expect(batch.objectives).toEqual([declaration]);
+        expectValid(batch);
+      });
+
+      it.each<[string, Partial<RequestSnapshot>, boolean]>([
+        [
+          "a server error",
+          {
+            attributes: { method: "GET", statusCode: 500 },
+            error: { message: "boom" },
+          },
+          true,
+        ],
+        // The status decides alone, both ways.
+        [
+          "a 5xx without an error object",
+          { attributes: { method: "GET", statusCode: 502 } },
+          true,
+        ],
+        [
+          "a 4xx carrying an error",
+          {
+            attributes: { method: "GET", statusCode: 401 },
+            error: { message: "Unauthorized" },
+          },
+          false,
+        ],
+        ["a slow success", { duration: 30_000 }, false],
+        // No status code - an RPC, a socket message - and the error decides.
+        [
+          "an errored request without a status code",
+          { protocol: "rpc", attributes: {}, error: { message: "failed" } },
+          true,
+        ],
+        ["a request with neither", { protocol: "rpc", attributes: {} }, false],
+      ])("grades %s as sent: %s", (_label, overrides, sent) => {
+        const buffer = createBuffer();
+        buffer.setIngestMode("errors-only");
+
+        buffer.insertRequestSnapshot(
+          request("op", { traces: tree(2), ...overrides }),
+        );
+        const batch = readBatch(buffer);
+
+        expect(sentIds(batch)).toEqual(sent ? ["op"] : []);
+        expect(batch.snapshots.flatMap((snapshot) => snapshot.t)).toEqual([]);
+        // Its 2 spans either way; the request and its error only if withheld.
+        expect(batch.truncatedSpans).toBe(
+          sent ? 2 : 3 + (overrides.error ? 1 : 0),
+        );
+        expectValid(batch);
+      });
+
+      it.each<[string, Partial<JobSnapshot>, boolean]>([
+        [
+          "a failed job",
+          { status: "failed", error: { message: "boom" } },
+          true,
+        ],
+        ["a completed job", {}, false],
+        // Slow is not failed.
+        ["a slow job", { duration: 60_000 }, false],
+      ])("grades %s as sent: %s", (_label, overrides, sent) => {
+        const buffer = createBuffer();
+        buffer.setIngestMode("errors-only");
+
+        buffer.insertJobSnapshot(
+          job("work", { traces: tree(2), ...overrides }),
+        );
+        const batch = readBatch(buffer);
+
+        expect(sentIds(batch)).toEqual(sent ? ["work-trace"] : []);
+        expect(batch.jobs.flatMap((entry) => entry.t)).toEqual([]);
+        expect(batch.truncatedSpans).toBe(
+          sent ? 2 : 3 + (overrides.error ? 1 : 0),
+        );
+        expectValid(batch);
+      });
+
+      it("withholds the log records a batch would have carried, and counts each", () => {
+        const buffer = createBuffer();
+        // Written before the pause began, and withheld all the same: the
+        // batch is written while it holds.
+        buffer.pushLogs(logs(MAX_LOGS_PER_TRANSACTION + 30));
+        buffer.setIngestMode("errors-only");
+
+        const first = readBatch(buffer);
+        expect(first).not.toHaveProperty("logs");
+        // A batch's worth, as outside a pause - not every line written, some
+        // of which no batch was ever going to carry.
+        expect(first.truncatedSpans).toBe(MAX_LOGS_PER_TRANSACTION);
+        expectValid(first);
+
+        // The backlog is drained, and counted, a batch at a time.
+        buffer.resetMainThreadBuffer();
+        buffer.drainPendingLogs();
+        const second = readBatch(buffer);
+        expect(second).not.toHaveProperty("logs");
+        expect(second.truncatedSpans).toBe(30);
+        expectValid(second);
+      });
+
+      it("still sends a batch that withheld everything, so the count arrives and the reply renews the pause", () => {
+        const buffer = createBuffer();
+        buffer.setIngestMode("errors-only");
+
+        buffer.insertRequestSnapshot(request("health"));
+
+        expect(buffer.isBufferEmpty()).toBe(false);
+        const batch = readBatch(buffer);
+        expect(batch).toEqual({
+          serviceId: "svc-test",
+          forwardLogs: true,
+          snapshots: [],
+          truncatedSpans: 2,
+        });
+        expectValid(batch);
+      });
+
+      it("counts a withheld execution against maxTracesPerBatch, as though it had been sent", () => {
+        const buffer = createBuffer({ maxTracesPerBatch: 2 });
+        buffer.setIngestMode("errors-only");
+
+        buffer.insertRequestSnapshot(request("health"));
+        buffer.insertRequestSnapshot(
+          request("failing", {
+            attributes: { method: "GET", statusCode: 500 },
+          }),
+        );
+        buffer.insertJobSnapshot(job("sync"));
+        buffer.insertJobSnapshot(
+          job("import", { status: "failed", error: { message: "failed" } }),
+        );
+        // A third of each would not have fitted a batch outside a pause
+        // either: neither graded nor counted.
+        buffer.insertRequestSnapshot(
+          request("late", { attributes: { method: "GET", statusCode: 500 } }),
+        );
+        buffer.insertJobSnapshot(
+          job("retry", { status: "failed", error: { message: "failed" } }),
+        );
+
+        const batch = readBatch(buffer);
+        expect(sentIds(batch)).toEqual(["failing", "import-trace"]);
+        expect(batch.truncatedSpans).toBe(2 + 1 + 2 + 1);
+
+        // The next batch starts its count over.
+        buffer.resetMainThreadBuffer();
+        buffer.insertRequestSnapshot(
+          request("late", { attributes: { method: "GET", statusCode: 500 } }),
+        );
+        buffer.insertJobSnapshot(
+          job("retry", { status: "failed", error: { message: "failed" } }),
+        );
+        expect(sentIds(readBatch(buffer))).toEqual(["late", "retry-trace"]);
+      });
+
+      it("lapses on its own when no reply renews it", () => {
+        vi.useFakeTimers();
+        const buffer = createBuffer();
+        buffer.setIngestMode("errors-only");
+
+        vi.advanceTimersByTime(DEGRADED_TTL_MS + 1);
+        expect(buffer.isErrorsOnly()).toBe(false);
+        expect(buffer.isDegraded()).toBe(false);
+
+        buffer.insertRequestSnapshot(request("health", { traces: tree(3) }));
+        buffer.pushLogs(logs(2));
+        const batch = readBatch(buffer);
+        expect(sentIds(batch)).toEqual(["health"]);
+        expect(countTraceNodes(batch.snapshots[0].t)).toBe(3);
+        expect(batch.logs).toHaveLength(2);
+        expect(batch).not.toHaveProperty("truncatedSpans");
+      });
+
+      it("slides with every reply that is still errors-only", () => {
+        vi.useFakeTimers();
+        const buffer = createBuffer();
+        buffer.setIngestMode("errors-only");
+
+        vi.advanceTimersByTime(DEGRADED_TTL_MS - 1);
+        buffer.setIngestMode("errors-only");
+        vi.advanceTimersByTime(DEGRADED_TTL_MS - 1);
+
+        expect(buffer.isErrorsOnly()).toBe(true);
+      });
+
+      it.each<[IngestMode, boolean]>([
+        ["reduced", true],
+        ["trimmed", true],
+        ["paced", true],
+        ["full", false],
+      ])(
+        "gives way at once to a `%s` reply (trees still withheld: %s)",
+        (mode, degraded) => {
+          const buffer = createBuffer();
+          buffer.setIngestMode("errors-only");
+
+          buffer.setIngestMode(mode);
+
+          expect(buffer.isErrorsOnly()).toBe(false);
+          expect(buffer.isDegraded()).toBe(degraded);
+          // Sent again, as that reply says: its tree withheld if it is not
+          // notable and trees are, whole otherwise - and the logs with it.
+          buffer.insertRequestSnapshot(request("health", { traces: tree(3) }));
+          buffer.pushLogs(logs(2));
+          const batch = readBatch(buffer);
+          expect(sentIds(batch)).toEqual(["health"]);
+          expect(countTraceNodes(batch.snapshots[0].t)).toBe(degraded ? 0 : 3);
+          expect(batch.truncatedSpans).toBe(degraded ? 3 : undefined);
+          expect(batch.logs).toHaveLength(2);
+        },
+      );
     });
   });
 

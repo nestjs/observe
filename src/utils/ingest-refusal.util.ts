@@ -7,11 +7,13 @@
  * declined to the pricing page, and one whose rate cap had engaged to their
  * invoices. The body tells them apart: a quota refusal carries
  * `code: "USAGE_LIMIT_REACHED"` with the plan and the counts, and a quota
- * refusal caused by a declined payment adds `reason: "payment_failed"`.
- * Credentials the collector has already rejected carry
- * `code: "CREDENTIALS_REJECTED"` - a 429 rather than another 401, so that
- * agents which pause only on a 429 stop retrying them. A rate cap, and any
- * older collector, sends none of these and gets the old sentence.
+ * refusal caused by a declined payment adds `reason: "payment_failed"` - or
+ * `reason: "overage_budget"` when the account's own $0 overage budget stopped
+ * collection once its included events were spent. Credentials the collector
+ * has already rejected carry `code: "CREDENTIALS_REJECTED"` - a 429 rather
+ * than another 401, so that agents which pause only on a 429 stop retrying
+ * them. A rate cap, and any older collector, sends none of these and gets the
+ * old sentence.
  *
  * Written self-contained on purpose - no imports, no module-scope constants -
  * because the telemetry worker is a stringified function and this travels
@@ -54,6 +56,19 @@ export const describeIngestRefusal = (body: unknown): string => {
       "a payment on the account was declined, so events past the included volume are refused until the outstanding invoice is paid" +
       (counts ? ` (${counts})` : "") +
       "; update the payment method in the dashboard to resume"
+    );
+  }
+
+  if (detail.reason === "overage_budget") {
+    // The account asked for nothing past its plan - a $0 overage budget - and
+    // the plan's events are spent. Nothing is wrong with the plan or the
+    // card, so neither an upgrade nor a payment is the fix: raising the
+    // budget is, or the turn of the month, which the operator would otherwise
+    // not know is coming.
+    return (
+      "the account's overage budget is $0 and its included events for this period are used" +
+      (counts ? ` (${counts})` : "") +
+      ", so collection is stopped until the 1st (UTC) or until the overage budget is raised on the dashboard's Usage page"
     );
   }
 

@@ -21,7 +21,9 @@ import { NodeRuntimeMetricsService } from "../services/node-runtime-metrics.serv
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   IngestMode,
+  OveragePauseReason,
   parseDegradedMessage,
+  parseOveragePauseReason,
   parsePausedMessage,
 } from "./degraded-ingest.protocol.js";
 import {
@@ -670,7 +672,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
     const mode = parseDegradedMessage(msg);
     if (mode !== null) {
-      this.applyIngestMode(mode);
+      this.applyIngestMode(mode, parseOveragePauseReason(msg));
       return;
     }
 
@@ -694,6 +696,14 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
   private reportedMode: IngestMode = "full";
 
   /**
+   * Why the account's overage is paused, when the last reply was errors-only
+   * and gave a reason this agent can word; null otherwise. Kept beside
+   * `reportedMode` for the same reason, and a pause whose reason changes -
+   * spike protection's, then a spent budget's - is said again.
+   */
+  private reportedPauseReason: OveragePauseReason | null = null;
+
+  /**
    * Stops sending trace trees the collector has told us it is throwing away,
    * and says so once - and again only when the reason changes.
    *
@@ -702,16 +712,45 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
    * that out by opening a trace and seeing nothing has been let down by an
    * agent that knew. Each line says what is still kept, because the traces
    * worth opening - server errors, slow requests, failed jobs - still are.
+   *
+   * Except while the account's overage is paused, when next to nothing is
+   * kept and nothing comes back on its own before the month ends: that line
+   * says so, and who can change it.
    */
-  private applyIngestMode(mode: IngestMode) {
-    // Reduced, trimmed and paced withhold the same trees; only the notice
-    // differs.
-    this.observeAgentSharedBuffer.setDegraded(mode !== "full");
+  private applyIngestMode(
+    mode: IngestMode,
+    pauseReason: OveragePauseReason | null = null,
+  ) {
+    // Reduced, trimmed and paced withhold the same trees, and errors-only
+    // everything but server errors; the buffer tells them apart.
+    this.observeAgentSharedBuffer.setIngestMode(mode);
 
-    if (mode === this.reportedMode) {
+    if (
+      mode === this.reportedMode &&
+      pauseReason === this.reportedPauseReason
+    ) {
       return;
     }
-    if (mode === "reduced") {
+    if (mode === "errors-only") {
+      // Not "most traces arrive without their spans": requests, jobs and
+      // logs stop too, and the operator may have to ask whoever holds the
+      // account to resume them.
+      const why =
+        pauseReason === "spike"
+          ? "spike protection paused this account's overage"
+          : pauseReason === "budget"
+            ? "this account's monthly overage budget is spent, so its overage is paused"
+            : "this account's overage is paused";
+      const resume =
+        pauseReason === "budget"
+          ? "resumes it or raises the budget"
+          : "resumes it";
+      this.logger.warn(
+        `Observe: ${why}. Only server errors and failed jobs are sent now, without their spans; ` +
+          "every other request and job, and every log line, is held back. Runtime and custom metrics are still recorded. " +
+          `Full collection returns when someone ${resume} at /dashboard/billing/usage, or at 00:00 UTC on the 1st.`,
+      );
+    } else if (mode === "reduced") {
       this.logger.warn(
         "Observe: this account has used its monthly allowance, so most traces now arrive without their spans. " +
           "Requests, jobs and errors are still recorded, and server errors, slow requests and failed jobs keep their full traces. " +
@@ -731,10 +770,16 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
           "Requests, jobs and errors are still recorded, and server errors, slow requests and failed jobs keep their full traces. " +
           "See /dashboard/billing/usage.",
       );
+    } else if (this.reportedMode === "errors-only") {
+      // Not only the spans: every request, job and log line is back.
+      this.logger.log(
+        "Observe: this account's overage is no longer paused, so everything is recorded again.",
+      );
     } else {
       this.logger.log("Observe: spans are being recorded again.");
     }
     this.reportedMode = mode;
+    this.reportedPauseReason = pauseReason;
   }
 
   handleError(error: Error) {
