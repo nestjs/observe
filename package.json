@@ -147,7 +147,7 @@
     "@vitest/coverage-v8": "4.1.11",
     "bull": "4.16.5",
     "bullmq": "6.2.0",
-    "drizzle-orm": "0.45.2",
+    "drizzle-orm": "0.45.4",
     "express": "5.2.1",
     "graphql": "16.14.2",
     "husky": "9.1.7",
