@@ -1,4 +1,5 @@
 import {
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -64,6 +65,45 @@ function harness(polls: Array<{ status: number; body: unknown } | "network">) {
 }
 
 const pending = { status: 400, body: { error: "authorization_pending" } };
+
+/** The AppModule `nest new` scaffolds with Observe. */
+const SCAFFOLDED_APP_MODULE = `import { Module } from '@nestjs/common';
+import { createObserveModule } from '@nestjs/observe';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+
+export const { ObserveModule, ObserveInstrument } = createObserveModule();
+
+@Module({
+  imports: [
+    ObserveModule.forRoot({
+      appKey: 'YOUR_APP_KEY',
+      appSecret: 'YOUR_APP_SECRET',
+      serviceId: 'orders-api',
+    }),
+  ],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
+`;
+
+/** An installed `@nestjs/observe`, as far as its declarations go. */
+function installSdk(cwd: string, appKeyDeclaration: string) {
+  const root = join(cwd, "node_modules", "@nestjs", "observe");
+  mkdirSync(join(root, "dist", "interfaces"), { recursive: true });
+  writeFileSync(
+    join(root, "package.json"),
+    JSON.stringify({
+      name: "@nestjs/observe",
+      exports: { ".": "./dist/index.js", "./package.json": "./package.json" },
+    }),
+  );
+  writeFileSync(
+    join(root, "dist", "interfaces", "observe-options.interface.d.ts"),
+    `export interface ObserveOptions {\n    ${appKeyDeclaration}\n}\n`,
+  );
+}
 
 describe("npx @nestjs/observe link", () => {
   let cwd: string;
@@ -230,5 +270,113 @@ describe("npx @nestjs/observe link", () => {
     expect(h.lines).toContain(
       '  "start:dev" does not run nest start, so load .env there yourself (node --env-file=.env).',
     );
+  });
+
+  describe("the nest new placeholders", () => {
+    beforeEach(() => {
+      mkdirSync(join(cwd, "src"));
+      writeFileSync(join(cwd, "src", "app.module.ts"), SCAFFOLDED_APP_MODULE);
+    });
+
+    it("points AppModule at the environment once .env holds the pair", async () => {
+      installSdk(cwd, "appKey?: string;");
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+
+      expect(readFileSync(join(cwd, "src", "app.module.ts"), "utf8")).toBe(
+        SCAFFOLDED_APP_MODULE.replace(
+          "'YOUR_APP_KEY'",
+          "process.env.OBSERVE_APP_KEY",
+        ).replace("'YOUR_APP_SECRET'", "process.env.OBSERVE_APP_SECRET"),
+      );
+      expect(h.lines).toContain(
+        "  src/app.module.ts now reads the pair from OBSERVE_APP_KEY and OBSERVE_APP_SECRET in place of the YOUR_APP_KEY placeholders.",
+      );
+    });
+
+    it("keeps them where the installed SDK would not compile process.env", async () => {
+      installSdk(cwd, "appKey: string;");
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+
+      expect(readFileSync(join(cwd, "src", "app.module.ts"), "utf8")).toBe(
+        SCAFFOLDED_APP_MODULE,
+      );
+      expect(h.lines).toContainEqual(
+        expect.stringMatching(
+          /^ {2}src\/app\.module\.ts still holds the YOUR_APP_KEY placeholders\. The SDK reads \.env in their place.*0\.3\.16 or later/,
+        ),
+      );
+    });
+
+    it("keeps them when nothing tells it the SDK is installed", async () => {
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+      expect(readFileSync(join(cwd, "src", "app.module.ts"), "utf8")).toBe(
+        SCAFFOLDED_APP_MODULE,
+      );
+    });
+
+    it("finds them in every application of a monorepo", async () => {
+      installSdk(cwd, "appKey?: string;");
+      writeFileSync(
+        join(cwd, "nest-cli.json"),
+        JSON.stringify({
+          sourceRoot: "apps/api/src",
+          monorepo: true,
+          projects: {
+            api: { type: "application", sourceRoot: "apps/api/src" },
+            worker: { type: "application", sourceRoot: "apps/worker/src" },
+          },
+        }),
+      );
+      for (const app of ["api", "worker"]) {
+        mkdirSync(join(cwd, "apps", app, "src"), { recursive: true });
+        writeFileSync(
+          join(cwd, "apps", app, "src", "app.module.ts"),
+          SCAFFOLDED_APP_MODULE,
+        );
+      }
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+
+      for (const app of ["api", "worker"]) {
+        expect(
+          readFileSync(join(cwd, "apps", app, "src", "app.module.ts"), "utf8"),
+        ).toContain("appKey: process.env.OBSERVE_APP_KEY,");
+      }
+      expect(h.lines).toContainEqual(
+        expect.stringContaining(
+          "apps/api/src/app.module.ts, apps/worker/src/app.module.ts and src/app.module.ts now read the pair",
+        ),
+      );
+    });
+
+    it("leaves a value the application passes itself alone", async () => {
+      installSdk(cwd, "appKey?: string;");
+      const own = SCAFFOLDED_APP_MODULE.replace(
+        "appKey: 'YOUR_APP_KEY'",
+        "appKey: config.get('OBSERVE_KEY')",
+      ).replace("appSecret: 'YOUR_APP_SECRET'", "appSecret: vault.secret");
+      writeFileSync(join(cwd, "src", "app.module.ts"), own);
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+      expect(readFileSync(join(cwd, "src", "app.module.ts"), "utf8")).toBe(own);
+    });
+
+    it("leaves them alone when the link is denied", async () => {
+      installSdk(cwd, "appKey?: string;");
+      const h = harness([{ status: 400, body: { error: "access_denied" } }]);
+
+      expect(await run(h)).toBe(1);
+      expect(readFileSync(join(cwd, "src", "app.module.ts"), "utf8")).toBe(
+        SCAFFOLDED_APP_MODULE,
+      );
+    });
   });
 });

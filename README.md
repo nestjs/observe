@@ -76,8 +76,11 @@ It prints a code, you type it at
 first if you have no account) and approve, and it writes the key pair into
 `.env` as `OBSERVE_APP_KEY` and `OBSERVE_APP_SECRET`, git-ignores `.env`, and
 adds `--env-file .env` to every script that runs `nest start` (`start`,
-`start:dev` and `start:debug` in a `nest new` project). `ObserveModule` reads those two variables whenever `appKey` and
-`appSecret` are left out or still hold the `nest new` placeholders.
+`start:dev` and `start:debug` in a `nest new` project). In an AppModule that
+still holds the `nest new` placeholders, `appKey: 'YOUR_APP_KEY'` and
+`appSecret: 'YOUR_APP_SECRET'` become `process.env.OBSERVE_APP_KEY` and
+`process.env.OBSERVE_APP_SECRET`. `ObserveModule` reads those two variables
+whenever `appKey` and `appSecret` are left out or still hold the placeholders.
 
 Or sign up at **[observe.nestjs.com](https://observe.nestjs.com)** and create a
 service by hand. The dashboard issues an **app key** and an **app secret**,

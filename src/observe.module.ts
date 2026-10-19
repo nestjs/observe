@@ -94,9 +94,9 @@ const SCAFFOLD_CREDENTIALS = {
 /**
  * `appKey` and `appSecret` from `OBSERVE_APP_KEY` and `OBSERVE_APP_SECRET`
  * when the options leave them out - or still hold the `nest new`
- * placeholders, which is what a project linked with
- * `npx @nestjs/observe link` keeps in its AppModule while the real pair sits
- * in its `.env`. A value the application passes explicitly always wins.
+ * placeholders, which a project scaffolded before `nest new` read the
+ * environment keeps in its AppModule until `npx @nestjs/observe link` swaps
+ * them out. A value the application passes explicitly always wins.
  *
  * Read when the options resolve, which for `forRoot()` is when AppModule is
  * imported: early enough for `node --env-file` and `nest start --env-file`,

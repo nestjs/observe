@@ -2,6 +2,7 @@ import {
   addEnvFileToStartScripts,
   ensureEnvIgnored,
   readPackageName,
+  replaceScaffoldPlaceholders,
   writeEnvFile,
 } from "./project-files.js";
 
@@ -44,7 +45,8 @@ const SLOW_DOWN_SECONDS = 5;
 /**
  * `npx @nestjs/observe link`: asks the API for a code, has the person type it
  * into the dashboard and approve, then writes the key pair it receives into
- * `.env` and makes the start scripts load it.
+ * `.env`, makes the start scripts load it, and points a `nest new` AppModule's
+ * placeholders at it.
  *
  * Returns the process exit code. Nothing is written until the key pair has
  * arrived, so an interrupted, denied or expired link leaves the project as it
@@ -97,6 +99,7 @@ export async function link(
   writeEnvFile(options.cwd, credentials.appKey, credentials.appSecret);
   const ignoredNow = ensureEnvIgnored(options.cwd);
   const scripts = addEnvFileToStartScripts(options.cwd);
+  const placeholders = replaceScaffoldPlaceholders(options.cwd);
 
   deps.log("");
   deps.log(
@@ -113,6 +116,16 @@ export async function link(
   if (scripts.skipped.length) {
     deps.log(
       `  ${listScripts(scripts.skipped)} do${scripts.skipped.length === 1 ? "es" : ""} not run nest start, so load .env there yourself (node --env-file=.env).`,
+    );
+  }
+  if (placeholders.updated.length) {
+    deps.log(
+      `  ${listFiles(placeholders.updated)} now read${placeholders.updated.length === 1 ? "s" : ""} the pair from OBSERVE_APP_KEY and OBSERVE_APP_SECRET in place of the YOUR_APP_KEY placeholders.`,
+    );
+  }
+  if (placeholders.outdatedSdk.length) {
+    deps.log(
+      `  ${listFiles(placeholders.outdatedSdk)} still hold${placeholders.outdatedSdk.length === 1 ? "s" : ""} the YOUR_APP_KEY placeholders. The SDK reads .env in their place, so the app reports anyway; to have the code say so, update @nestjs/observe to 0.3.16 or later and run link again.`,
     );
   }
   deps.log(
@@ -194,6 +207,13 @@ function listScripts(names: string[]): string {
   return quoted.length > 1
     ? `${quoted.slice(0, -1).join(", ")} and ${quoted[quoted.length - 1]}`
     : quoted[0];
+}
+
+/** `src/app.module.ts`, `src/a.ts and src/b.ts`. */
+function listFiles(paths: string[]): string {
+  return paths.length > 1
+    ? `${paths.slice(0, -1).join(", ")} and ${paths[paths.length - 1]}`
+    : paths[0];
 }
 
 function describe(err: unknown): string {

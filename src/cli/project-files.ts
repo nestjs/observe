@@ -1,5 +1,12 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join, relative, sep } from "node:path";
 
 /** The variables `ObserveModule` falls back to for its key pair. */
 export const KEY_VARIABLE = "OBSERVE_APP_KEY";
@@ -127,5 +134,161 @@ export function readPackageName(cwd: string): string | undefined {
     return typeof name === "string" ? name : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** The values `nest new` scaffolds into `ObserveModule.forRoot()`. */
+const SCAFFOLD_PLACEHOLDERS = [
+  { option: "appKey", placeholder: "YOUR_APP_KEY", variable: KEY_VARIABLE },
+  {
+    option: "appSecret",
+    placeholder: "YOUR_APP_SECRET",
+    variable: SECRET_VARIABLE,
+  },
+] as const;
+
+const SOURCE_FILE = /\.(ts|mts|cts|js|mjs|cjs)$/;
+const SKIPPED_DIRECTORIES = new Set(["node_modules", "dist", ".git"]);
+
+export interface PlaceholderUpdate {
+  /** Files whose placeholders now read the environment. */
+  updated: string[];
+  /**
+   * Files that still hold placeholders, because the installed SDK types the
+   * pair as required strings and `process.env` would not compile there.
+   */
+  outdatedSdk: string[];
+}
+
+/**
+ * Swaps the `nest new` placeholders - `appKey: 'YOUR_APP_KEY'`,
+ * `appSecret: 'YOUR_APP_SECRET'` - for `process.env.OBSERVE_APP_KEY` and
+ * `process.env.OBSERVE_APP_SECRET`, now that `.env` holds the real pair.
+ *
+ * The SDK already reads the environment in place of a placeholder, so the
+ * application reports either way. But a linked project whose AppModule still
+ * says `YOUR_APP_KEY` reads as one that was never set up, and invites pasting
+ * the secret into the code - the one place it must not go.
+ *
+ * Only in TypeScript sources whose installed SDK types the pair as optional:
+ * against the older, required `string`, `process.env.*` is `string |
+ * undefined` and a strict project would stop compiling. Those are reported
+ * instead, and left as they are.
+ */
+export function replaceScaffoldPlaceholders(cwd: string): PlaceholderUpdate {
+  const result: PlaceholderUpdate = { updated: [], outdatedSdk: [] };
+  let typesAcceptEnv: boolean | undefined;
+
+  for (const path of sourceFiles(cwd)) {
+    const content = readFileSync(path, "utf8");
+    if (
+      !SCAFFOLD_PLACEHOLDERS.some(({ placeholder }) =>
+        content.includes(placeholder),
+      )
+    ) {
+      continue;
+    }
+    let updated = content;
+    for (const { option, placeholder, variable } of SCAFFOLD_PLACEHOLDERS) {
+      updated = updated.replace(
+        new RegExp(`(\\b${option}\\s*:\\s*)(['"\`])${placeholder}\\2`, "g"),
+        `$1process.env.${variable}`,
+      );
+    }
+    if (updated === content) {
+      continue;
+    }
+    const name = relative(cwd, path).split(sep).join("/");
+    if (/\.[mc]?ts$/.test(path)) {
+      typesAcceptEnv ??= sdkTypesAcceptEnv(cwd);
+      if (!typesAcceptEnv) {
+        result.outdatedSdk.push(name);
+        continue;
+      }
+    }
+    writeFileSync(path, updated);
+    result.updated.push(name);
+  }
+  return result;
+}
+
+/**
+ * The project's sources: `src`, or the source roots `nest-cli.json` names -
+ * a monorepo's every application and library.
+ */
+function sourceFiles(cwd: string): string[] {
+  const roots = new Set(["src"]);
+  try {
+    const config = JSON.parse(
+      readFileSync(join(cwd, "nest-cli.json"), "utf8"),
+    ) as {
+      sourceRoot?: string;
+      projects?: Record<string, { sourceRoot?: string; root?: string }>;
+    };
+    if (config.sourceRoot) {
+      roots.add(config.sourceRoot);
+    }
+    for (const project of Object.values(config.projects ?? {})) {
+      const root = project?.sourceRoot ?? project?.root;
+      if (root) {
+        roots.add(root);
+      }
+    }
+  } catch {
+    // No nest-cli.json, or not JSON: `src` is all there is to look in.
+  }
+
+  const files = new Set<string>();
+  const walk = (directory: string) => {
+    let entries: string[];
+    try {
+      entries = readdirSync(directory);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIPPED_DIRECTORIES.has(entry)) {
+        continue;
+      }
+      const path = join(directory, entry);
+      const stats = statSync(path);
+      if (stats.isDirectory()) {
+        walk(path);
+      } else if (SOURCE_FILE.test(entry) && !entry.endsWith(".d.ts")) {
+        files.add(path);
+      }
+    }
+  };
+  for (const root of roots) {
+    walk(join(cwd, root));
+  }
+  return [...files].sort();
+}
+
+/**
+ * Whether the `@nestjs/observe` this project has installed types `appKey` as
+ * optional - 0.3.16 and later - so `process.env.OBSERVE_APP_KEY` compiles in
+ * a strict project. Read from its declarations rather than its version, which
+ * says nothing about a build from a branch or a link. Not installed, or
+ * unreadable, counts as no: a guess that breaks the build is worse than a
+ * placeholder that still works.
+ */
+function sdkTypesAcceptEnv(cwd: string): boolean {
+  try {
+    const manifest = createRequire(join(cwd, "package.json")).resolve(
+      "@nestjs/observe/package.json",
+    );
+    const declarations = readFileSync(
+      join(
+        dirname(manifest),
+        "dist",
+        "interfaces",
+        "observe-options.interface.d.ts",
+      ),
+      "utf8",
+    );
+    return /\bappKey\?\s*:/.test(declarations);
+  } catch {
+    return false;
   }
 }
