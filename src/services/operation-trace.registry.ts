@@ -511,8 +511,11 @@ export class OperationTraceRegistry {
   ): void {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
-      this.logger.error(
-        `No snapshot found for traceId: "${traceId}". Cannot end trace step for "${className}#${methodKey}".`,
+      // Steps are only ended after they opened against a live snapshot, so
+      // this one was still running when its trace was dropped: un-awaited
+      // work that outlived its request or job, same as the warnings below.
+      this.logger.warn(
+        `Trace "${traceId}" ended before its "${className}#${methodKey}" span did, so the trace was not reported. Some of your async operations were not awaited and outlived the operation that started them. Ignore if this is the desired behavior.`,
       );
       return;
     }

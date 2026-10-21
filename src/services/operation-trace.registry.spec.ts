@@ -1427,5 +1427,44 @@ describe("OperationTraceRegistry", () => {
       // snapshot per un-awaited call for the lifetime of the process.
       expect(registry.getActiveSpan("i2", "anything")).toBeUndefined();
     }, 10_000);
+
+    it("warns rather than errors when a span ends after its trace was dropped", async () => {
+      const logger = (registry as unknown as { logger: Logger }).logger;
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+      startRequest("i3");
+      const handler = registry.internalStartTraceStep(
+        "i3",
+        "OrdersController",
+        "create",
+        undefined,
+      );
+      // Started by the handler and not awaited - an email sent in the
+      // background - so it is still running when the handler returns.
+      const mail = registry.internalStartTraceStep(
+        "i3",
+        "MailService",
+        "send",
+        handler,
+      );
+      registry.internalEndTraceStep(
+        "i3",
+        handler,
+        "OrdersController",
+        "create",
+        handler,
+      );
+      registry.endTrace("i3");
+      await expect(registry.pluckSnapshot("i3")).resolves.toBeUndefined();
+
+      registry.internalEndTraceStep("i3", mail, "MailService", "send", mail);
+
+      expect(error).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('"MailService#send"'),
+      );
+    }, 10_000);
   });
 });
