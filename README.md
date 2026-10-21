@@ -124,6 +124,10 @@ only trace of it is one line at startup.
 
 ## Quick start
 
+The agent needs `@nestjs/core` 11.2.2 or later. On 11.2.1 and earlier, passing
+`instrument` to `NestFactory.create()` makes startup fail. On Express the error
+is `TypeError: argument handler must be a function`.
+
 `createObserveModule()` returns both the dynamic module and the instrumentation
 hook Nest needs at bootstrap:
 
