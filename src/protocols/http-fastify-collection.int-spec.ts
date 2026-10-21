@@ -11,6 +11,7 @@ import {
   CollectedSnapshots,
   collectSnapshots,
   testObserveOptions,
+  waitFor,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
 
@@ -65,6 +66,7 @@ class HttpTestModule {}
 describe("ObserveModule: HTTP collection (Fastify)", () => {
   let app: NestFastifyApplication;
   let collected: CollectedSnapshots;
+  let appOnResponseCalls = 0;
 
   beforeAll(async () => {
     app = await NestFactory.create<NestFastifyApplication>(
@@ -74,6 +76,15 @@ describe("ObserveModule: HTTP collection (Fastify)", () => {
     );
     collected = collectSnapshots(app);
     await app.init();
+    // Added after the adapter's own onResponse hook, which runs the agent's,
+    // so Fastify only gets here once the agent's hook calls done().
+    app
+      .getHttpAdapter()
+      .getInstance()
+      .addHook("onResponse", (_request, _reply, done) => {
+        appOnResponseCalls++;
+        done();
+      });
     // Fastify queues its plugins and routes until `ready()`; supertest talks to
     // the raw server, which would answer 404 to everything before that.
     await app.getHttpAdapter().getInstance().ready();
@@ -83,7 +94,10 @@ describe("ObserveModule: HTTP collection (Fastify)", () => {
     await app?.close();
   });
 
-  beforeEach(() => collected.clear());
+  beforeEach(() => {
+    collected.clear();
+    appOnResponseCalls = 0;
+  });
 
   it("collects a snapshot for a GET request", async () => {
     await request(app.getHttpServer()).get("/orders").expect(200);
@@ -188,6 +202,19 @@ describe("ObserveModule: HTTP collection (Fastify)", () => {
     );
 
     expect(snapshot.attributes?.statusCode).toBe(500);
+  });
+
+  it("lets the application's own onResponse hooks run", async () => {
+    // @fastify/multipart cleans up saved temp files and Fastify logs
+    // "request completed" from the same hook chain.
+    await request(app.getHttpServer()).get("/orders").expect(200);
+
+    await waitForSnapshot(collected, (item) => item.operationId === "/orders");
+    await waitFor(
+      () => appOnResponseCalls === 1,
+      1000,
+      "the application's onResponse hook",
+    );
   });
 
   it("collects one snapshot per request", async () => {

@@ -129,14 +129,18 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       },
     );
 
+    // Fastify waits for `done` before it runs the next onResponse hook.
+    // Express does not pass one.
     httpAdapter.setOnResponseHook(
       (
         req: unknown,
         res: {
           statusCode: number;
         },
+        done?: () => void,
       ) => {
         this.endHttpRequestTracing(req, res);
+        done?.();
       },
     );
   }
