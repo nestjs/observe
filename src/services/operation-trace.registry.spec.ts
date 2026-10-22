@@ -1428,7 +1428,7 @@ describe("OperationTraceRegistry", () => {
       expect(registry.getActiveSpan("i2", "anything")).toBeUndefined();
     }, 10_000);
 
-    it("warns rather than errors when a span ends after its trace was dropped", async () => {
+    it("warns once, not per span, when a trace is dropped for a span that outlived it", async () => {
       const logger = (registry as unknown as { logger: Logger }).logger;
       const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
       const error = vi.spyOn(logger, "error").mockImplementation(() => {});
@@ -1458,13 +1458,17 @@ describe("OperationTraceRegistry", () => {
       registry.endTrace("i3");
       await expect(registry.pluckSnapshot("i3")).resolves.toBeUndefined();
 
-      registry.internalEndTraceStep("i3", mail, "MailService", "send", mail);
-
-      expect(error).not.toHaveBeenCalled();
+      // Once, when the trace is given up on, naming the span that held it.
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(
         expect.stringContaining('"MailService#send"'),
       );
+
+      // Its late end adds nothing.
+      registry.internalEndTraceStep("i3", mail, "MailService", "send", mail);
+
+      expect(error).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledTimes(1);
     }, 10_000);
   });
 });

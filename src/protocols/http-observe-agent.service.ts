@@ -277,10 +277,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
    * either plucked the trace or is about to.
    *
    * Eviction is deferred, not immediate: Express does not cancel the handler
-   * on abort, so its spans are usually still closing when `close` fires, and
-   * each one ending after the snapshot is gone would log an error. The grace
-   * period lets the handler drain first; `unref` keeps the timer from holding
-   * a shutting-down process open.
+   * on abort, so its spans are usually still closing when `close` fires. The
+   * grace period lets the handler drain first; `unref` keeps the timer from
+   * holding a shutting-down process open.
    */
   private evictTraceOnClientAbort(res: unknown, traceId: string): void {
     const response = res as {
