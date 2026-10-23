@@ -5,7 +5,6 @@ import { Gauge, GaugeKind, Summary } from "../custom-metrics/index.js";
 import { Counter } from "../custom-metrics/counter.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { TraceSpanDelegate } from "../trace-span.delegate.js";
-import { KeyOf } from "../types/key-of.type.js";
 import { Path, PathValue } from "../types/path-value.type.js";
 import {
   CALLER_METADATA_KEY,
@@ -23,10 +22,7 @@ const MAX_OPERATION_ID_LENGTH = 255;
 
 @Injectable()
 export class TracerService<
-  Store extends Record<string | symbol, unknown> = Record<
-    string | symbol,
-    unknown
-  >,
+  Store extends object = Record<string | symbol, unknown>,
   TraceKey extends string = "traceId",
 > {
   // Each entry has its own label union, so the maps hold the label-agnostic
@@ -40,7 +36,9 @@ export class TracerService<
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
-    private readonly als: AsyncLocalStorage<Map<KeyOf<Store> | TraceKey, any>>,
+    private readonly als: AsyncLocalStorage<
+      Map<string | symbol | TraceKey, any>
+    >,
     private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,
@@ -138,8 +136,7 @@ export class TracerService<
     }
 
     const traceId =
-      store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
-      store.get(this.options.traceIdKey);
+      store.get(TRACE_REGISTRY_KEY) ?? store.get(this.options.traceIdKey);
     if (typeof traceId !== "string") {
       // Reporting an error must not raise one. The registry warned and gave up
       // in this case anyway, so the outcome is unchanged.
@@ -444,12 +441,11 @@ export class TracerService<
    * methods with no async context at all - and is reported the same way.
    */
   private requireTraceId(
-    store: Map<KeyOf<Store>, unknown>,
+    store: Map<string | symbol, unknown>,
     method: string,
   ): string {
     const traceId =
-      store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
-      store.get(this.options.traceIdKey);
+      store.get(TRACE_REGISTRY_KEY) ?? store.get(this.options.traceIdKey);
     if (typeof traceId !== "string") {
       throw new Error(
         `No trace id found in the current context. Ensure that you are using the "${method}" method within a traced operation.`,

@@ -164,6 +164,46 @@ describe("TracerService", () => {
     });
   });
 
+  describe("setAttribute and getAttribute", () => {
+    it("takes any key when the store is not typed", () => {
+      als.run(new Map(), () => {
+        tracer.setAttribute("userId", "42");
+        tracer.setAttribute("flags.betaCheckout", true);
+
+        expect(tracer.getAttribute("userId")).toBe("42");
+        expect(tracer.getAttribute("flags.betaCheckout")).toBe(true);
+        expectTypeOf(tracer.getAttribute("userId")).toEqualTypeOf<unknown>();
+      });
+    });
+
+    it("checks keys and values against a store declared as an interface", () => {
+      interface RequestStore {
+        userId: number;
+        flags: { betaCheckout: boolean };
+      }
+      const typedTracer = new TracerService<RequestStore>(
+        registry,
+        als as never,
+        {} as ObserveAgentSharedBuffer,
+        { traceIdKey: TRACE_ID_KEY } as ObserveModuleOptionsWithDefaults,
+      );
+
+      als.run(new Map(), () => {
+        // @ts-expect-error the store says userId is a number
+        typedTracer.setAttribute("userId", "7");
+        // @ts-expect-error the store has no such key
+        typedTracer.setAttribute("tenantId", "acme");
+        typedTracer.setAttribute("userId", 7);
+        typedTracer.setAttribute("flags.betaCheckout", true);
+
+        expect(typedTracer.getAttribute("userId")).toBe(7);
+        expectTypeOf(typedTracer.getAttribute("userId")).toEqualTypeOf<
+          number | undefined
+        >();
+      });
+    });
+  });
+
   describe("setOperationId", () => {
     it("renames the active request using the configured trace id key", async () => {
       const customKeyTracer = new TracerService(
