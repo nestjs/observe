@@ -13,7 +13,10 @@ import {
   SpanSliceRecorder,
 } from "../profiling/span-slice-recorder.js";
 import { SPAN_COLLAPSED_TAG } from "./collapse-repeated-spans.util.js";
-import { OperationTraceRegistry } from "./operation-trace.registry.js";
+import {
+  OperationTraceRegistry,
+  UNFINISHED_SPANS_TAG,
+} from "./operation-trace.registry.js";
 import { resolveSkipSpans } from "./skip-spans.util.js";
 
 /**
@@ -21,7 +24,8 @@ import { resolveSkipSpans } from "./skip-spans.util.js";
  * tree underneath it. Two properties matter most and neither is visible from a
  * type: a span's id doubles as the caller id it is registered under (which is
  * what lets a log line resolve back to the span it was written inside), and a
- * snapshot is only shipped once every span it opened has closed.
+ * shipped snapshot only ever holds spans that have closed - a span still open
+ * a second after its operation ended is left out rather than shipped open.
  */
 describe("OperationTraceRegistry", () => {
   let als: AsyncLocalStorage<Map<string, unknown>>;
@@ -1042,7 +1046,15 @@ describe("OperationTraceRegistry", () => {
       registry.internalEndTraceStep("m5", parent, "Svc", "root", parent);
       registry.endTrace("m5");
 
-      await expect(registry.pluckSnapshot("m5")).resolves.toBeUndefined();
+      // Waited out and shipped without the leaked span, never with it.
+      const snapshot = await registry.pluckSnapshot("m5");
+      expect(snapshot!.traces).toEqual([
+        expect.objectContaining({
+          methodKey: "root",
+          children: [expect.objectContaining({ name: "quick" })],
+        }),
+      ]);
+      expect(() => JSON.stringify(snapshot)).not.toThrow();
     }, 10_000);
 
     it("records an execution slice under the manual span's own id", async () => {
@@ -1407,28 +1419,50 @@ describe("OperationTraceRegistry", () => {
   });
 
   describe("incomplete snapshots", () => {
-    it("abandons a snapshot whose spans never closed", async () => {
+    // Any node that is still ongoing anywhere in a shipped tree.
+    const ongoingNodes = (nodes: unknown[] = []): unknown[] =>
+      nodes.flatMap((node) => {
+        const { type, children } = node as {
+          type?: string;
+          children?: unknown[];
+        };
+        return type === "start"
+          ? [node, ...ongoingNodes(children)]
+          : ongoingNodes(children);
+      });
+
+    it("keeps the operation when every span it opened is still open", async () => {
+      vi.spyOn(
+        (registry as unknown as { logger: Logger }).logger,
+        "warn",
+      ).mockImplementation(() => {});
+
       startRequest("i1");
       registry.internalStartTraceStep("i1", "Svc", "leaked", undefined);
-      registry.endTrace("i1");
+      registry.endTrace("i1", { statusCode: 201 });
 
       // An un-awaited async call leaves a span open; rather than shipping a
-      // half-built tree, the snapshot waits and is then dropped.
-      await expect(registry.pluckSnapshot("i1")).resolves.toBeUndefined();
+      // half-built tree, the snapshot waits and then ships without it. The
+      // request keeps its row - status, duration - with an empty tree, the
+      // same shape a trace `skipSpans` claims ships with.
+      const snapshot = (await registry.pluckSnapshot("i1")) as RequestSnapshot;
+      expect(snapshot.traces).toEqual([]);
+      expect(snapshot.attributes?.statusCode).toBe(201);
+      expect(snapshot.tags).toEqual({ [UNFINISHED_SPANS_TAG]: 1 });
     }, 10_000);
 
-    it("does not leak the trace after abandoning it", async () => {
+    it("does not leak the trace after shipping it without its open spans", async () => {
       startRequest("i2");
       registry.internalStartTraceStep("i2", "Svc", "leaked", undefined);
       registry.endTrace("i2");
       await registry.pluckSnapshot("i2");
 
-      // Cleanup runs on the abandon path too, or a busy process accumulates a
+      // Cleanup runs on this path too, or a busy process accumulates a
       // snapshot per un-awaited call for the lifetime of the process.
       expect(registry.getActiveSpan("i2", "anything")).toBeUndefined();
     }, 10_000);
 
-    it("warns once, not per span, when a trace is dropped for a span that outlived it", async () => {
+    it("warns once, not per span, when a trace ships without a span that outlived it", async () => {
       const logger = (registry as unknown as { logger: Logger }).logger;
       const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
       const error = vi.spyOn(logger, "error").mockImplementation(() => {});
@@ -1456,9 +1490,9 @@ describe("OperationTraceRegistry", () => {
         handler,
       );
       registry.endTrace("i3");
-      await expect(registry.pluckSnapshot("i3")).resolves.toBeUndefined();
+      await expect(registry.pluckSnapshot("i3")).resolves.toBeDefined();
 
-      // Once, when the trace is given up on, naming the span that held it.
+      // Once, when the trace ships, naming the span it ships without.
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(
         expect.stringContaining('"MailService#send"'),
@@ -1469,6 +1503,139 @@ describe("OperationTraceRegistry", () => {
 
       expect(error).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledTimes(1);
+    }, 10_000);
+
+    it("ships what finished when a span outlives its trace, without the spans still open", async () => {
+      const logger = (registry as unknown as { logger: Logger }).logger;
+      vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+      const requestTags = { region: "eu" };
+      registry.startTrace("p1", {
+        operationId: "POST /orders",
+        protocol: "http",
+        attributes: { method: "POST", originalUrl: "/orders" },
+        tags: requestTags,
+      });
+      const handler = registry.internalStartTraceStep(
+        "p1",
+        "OrdersController",
+        "create",
+        undefined,
+      );
+      const create = registry.internalStartTraceStep(
+        "p1",
+        "OrdersService",
+        "create",
+        handler,
+      );
+      registry.internalEndTraceStep(
+        "p1",
+        create,
+        "OrdersService",
+        "create",
+        create,
+      );
+      // Fired by the handler and not awaited: still running when it returns,
+      // with a call of its own that already finished.
+      const mail = registry.internalStartTraceStep(
+        "p1",
+        "MailService",
+        "send",
+        handler,
+      );
+      const render = registry.internalStartTraceStep(
+        "p1",
+        "TemplateService",
+        "render",
+        mail,
+      );
+      registry.internalEndTraceStep(
+        "p1",
+        render,
+        "TemplateService",
+        "render",
+        render,
+      );
+      registry.internalEndTraceStep(
+        "p1",
+        handler,
+        "OrdersController",
+        "create",
+        handler,
+      );
+      registry.endTrace("p1", { statusCode: 201 });
+
+      const snapshot = (await registry.pluckSnapshot("p1")) as RequestSnapshot;
+
+      expect(snapshot).toBeDefined();
+      expect(snapshot.attributes?.statusCode).toBe(201);
+      expect(snapshot.traces).toEqual([
+        expect.objectContaining({
+          className: "OrdersController",
+          methodKey: "create",
+          children: [
+            expect.objectContaining({
+              className: "OrdersService",
+              methodKey: "create",
+            }),
+          ],
+        }),
+      ]);
+      // Only complete nodes reach the wire, and none of them still points
+      // back at a parent.
+      expect(ongoingNodes(snapshot.traces)).toEqual([]);
+      expect(() => JSON.stringify(snapshot)).not.toThrow();
+      // The open span and the finished call under it are both left out.
+      expect(snapshot.tags).toEqual({
+        region: "eu",
+        [UNFINISHED_SPANS_TAG]: 2,
+      });
+      // The tags object the options handed in is shared by every request.
+      expect(requestTags).toEqual({ region: "eu" });
+
+      // Its late end changes nothing in what was shipped.
+      const shipped = JSON.stringify(snapshot);
+      registry.internalEndTraceStep("p1", mail, "MailService", "send", mail);
+      expect(JSON.stringify(snapshot)).toBe(shipped);
+    }, 10_000);
+
+    it("reports the failure of an operation whose background work outlived it", async () => {
+      vi.spyOn(
+        (registry as unknown as { logger: Logger }).logger,
+        "warn",
+      ).mockImplementation(() => {});
+
+      startRequest("p2");
+      const handler = registry.internalStartTraceStep(
+        "p2",
+        "OrdersController",
+        "create",
+        undefined,
+      );
+      // The email goes out in the background, then the handler throws.
+      registry.internalStartTraceStep("p2", "MailService", "send", handler);
+      registry.internalEndTraceStep(
+        "p2",
+        handler,
+        "OrdersController",
+        "create",
+        handler,
+        new Error("payment provider down"),
+      );
+      registry.endTrace("p2", { statusCode: 500 });
+
+      // The failed request is what the waiting used to cost: its status and
+      // its error ride on the snapshot, so they went with it.
+      const snapshot = (await registry.pluckSnapshot("p2")) as RequestSnapshot;
+      expect(snapshot.attributes?.statusCode).toBe(500);
+      expect(snapshot.traces).toEqual([
+        expect.objectContaining({
+          methodKey: "create",
+          error: expect.objectContaining({ message: "payment provider down" }),
+        }),
+      ]);
+      expect(ongoingNodes(snapshot.traces)).toEqual([]);
+      expect(snapshot.tags).toEqual({ [UNFINISHED_SPANS_TAG]: 1 });
     }, 10_000);
   });
 });

@@ -24,6 +24,17 @@ import { SkipSpansPredicate } from "./skip-spans.util.js";
 
 const SNAPSHOT_COMPLETION_TIMEOUT_MS = 1000;
 
+/**
+ * Tag under which a snapshot records how many spans were left out of its tree
+ * because they had not ended when it was shipped - the spans still open and
+ * everything recorded under them.
+ *
+ * A tag for the same reason `SPAN_COLLAPSED_TAG` is one: `tags` is already on
+ * every snapshot and already declared by the collector's contract, so no
+ * collector release has to come first. Absent on a snapshot shipped whole.
+ */
+export const UNFINISHED_SPANS_TAG = "observe.unfinishedSpans";
+
 type TraceId = string;
 type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
   /**
@@ -64,6 +75,17 @@ const UNHANDLED_ERROR_STATUS_CODE = 500;
  * count as handled; the exact code only matters when the exception carries one.
  */
 const HANDLED_ERROR_STATUS_CODE = 400;
+
+/** A node and everything below it. */
+function countNodes(node: {
+  children?: Array<CompleteTraceEventNode | OngoingTraceEventNode>;
+}): number {
+  let count = 1;
+  for (const child of node.children ?? []) {
+    count += countNodes(child);
+  }
+  return count;
+}
 
 export class OperationTraceRegistry {
   private readonly traceSnapshots: Map<TraceId, SnapshotWithSignal> = new Map();
@@ -511,9 +533,10 @@ export class OperationTraceRegistry {
   ): void {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
-      // The trace was dropped while this span was still open - `pluckSnapshot`
-      // gave up on it (and said so, once for the whole trace), or the client
-      // aborted. Nothing is left to record it in.
+      // The trace was handed off while this span was still open -
+      // `pluckSnapshot` shipped it without the span (and said so, once for the
+      // whole trace) - or dropped because the client aborted. Nothing is left
+      // to record it in.
       return;
     }
     snapshot.refsMarkedAsComplete += 1;
@@ -765,9 +788,12 @@ export class OperationTraceRegistry {
           this.awaitingCompletion -= 1;
         }
         if (snapshot.refsCounter > snapshot.refsMarkedAsComplete) {
-          this.reportDroppedTrace(traceId, snapshot);
-          cleanup();
-          return undefined;
+          // Shipped without the spans still open rather than not at all: the
+          // operation itself finished, and dropping it lost its status and
+          // error along with every span that did end. Read before cleanup,
+          // which takes the span map the warning names them from.
+          this.reportUnfinishedSpans(traceId, snapshot);
+          this.leaveOutUnfinishedSpans(snapshot);
         }
       }
       cleanup();
@@ -811,11 +837,50 @@ export class OperationTraceRegistry {
   }
 
   /**
-   * One line per trace `pluckSnapshot` gives up on, naming the spans that kept
-   * it open. Their late ends are silent: one un-awaited call usually holds a
+   * Takes every span that is still open out of the tree, together with
+   * everything recorded under it, and counts what went on the snapshot.
+   *
+   * An open node cannot be shipped: it has no duration yet, and a parent's
+   * self time is its duration minus its children's, so it would skew the
+   * numbers of the span that called it. What finished under it goes too, as
+   * there is no truthful place left to hang it. After cleanup nothing writes
+   * to the shipped tree again - a late end or start finds no snapshot and
+   * returns.
+   */
+  private leaveOutUnfinishedSpans(snapshot: SnapshotWithSignal): void {
+    let leftOut = 0;
+    const keepFinished = (
+      nodes: Array<CompleteTraceEventNode | OngoingTraceEventNode>,
+    ): Array<CompleteTraceEventNode | OngoingTraceEventNode> =>
+      nodes.filter((node) => {
+        if ("type" in node && node.type === "start") {
+          leftOut += countNodes(node);
+          return false;
+        }
+        if (node.children && node.children.length > 0) {
+          node.children = keepFinished(node.children);
+          if (node.children.length === 0) {
+            // Same shape a leaf has when the registry completes it.
+            delete (node as Partial<CompleteTraceEventNode>).children;
+          }
+        }
+        return true;
+      });
+
+    snapshot.traces = keepFinished(snapshot.traces);
+    if (leftOut > 0) {
+      // A copy: the object `startTrace` was given is the transport's `tags`
+      // option, shared by every operation it reports.
+      snapshot.tags = { ...snapshot.tags, [UNFINISHED_SPANS_TAG]: leftOut };
+    }
+  }
+
+  /**
+   * One line per trace `pluckSnapshot` ships without its open spans, naming
+   * them. Their late ends are silent: one un-awaited call usually holds a
    * whole chain of spans open, and a line per span said the same thing N times.
    */
-  private reportDroppedTrace(
+  private reportUnfinishedSpans(
     traceId: TraceId,
     snapshot: SnapshotWithSignal,
   ): void {
@@ -830,7 +895,7 @@ export class OperationTraceRegistry {
       ("name" in snapshot && snapshot.name) ||
       traceId;
     this.logger.warn(
-      `Trace "${traceId}" (${operation}) was not reported: ${open.join(", ") || "a span"} had not ended ${SNAPSHOT_COMPLETION_TIMEOUT_MS}ms after the operation did. Some of your async operations were not awaited and outlived the operation that started them. Ignore if this is the desired behavior.`,
+      `Trace "${traceId}" (${operation}) was reported without ${open.join(", ") || "a span"}, which had not ended ${SNAPSHOT_COMPLETION_TIMEOUT_MS}ms after the operation did. Some of your async operations were not awaited and outlived the operation that started them. Ignore if this is the desired behavior.`,
     );
   }
 

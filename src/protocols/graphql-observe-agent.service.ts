@@ -278,9 +278,9 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
    * through `onResolution`, which never fires for a document that failed
    * parsing or validation, so a start hook there can go unmatched. Nothing is
    * leaked when it does: the state lives in the hook's return value rather than
-   * in this service, and the registry drops a trace whose spans never closed.
-   * The one visible consequence is that a malformed document collects nothing
-   * on Mercurius, which is what it collected before any of this existed.
+   * in this service, and the registry ships a trace without the spans that
+   * never closed. A malformed document on Mercurius is therefore reported with
+   * its status code and no spans under it.
    */
   onRequestEnd(ctx: GqlRequestEndContext): void {
     const state = ctx.state as OperationState | undefined;
