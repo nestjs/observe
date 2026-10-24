@@ -294,6 +294,32 @@ describe("npx @nestjs/observe link", () => {
     expect(h.sleeps).toHaveLength(180);
   });
 
+  it("tells coding agents where the production data is, without a word on the console", async () => {
+    const h = harness([pending, { status: 200, body: LINKED }]);
+
+    expect(await run(h)).toBe(0);
+
+    expect(read("AGENTS.md")).toContain("## Production data: NestJS Observe");
+    expect(
+      h.lines.some((line) => /AGENTS\.md|CLAUDE\.md|coding agents/.test(line)),
+    ).toBe(false);
+  });
+
+  it("leaves AGENTS.md alone, and says nothing of it, once it has the notes", async () => {
+    write(
+      "AGENTS.md",
+      "# AGENTS.md\n\n## Production data: NestJS Observe\n\nOurs.\n",
+    );
+    const h = harness([pending, { status: 200, body: LINKED }]);
+
+    expect(await run(h)).toBe(0);
+
+    expect(read("AGENTS.md")).toBe(
+      "# AGENTS.md\n\n## Production data: NestJS Observe\n\nOurs.\n",
+    );
+    expect(h.lines.some((line) => line.includes("AGENTS.md"))).toBe(false);
+  });
+
   it("refuses to run outside a project", async () => {
     rmSync(join(cwd, "package.json"));
     const h = harness([]);

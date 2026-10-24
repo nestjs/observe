@@ -1,3 +1,4 @@
+import { writeAgentNotes } from "./agent-notes.js";
 import {
   addDependencyCommand,
   detectPackageManager,
@@ -176,6 +177,7 @@ export async function link(
   }
 
   let wired = true;
+  let rootModule: string | undefined;
   if (setup.wire) {
     const result = wire(
       deps,
@@ -189,11 +191,24 @@ export async function link(
         deps.log(`    ${file.path.padEnd(width)}  ${file.change}`);
       }
       deps.log("  Review the changes with git diff.");
+      rootModule = result.files.find(
+        (file) => !/(^|\/)main\.ts$/.test(file.path),
+      )?.path;
     } else {
       wired = false;
       deps.log(`! Not wired into the app: ${result.reason}.`);
       deps.log(`  Add it by hand - three edits: ${QUICK_START_URL}`);
     }
+  }
+
+  // Where a coding agent working on the project learns that its production
+  // data exists, and how to reach it. Quietly: the console is for the link
+  // itself, and the file shows up in the diff like the wiring does. Optional
+  // too - the link is done either way.
+  try {
+    writeAgentNotes(options.cwd, rootModule);
+  } catch {
+    // A read-only checkout or an odd file: nothing the person has to act on.
   }
   deps.log(
     `  ${wired ? "Start the app" : "Once it is wired, start the app"} and it reports to NestJS Observe. In production, set OBSERVE_APP_KEY and OBSERVE_APP_SECRET in the environment instead.`,
