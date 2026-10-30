@@ -98,7 +98,7 @@ export class TracerService<
     }
     if (!activeOngoingEvent) {
       throw new Error(
-        `No active span found for traceId: ${traceId}. Ensure that a span is created before calling "activeSpan".`,
+        `No active span found for traceId: ${this.reportedTraceId(store, traceId)}. Ensure that a span is created before calling "activeSpan".`,
       );
     }
 
@@ -153,6 +153,7 @@ export class TracerService<
       callerId,
       error,
       tags ?? {},
+      this.reportedTraceId(store, traceId),
     );
   }
 
@@ -452,6 +453,19 @@ export class TracerService<
       );
     }
     return traceId;
+  }
+
+  /**
+   * The trace id a message names: the one the operation's logs and
+   * `currentTraceId()` carry, rather than the registry key its trace is kept
+   * under, which a reader has no way to look up.
+   */
+  private reportedTraceId(
+    store: Map<string | symbol, unknown>,
+    registryKey: string,
+  ): string {
+    const traceId = store.get(this.options.traceIdKey);
+    return typeof traceId === "string" ? traceId : registryKey;
   }
 
   private registerCounterChangeHandler<TLabel extends string>(

@@ -38,13 +38,17 @@ describe("OperationTraceRegistry", () => {
     registry = new OperationTraceRegistry(als as never, false);
   });
 
-  const startRequest = (traceId: string) =>
-    registry.startTrace(traceId, {
-      operationId: "GET /orders",
-      protocol: "http",
-      attributes: { method: "GET", originalUrl: "/orders" },
-      tags: {},
-    });
+  const startRequest = (traceId: string, reportedTraceId?: string) =>
+    registry.startTrace(
+      traceId,
+      {
+        operationId: "GET /orders",
+        protocol: "http",
+        attributes: { method: "GET", originalUrl: "/orders" },
+        tags: {},
+      },
+      reportedTraceId,
+    );
 
   describe("abandoning a trace", () => {
     it("frees an abandoned trace entirely - spans and snapshot both", async () => {
@@ -569,6 +573,28 @@ describe("OperationTraceRegistry", () => {
       expect(() =>
         registry.captureError("nope", "span", new Error("x"), {}),
       ).not.toThrow();
+    });
+
+    it("names the reported trace id in each warning, not the registry key", () => {
+      const warn = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      // Nothing registered under the key.
+      registry.captureError("key-e6", "span", new Error("x"), {}, "public-e6");
+      // A trace with no span yet.
+      startRequest("key-e7", "public-e7");
+      registry.captureError("key-e7", "span", new Error("x"), {}, "public-e7");
+      // A trace the caller is not a span of.
+      startRequest("key-e8", "public-e8");
+      registry.internalStartTraceStep("key-e8", "Svc", "root", undefined);
+      registry.captureError("key-e8", "other", new Error("x"), {}, "public-e8");
+
+      expect(warn.mock.calls.map(([message]) => message)).toEqual([
+        'No request snapshot found for traceId: "public-e6". Cannot capture error.',
+        'No traces found for traceId: "public-e7". Cannot capture error.',
+        'No active span found for traceId: "public-e8". Cannot capture error.',
+      ]);
     });
 
     it("records a thrown non-Error", async () => {
@@ -1565,6 +1591,27 @@ describe("OperationTraceRegistry", () => {
 
       expect(error).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledTimes(1);
+    }, 10_000);
+
+    it("names the trace id the snapshot reports under, not its registry key", async () => {
+      const warn = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => {});
+
+      // Kept under a key of its own, as every HTTP, RPC and queued execution
+      // is, while its logs carry the id it reports under.
+      startRequest("key-i9", "public-i9");
+      registry.internalStartTraceStep("key-i9", "Svc", "leaked", undefined);
+      registry.endTrace("key-i9");
+      await registry.pluckSnapshot("key-i9");
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Trace "public-i9" (GET /orders) was reported without "Svc#leaked"',
+        ),
+      );
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("key-i9"));
     }, 10_000);
 
     it("ships what finished when a span outlives its trace, without the spans still open", async () => {
