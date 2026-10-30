@@ -55,7 +55,7 @@ shortcut.
 It does not lock the data in, either. Traces carry W3C `traceparent` in and
 out, so a request through services instrumented with OpenTelemetry stays one
 trace, and the agent can export everything it records as OTLP to a collector,
-Jaeger, Tempo or any vendor, beside Observe or instead of it - see
+Jaeger, Tempo or any vendor, beside what it sends to Observe - see
 [Exporting to OpenTelemetry](#exporting-to-opentelemetry).
 
 ## Seeing it before installing
@@ -406,7 +406,7 @@ SLOs need a plan that has them - Scale or Enterprise. On any other plan, declara
 
 ## Exporting to OpenTelemetry
 
-`otlp` exports every trace the agent records as OpenTelemetry spans, over OTLP/HTTP, to a receiver of your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb, Datadog's agent, or any vendor that takes OTLP. It runs beside what is sent to Observe, and needs no Observe credentials to run on its own.
+`otlp` exports every trace the agent records as OpenTelemetry spans, over OTLP/HTTP, to a receiver of your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb, Datadog's agent, or any vendor that takes OTLP. It runs beside what the agent sends to NestJS Observe, never instead of it: with `enabled: false`, or without the `appKey` and `appSecret` the hosted collector needs, nothing is exported either. A proxy at `endpoint` that adds them on the way to NestJS Observe counts as reporting to it.
 
 ```typescript
 ObserveModule.forRoot({

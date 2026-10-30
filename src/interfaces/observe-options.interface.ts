@@ -227,8 +227,8 @@ export interface ObserveOptions {
    * calls as CLIENT spans, on the same trace ids the W3C `traceparent`
    * headers carry - so services instrumented with OpenTelemetry land in the
    * same traces. What is exported is what is recorded: after
-   * `tracesSampleRate`, `skipSpans`, `spanCollapse` and redaction, and
-   * whatever the Observe collector does with its own copy.
+   * `tracesSampleRate`, `skipSpans`, `spanCollapse` and redaction, whatever
+   * the Observe collector then does with its own copy.
    *
    * `true` takes everything from the standard `OTEL_EXPORTER_OTLP_*`,
    * `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` variables, as an
@@ -237,7 +237,9 @@ export interface ObserveOptions {
    * runs an OpenTelemetry SDK has them set for that SDK, and would send
    * every trace twice.
    *
-   * Works without Observe credentials, and is off with `enabled: false`.
+   * Runs beside reporting to NestJS Observe, never instead of it: off with
+   * `enabled: false`, and off without the credentials the hosted collector
+   * needs - a proxy at `endpoint` that adds them on the way still counts.
    * Traces only: metrics and logs are not exported.
    * @default false
    */

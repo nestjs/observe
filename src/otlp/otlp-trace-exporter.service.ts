@@ -11,6 +11,7 @@ import * as https from "https";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "util";
 import { gzip } from "zlib";
+import { sendsToObserve } from "../agent/observe-reporting.util.js";
 import type { JobSnapshot } from "../interfaces/job-snapshot.interface.js";
 import type { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import type { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
@@ -83,15 +84,15 @@ interface ReceiverReply {
 /**
  * Exports what the agent records as OpenTelemetry traces, over OTLP/HTTP, to
  * whatever receiver `otlp` names - a collector, Jaeger, Tempo, Honeycomb, a
- * vendor's agent - alongside what goes to Observe, or instead of it.
+ * vendor's agent - beside what goes to Observe, never instead of it: an agent
+ * that sends Observe nothing (see `sendsToObserve`) exports nothing either.
  *
  * Fed every finished operation at the point all protocols hand theirs to the
  * shared buffer, and before anything the Observe side decides about it: the
  * Observe collector's answers (an account over its allowance, a paused
  * overage) and `maxTracesPerBatch` shape what goes to Observe, not what goes
- * here, and so does whether Observe credentials are set at all. What it is
- * fed has already been through `tracesSampleRate`, `skipSpans` and
- * `spanCollapse`, and through redaction.
+ * here. What it is fed has already been through `tracesSampleRate`,
+ * `skipSpans` and `spanCollapse`, and through redaction.
  *
  * Runs on the application's thread, unlike the Observe worker: an export is
  * a small encode and an asynchronous request, compression runs on libuv's
@@ -139,7 +140,9 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     private readonly operationTraceRegistry: OperationTraceRegistry,
     private readonly asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
   ) {
-    if (options.enabled === false) {
+    // Off with the agent, and off while it reports to Observe nowhere - which
+    // the worker's start-up notice already says, export included.
+    if (!sendsToObserve(options)) {
       return;
     }
     const { settings, warnings } = resolveOtlpSettings(options.otlp, {

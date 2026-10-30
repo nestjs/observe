@@ -35,22 +35,17 @@ import {
   SIGN_UP_URL,
 } from "./credentials-notice.js";
 import { ObserveAgentSharedBuffer } from "./observe-agent.shared-buffer.js";
+import {
+  collectorEndpointOf,
+  hasScaffoldCredentials,
+  isHostedCollector,
+  lacksHostedCredentials,
+  sendsToObserve,
+} from "./observe-reporting.util.js";
 
 const DEFAULT_RUNTIME_METRICS_INTERVAL = 60000; // 60 seconds
 const MIN_RUNTIME_METRICS_INTERVAL = 30000; // 30 seconds
 const DEFAULT_FLUSH_INTERVAL = 5000; // 5 seconds
-
-/**
- * The hosted collector. Unlike a collector in placeholder mode, it accepts
- * nothing without credentials.
- */
-const HOSTED_COLLECTOR_ENDPOINT = "https://observe-api.nestjs.com";
-
-/**
- * Where signals are posted when `endpoint` is not configured.
- */
-const DEFAULT_COLLECTOR_ENDPOINT =
-  process.env.OBSERVE_ENDPOINT ?? HOSTED_COLLECTOR_ENDPOINT;
 const MIN_FLUSH_INTERVAL = 1000; // 1 second
 
 /**
@@ -84,16 +79,6 @@ const FINAL_FLUSH_POLL_MS = 10;
  * a pegged CPU and a saturated loop, and mean nothing.
  */
 const MIN_FINAL_RUNTIME_WINDOW_MS = 10_000;
-
-/**
- * The credentials `nest new --observe` writes into `AppModule`.
- *
- * A project fresh from the generator has these until someone signs up, so
- * they mean "not connected yet", not "wrong": sending them only buys a 401
- * and an `Error:` line on the very first `npm run start`.
- */
-const SCAFFOLD_APP_KEY = "YOUR_APP_KEY";
-const SCAFFOLD_APP_SECRET = "YOUR_APP_SECRET";
 
 const DASHBOARD_URL = `${SIGN_UP_URL}/dashboard`;
 
@@ -160,12 +145,15 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       this.logger.log(
         "Observe is disabled (enabled: false): nothing is recorded or sent.",
       );
-    } else if (this.hasScaffoldCredentials || this.lacksHostedCredentials) {
+    } else if (
+      hasScaffoldCredentials(this.options) ||
+      lacksHostedCredentials(this.options)
+    ) {
       // Nothing is sent, so there is no worker to start. The flush timer below
       // still runs and empties the buffer, which the instrumentation keeps
       // writing into either way.
       const notice = describeMissingCredentials({
-        scaffold: this.hasScaffoldCredentials,
+        scaffold: hasScaffoldCredentials(this.options),
         unset:
           !this.options.appKey && !this.options.appSecret
             ? "both"
@@ -546,48 +534,6 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
-  private get hasScaffoldCredentials(): boolean {
-    return (
-      this.options.appKey === SCAFFOLD_APP_KEY &&
-      this.options.appSecret === SCAFFOLD_APP_SECRET
-    );
-  }
-
-  /**
-   * Whether credentials are missing and the collector is the hosted one,
-   * which answers every batch without them with a 401.
-   *
-   * The worker leaves both headers off when either half is unset, which a
-   * collector in placeholder mode accepts, so a collector of the user's own
-   * still gets those batches. The hosted collector refuses them for as long
-   * as the process runs: on 2026-10-15 that was 42% of the 1.87M batches it
-   * refused, from processes deployed without their environment variables,
-   * some of them posting every five seconds for weeks.
-   */
-  private get lacksHostedCredentials(): boolean {
-    return (
-      (!this.options.appKey || !this.options.appSecret) &&
-      this.isHostedCollector
-    );
-  }
-
-  /**
-   * Whether `endpoint` - set, from `OBSERVE_ENDPOINT`, or the default - is the
-   * hosted collector. Compared by host, so a trailing slash or a capital
-   * letter cannot pass it off as a collector of the user's own.
-   */
-  private get isHostedCollector(): boolean {
-    try {
-      return (
-        new URL(this.endpoint).hostname ===
-        new URL(HOSTED_COLLECTOR_ENDPOINT).hostname
-      );
-    } catch {
-      // Not a URL at all; the worker says so when it tries to send.
-      return false;
-    }
-  }
-
   /**
    * Whether `enabled: false` switched the agent off - whatever the
    * credentials, and whichever collector `endpoint` names.
@@ -598,15 +544,11 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
   /** Whether nothing will be sent, so there is no worker to feed. */
   private get sendsNothing(): boolean {
-    return (
-      this.isDisabled ||
-      this.hasScaffoldCredentials ||
-      this.lacksHostedCredentials
-    );
+    return !sendsToObserve(this.options);
   }
 
   private get endpoint(): string {
-    return this.options.endpoint ?? DEFAULT_COLLECTOR_ENDPOINT;
+    return collectorEndpointOf(this.options);
   }
 
   /**
@@ -726,7 +668,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     }
     this.reportedConnection = true;
     this.logger.log(
-      this.isHostedCollector
+      isHostedCollector(this.endpoint)
         ? `Observe is connected: the collector accepted this app's first batch. Requests and jobs appear at ${DASHBOARD_URL} as soon as the app serves them.`
         : `Observe is connected: ${this.endpoint} accepted this app's first batch.`,
     );
