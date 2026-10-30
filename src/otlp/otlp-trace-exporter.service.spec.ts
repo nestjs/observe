@@ -16,6 +16,8 @@ const options = (
   overrides: Partial<ObserveModuleOptionsWithDefaults> = {},
 ): ObserveModuleOptionsWithDefaults =>
   ({
+    appKey: "test-app-key",
+    appSecret: "test-app-secret",
     serviceId: "orders-api",
     traceIdKey: "traceId",
     flushInterval: 60_000,
@@ -93,6 +95,47 @@ describe("OtlpTraceExporter", () => {
 
     expect(exporter.enabled).toBe(false);
     expect(receiver.requests).toEqual([]);
+  });
+
+  it("exports only beside reporting to Observe, never instead of it", async () => {
+    const hosted = "https://observe-api.nestjs.com";
+    const exporterWith = (
+      overrides: Partial<ObserveModuleOptionsWithDefaults>,
+    ) =>
+      new OtlpTraceExporter(
+        options({
+          otlp: { endpoint: receiver.url, protocol: "http/json" },
+          ...overrides,
+        }),
+        new OperationTraceRegistry(new AsyncLocalStorage()),
+        new AsyncLocalStorage(),
+      );
+
+    // The agent sends Observe nothing, so nothing is exported either.
+    for (const overrides of [
+      { enabled: false },
+      { appKey: undefined, appSecret: undefined, endpoint: hosted },
+      { appSecret: undefined, endpoint: hosted },
+      { appKey: "YOUR_APP_KEY", appSecret: "YOUR_APP_SECRET" },
+    ]) {
+      const exporter = exporterWith(overrides);
+      exporter.onModuleInit();
+      exporter.exportRequestSnapshot(snapshot());
+      await exporter.onApplicationShutdown();
+
+      expect(exporter.enabled).toBe(false);
+    }
+    expect(receiver.requests).toEqual([]);
+    expect(log).not.toHaveBeenCalled();
+
+    // A proxy in front of Observe adds the credentials on its way there.
+    const behindProxy = exporterWith({
+      appKey: undefined,
+      appSecret: undefined,
+      endpoint: "http://observe-proxy.internal:8080",
+    });
+    expect(behindProxy.enabled).toBe(true);
+    await behindProxy.onApplicationShutdown();
   });
 
   it("sends a full batch at once, without waiting for the interval", async () => {

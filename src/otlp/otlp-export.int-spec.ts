@@ -317,7 +317,7 @@ describe("ObserveModule: OTLP export on shutdown", () => {
     }
   });
 
-  it("exports without Observe credentials, when the agent sends Observe nothing", async () => {
+  it("exports nothing while the agent sends Observe nothing, as without credentials", async () => {
     // From this process's environment too, which credentials are read from.
     const saved = {
       key: process.env.OBSERVE_APP_KEY,
@@ -327,7 +327,8 @@ describe("ObserveModule: OTLP export on shutdown", () => {
     delete process.env.OBSERVE_APP_SECRET;
     const receiver = await startFakeOtlpReceiver();
     // The hosted collector takes nothing without a key and a secret, so the
-    // agent starts no worker at all - and contacts it never.
+    // agent starts no worker at all - and export, which runs only beside
+    // reporting to Observe, does not start either.
     const app = await boot([InventoryController], [], {
       appKey: undefined,
       appSecret: undefined,
@@ -335,13 +336,19 @@ describe("ObserveModule: OTLP export on shutdown", () => {
       flushInterval: 1000,
       otlp: { endpoint: receiver.url },
     });
+    let closed = false;
     try {
       const url = await listenOnLoopback(app);
       await request(url).get("/stock/2").expect(200);
-
-      await receiver.waitForSpan((span) => span.name === "GET /stock/:id");
-    } finally {
+      // Closing exports whatever is still queued, so after it nothing was.
       await app.close();
+      closed = true;
+
+      expect(receiver.requests).toEqual([]);
+    } finally {
+      if (!closed) {
+        await app.close();
+      }
       await receiver.close();
       if (saved.key !== undefined) {
         process.env.OBSERVE_APP_KEY = saved.key;

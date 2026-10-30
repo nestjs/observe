@@ -13,7 +13,7 @@ import {
  * deployment is missing - and that production is never told to sign up.
  */
 describe("describeMissingCredentials", () => {
-  it("says that OTLP export still runs, so 'sends nothing' is read as Observe's", () => {
+  it("says that OTLP export is off too, since it only runs beside Observe", () => {
     for (const situation of [
       { scaffold: true, production: false },
       { scaffold: false, unset: "both" as const, production: false },
@@ -27,7 +27,7 @@ describe("describeMissingCredentials", () => {
 
       expect(exporting.level).toBe(plain.level);
       expect(exporting.message.startsWith(plain.message)).toBe(true);
-      expect(exporting.message).toContain("OTLP export is not affected");
+      expect(exporting.message).toContain("OTLP export is off too");
       expect(plain.message).not.toContain("OTLP");
     }
   });

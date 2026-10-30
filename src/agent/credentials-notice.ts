@@ -43,8 +43,9 @@ export function describeMissingCredentials(input: {
   unset?: "both" | "appKey" | "appSecret";
   production: boolean;
   /**
-   * `otlp` is on, so traces still leave the process - only not for Observe.
-   * Said, or "sends nothing" would read as the export being off too.
+   * `otlp` is set, and is off as well: it exports beside what goes to
+   * Observe, never instead of it. Said, or the missing export would read as
+   * a fault of the receiver's.
    */
   exportsOtlp?: boolean;
 }): CredentialsNotice {
@@ -52,7 +53,7 @@ export function describeMissingCredentials(input: {
   return input.exportsOtlp
     ? {
         ...notice,
-        message: `${notice.message} OTLP export is not affected: traces still go to the receiver \`otlp\` names.`,
+        message: `${notice.message} OTLP export is off too: it runs beside reporting to NestJS Observe, not instead of it.`,
       }
     : notice;
 }
