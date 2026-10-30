@@ -87,6 +87,59 @@ function countNodes(node: {
   return count;
 }
 
+/** Whether an object has an own enumerable key, as `Object.keys` counts them. */
+function hasOwnKeys(value: object): boolean {
+  for (const key in value) {
+    if (Object.hasOwn(value, key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A span as it is shipped: a new node holding what the encoder reads, and
+ * none of the registry's bookkeeping - `type`, `startTime`, `parent` - nor a
+ * `tags` or `children` with nothing in them.
+ *
+ * Built afresh instead of deleting those from the live node, which sent every
+ * span into V8's slow dictionary mode. Fields are added in one order, so the
+ * shipped nodes share a handful of shapes and stay fast for what reads them
+ * next: collapsing, encoding. A node that never ended, which only a trace
+ * whose starts and ends were miscounted can still hold here, goes without a
+ * duration, as it always did - and without the `parent` that made such a tree
+ * impossible to serialise.
+ */
+function toShippedNode(
+  node: CompleteTraceEventNode | OngoingTraceEventNode,
+): CompleteTraceEventNode {
+  const shipped = {
+    origin: node.origin,
+    className: node.className,
+    methodKey: node.methodKey,
+    startOffset: node.startOffset,
+  } as CompleteTraceEventNode;
+  if (node.name !== undefined) {
+    shipped.name = node.name;
+  }
+  if (node.children && node.children.length > 0) {
+    shipped.children = node.children.map(toShippedNode);
+  }
+  if (node.spanId !== undefined) {
+    shipped.spanId = node.spanId;
+  }
+  if (node.tags && hasOwnKeys(node.tags)) {
+    shipped.tags = node.tags;
+  }
+  if ("duration" in node) {
+    shipped.duration = node.duration;
+  }
+  if (node.error !== undefined) {
+    shipped.error = node.error;
+  }
+  return shipped;
+}
+
 export class OperationTraceRegistry {
   private readonly traceSnapshots: Map<TraceId, SnapshotWithSignal> = new Map();
   // Keyed by `string | undefined` because a root span has no caller: entries
@@ -238,6 +291,19 @@ export class OperationTraceRegistry {
    */
   hasTrace(traceId: TraceId): boolean {
     return this.traceSnapshots.has(traceId);
+  }
+
+  /**
+   * Whether a span of the trace has started and not yet ended - what tells a
+   * transport whether completing the trace can happen now or should give
+   * that span a moment to close. False for a trace that is not open at all.
+   */
+  hasOpenSpans(traceId: TraceId): boolean {
+    const snapshot = this.traceSnapshots.get(traceId);
+    return (
+      snapshot !== undefined &&
+      snapshot.refsCounter > snapshot.refsMarkedAsComplete
+    );
   }
 
   startTrace(
@@ -489,15 +555,15 @@ export class OperationTraceRegistry {
    * Nests a freshly opened node under its caller when that caller is still
    * live, and at the trace root otherwise.
    *
-   * A caller that has already completed has had its scratch fields stripped
-   * (`type`, and `children` when it had none), so there is nothing left to
-   * nest under. That happens whenever a callee outlives its caller - most
-   * commonly a handler that Nest bound (`AsyncResource.bind` in its
-   * interceptors consumer) to the async context of an interceptor whose
-   * `intercept()` returned synchronously. Fall back to the root rather than
-   * throw into the request: the mirror case, a step ending after its caller
-   * did, is already tolerated in `internalEndTraceStep`. Auto and manual spans
-   * both attach through here, so they share the tolerance.
+   * A caller that has already completed - its `type` is `"end"` - takes no
+   * more children: its span is closed. That happens whenever a callee
+   * outlives its caller - most commonly a handler that Nest bound
+   * (`AsyncResource.bind` in its interceptors consumer) to the async context
+   * of an interceptor whose `intercept()` returned synchronously. Fall back
+   * to the root rather than throw into the request: the mirror case, a step
+   * ending after its caller did, is already tolerated in
+   * `internalEndTraceStep`. Auto and manual spans both attach through here, so
+   * they share the tolerance.
    */
   private attachToCaller(
     snapshot: SnapshotWithSignal,
@@ -559,26 +625,16 @@ export class OperationTraceRegistry {
     }
 
     const duration = performance.now() - cursor.startTime;
-
-    // `type`, `startTime` and `parent` are exactly what separates an ongoing
-    // node from a complete one, so removing them *is* the conversion the cast
-    // below records. They go through a view that admits their absence rather
-    // than each needing its own suppression.
-    const completing = cursor as Partial<OngoingTraceEventNode>;
-    delete completing.type; // The node is now complete
-    delete completing.startTime; // The duration is now set
     const parent = cursor.parent;
-    delete completing.parent; // Complete nodes carry no parent reference
 
-    // Remove tags if empty
-    if (Object.keys(cursor.tags || {}).length === 0) {
-      delete completing.tags;
-    }
-
-    // Clean up children array if it is empty
-    if (cursor.children.length === 0) {
-      delete completing.children;
-    }
+    // The node has ended. It keeps its fields rather than having `type`,
+    // `startTime` and an empty `tags` or `children` deleted: a deleted
+    // property sends a V8 object into slow dictionary mode, and every span
+    // ended there, slowing everything that read the tree afterwards. `type`
+    // tells the live tree the node has ended; `toShippedNode` leaves the rest
+    // out when the trace is plucked. Complete nodes carry no parent reference.
+    cursor.type = "end";
+    cursor.parent = undefined;
 
     const activeTrace: CompleteTraceEventNode =
       cursor as unknown as CompleteTraceEventNode;
@@ -820,6 +876,10 @@ export class OperationTraceRegistry {
         snapshot.traces = [];
         return snapshot;
       }
+
+      // Every span has closed, and nothing writes to the tree any more: it is
+      // rebuilt once, as it will be shipped.
+      snapshot.traces = snapshot.traces.map(toShippedNode);
 
       // Last, on the finished tree: every span has closed by now, so a group
       // is judged on its complete membership and durations, and nothing that

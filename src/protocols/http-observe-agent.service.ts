@@ -284,6 +284,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       },
       this.logger,
       "http",
+      () => this.operationTraceRegistry.hasOpenSpans(traceId),
     );
   }
 

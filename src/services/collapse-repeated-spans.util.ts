@@ -111,13 +111,9 @@ export function collapseRepeatedSpans(
   const collapsed = collapseSiblings(siblings, settings);
   for (const node of collapsed) {
     if (Array.isArray(node.children) && node.children.length > 0) {
-      const children = collapseRepeatedSpans(node.children, settings);
-      if (children.length > 0) {
-        node.children = children;
-      } else {
-        // Same shape a leaf has when the registry completes it.
-        delete (node as Partial<CompleteTraceEventNode>).children;
-      }
+      // Never empty: collapsing replaces repeated siblings, keeping at least
+      // one node for each group, so no child list loses all its members.
+      node.children = collapseRepeatedSpans(node.children, settings);
     }
   }
   return collapsed;
@@ -131,19 +127,27 @@ function collapseSiblings(
     return siblings;
   }
 
-  const groups = new Map<string, CompleteTraceEventNode[]>();
+  // By class, then by method. Both names are strings the instrumentation made
+  // once and V8 has already hashed; a key joining them was a new string to
+  // build and hash for every sibling, which made it the costliest line here.
+  const groupsByClass = new Map<
+    string,
+    Map<string, CompleteTraceEventNode[]>
+  >();
   for (const node of siblings) {
     if (!isCollapsible(node)) {
       continue;
     }
-    // A separator no identifier contains, so `A.b` + `c` and `A` + `b.c`
-    // cannot share a key.
-    const key = `${node.className}\0${node.methodKey}`;
-    const group = groups.get(key);
+    let groupsByMethod = groupsByClass.get(node.className);
+    if (!groupsByMethod) {
+      groupsByMethod = new Map();
+      groupsByClass.set(node.className, groupsByMethod);
+    }
+    const group = groupsByMethod.get(node.methodKey);
     if (group) {
       group.push(node);
     } else {
-      groups.set(key, [node]);
+      groupsByMethod.set(node.methodKey, [node]);
     }
   }
 
@@ -155,28 +159,30 @@ function collapseSiblings(
   >();
   const removed = new Set<CompleteTraceEventNode>();
 
-  for (const group of groups.values()) {
-    if (group.length <= settings.threshold) {
-      continue;
-    }
+  for (const groupsByMethod of groupsByClass.values()) {
+    for (const group of groupsByMethod.values()) {
+      if (group.length <= settings.threshold) {
+        continue;
+      }
 
-    const candidates = group
-      .filter((node) => !node.error)
-      .sort((a, b) => b.duration - a.duration);
-    const surplus = candidates.slice(settings.keepSlowest);
-    // A node standing for a single call would be a relabelled span, not an
-    // aggregate.
-    if (surplus.length < 2) {
-      continue;
-    }
+      const candidates = group
+        .filter((node) => !node.error)
+        .sort((a, b) => b.duration - a.duration);
+      const surplus = candidates.slice(settings.keepSlowest);
+      // A node standing for a single call would be a relabelled span, not an
+      // aggregate.
+      if (surplus.length < 2) {
+        continue;
+      }
 
-    const earliest = surplus.reduce((first, node) =>
-      compareStart(node, first, siblings) < 0 ? node : first,
-    );
-    replacements.set(earliest, toCollapsedNode(surplus, earliest));
-    for (const node of surplus) {
-      if (node !== earliest) {
-        removed.add(node);
+      const earliest = surplus.reduce((first, node) =>
+        compareStart(node, first, siblings) < 0 ? node : first,
+      );
+      replacements.set(earliest, toCollapsedNode(surplus, earliest));
+      for (const node of surplus) {
+        if (node !== earliest) {
+          removed.add(node);
+        }
       }
     }
   }
@@ -232,7 +238,9 @@ function toCollapsedNode(
     }
   }
 
-  const collapsed: CompleteTraceEventNode = {
+  const collapsed: Omit<CompleteTraceEventNode, "children"> & {
+    children?: CompleteTraceEventNode[];
+  } = {
     origin: "auto",
     className: earliest.className,
     methodKey: earliest.methodKey,
@@ -240,7 +248,6 @@ function toCollapsedNode(
     name: `${earliest.className}.${earliest.methodKey} ×${surplus.length}`,
     tags: { [SPAN_COLLAPSED_TAG]: surplus.length },
     duration,
-    children,
   };
   if (startOffset !== undefined) {
     collapsed.startOffset = startOffset;
@@ -251,15 +258,18 @@ function toCollapsedNode(
     // they would for any span that was not shipped.
     collapsed.spanId = earliest.spanId;
   }
-  if (children.length === 0) {
-    delete (collapsed as Partial<CompleteTraceEventNode>).children;
+  // Added when there are any rather than deleted when there are none: a
+  // deleted property sends the node into V8's slow dictionary mode.
+  if (children.length > 0) {
+    collapsed.children = children;
   }
-  return collapsed;
+  return collapsed as CompleteTraceEventNode;
 }
 
 /**
- * Only completed auto spans collapse. `type` is what marks a node as still
- * ongoing; the registry deletes it on completion.
+ * Only completed auto spans collapse. A node still carrying `type` is one that
+ * was not shipped as complete: the registry rebuilds the trees it ships
+ * without it.
  */
 function isCollapsible(
   node: CompleteTraceEventNode | OngoingTraceEventNode,

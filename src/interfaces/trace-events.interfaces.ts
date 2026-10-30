@@ -1,7 +1,13 @@
 import { TraceSpan } from "./trace-span.interface.js";
 
 export interface OngoingTraceEventNode extends TraceSpan {
-  type: "start";
+  /**
+   * `"start"` while the call runs, `"end"` once it has returned. A node that
+   * has ended keeps its other fields where they are - `startTime`, an empty
+   * `children` - until its trace is handed off, when the tree is rebuilt into
+   * `CompleteTraceEventNode`s holding only what is shipped.
+   */
+  type: "start" | "end";
   /**
    * Represents the host class name, which is the class where the method being traced is defined.
    */
@@ -18,9 +24,9 @@ export interface OngoingTraceEventNode extends TraceSpan {
   /**
    * Milliseconds between the start of the trace root and the start of this span.
    *
-   * Captured when the span opens and carried through to the completed node, so
-   * it survives `startTime` being deleted on completion. Undefined when the
-   * parent snapshot has already been cleaned up.
+   * Captured when the span opens and carried through to the completed node,
+   * which has no `startTime`. Undefined when the parent snapshot has already
+   * been cleaned up.
    */
   startOffset?: number;
   /**
@@ -32,7 +38,7 @@ export interface OngoingTraceEventNode extends TraceSpan {
   children: Array<CompleteTraceEventNode | OngoingTraceEventNode>;
   /**
    * Optional parent node for ongoing trace events.
-   * Undefined for root nodes.
+   * Undefined for root nodes, and once the node has ended.
    */
   parent?: OngoingTraceEventNode;
 }

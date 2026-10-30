@@ -81,8 +81,8 @@ export function collectSnapshots(
 /**
  * Waits for a snapshot to arrive, or gives up.
  *
- * Every protocol finishes its trace asynchronously - the HTTP agent on the
- * response hook, gRPC behind a `setTimeout(0)` - so a bare assertion after
+ * Every protocol finishes its trace asynchronously - the HTTP agent after the
+ * response hook, gRPC after the call ends - so a bare assertion after
  * `await request(...)` is a race the test would lose intermittently. Polling to
  * a deadline keeps the suites honest about that without hard-coded sleeps.
  */

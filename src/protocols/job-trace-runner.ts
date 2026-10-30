@@ -322,7 +322,7 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
 
             // `pluckSnapshot` deletes what it returns, so a trace already
             // plucked answers undefined, and the encoder would dereference it
-            // inside a `setTimeout`, where no try/catch can reach: an
+            // in this deferred completion, where no try/catch can reach: an
             // unhandled TypeError that took the whole process down.
             //
             // Dropped rather than reported: there is no snapshot, so there is
@@ -335,6 +335,7 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
           },
           this.logger,
           "job",
+          () => this.operationTraceRegistry.hasOpenSpans(registryKey),
         );
       };
 

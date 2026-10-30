@@ -432,13 +432,14 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     worker.once("exit", onExit);
 
     try {
-      // Every protocol records its snapshot from a `setTimeout(0)` after the
-      // response or job has finished, so the last requests a process served
-      // may not be in the buffer yet - and an empty buffer would end this
-      // before they land. A zero timer set now fires after the ones already
-      // queued, and the microtasks each of those starts run before it does.
-      // A trace whose spans were still open waits a further second in the
-      // registry; the loop below waits for those too.
+      // Every protocol records its snapshot after the response or job has
+      // finished - in a microtask, or from a `setTimeout(0)` when a span was
+      // still open - so the last requests a process served may not be in the
+      // buffer yet, and an empty buffer would end this before they land. A
+      // zero timer set now fires after the microtasks and the timers already
+      // queued, and after the microtasks each of those starts. A trace whose
+      // spans were still open waits a further second in the registry; the
+      // loop below waits for those too.
       await sleep(0);
 
       for (;;) {
