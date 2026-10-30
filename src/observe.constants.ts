@@ -13,6 +13,17 @@ export const CALLER_METADATA_KEY = "#caller";
 export const TRACE_REGISTRY_KEY = "#registryKey";
 
 /**
+ * Where a store keeps the W3C trace context its operation arrived with - see
+ * `readTraceContext`. Absent when none came in; outbound calls then derive
+ * their `traceparent` from the trace id instead.
+ *
+ * Apart from `traceIdKey` because the two can disagree: an `x-request-id`
+ * from a proxy names the Observe trace, while the `traceparent` beside it
+ * names the OpenTelemetry trace the caller is in, and both are passed on.
+ */
+export const TRACE_CONTEXT_KEY = "#traceContext";
+
+/**
  * The job option the enqueuing side stamps the active trace id into. Both
  * BullMQ and Bull persist unknown options verbatim, so it survives the trip
  * through Redis without touching the job's data.

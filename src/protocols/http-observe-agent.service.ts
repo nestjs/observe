@@ -16,11 +16,16 @@ import { Subscription } from "rxjs";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { RequestSnapshot } from "../interfaces/index.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
-import { OBSERVE_OPTIONS, TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import {
+  OBSERVE_OPTIONS,
+  TRACE_CONTEXT_KEY,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { redactUrlQuery } from "../utils/redact-url-query.js";
+import { readTraceContext } from "../utils/trace-context.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
   deferTraceCompletion,
@@ -168,6 +173,16 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         this.logger,
       );
       store.set(this.options.traceIdKey, traceId);
+
+      // Read whatever produced the trace id: a `traceIdGenerator` of the
+      // application's own decides what Observe calls the trace, not which
+      // OpenTelemetry trace the caller is in, and outbound calls carry that
+      // one on either way - for an unrecorded request too, so the trace does
+      // not break here.
+      const traceContext = readTraceContext(req.headers);
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
+      }
 
       setAttributesSafely(
         this.options.http?.setAttributes,

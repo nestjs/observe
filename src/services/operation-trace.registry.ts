@@ -442,6 +442,11 @@ export class OperationTraceRegistry {
     className: string,
     methodKey: string,
     callerId: string | undefined,
+    /**
+     * An id minted ahead of the span - by an outbound call that had to name
+     * its span in a `traceparent` before the span could be opened.
+     */
+    spanId?: string,
   ): string | undefined {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
@@ -449,7 +454,7 @@ export class OperationTraceRegistry {
     }
     snapshot.refsCounter += 1;
 
-    const newNodeId = uuidv7();
+    const newNodeId = spanId ?? uuidv7();
     const startTime = performance.now();
 
     // Records which span owns the thread from here. A no-op unless continuous
