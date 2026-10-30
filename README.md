@@ -7,7 +7,7 @@
 <p align="center">
 <a href="https://www.npmjs.com/package/@nestjs/observe"><img src="https://img.shields.io/npm/v/@nestjs/observe.svg" alt="NPM Version" /></a>
 <a href="https://www.npmjs.com/package/@nestjs/observe"><img src="https://img.shields.io/npm/dm/@nestjs/observe.svg" alt="NPM Downloads" /></a>
-<a href="https://www.npmjs.com/package/@nestjs/observe"><img src="https://img.shields.io/npm/l/@nestjs/observe.svg" alt="Package License" /></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-Observe%20Agent-blue.svg" alt="License: NestJS Observe Agent License" /></a>
 </p>
 
 <p align="center">
@@ -105,8 +105,8 @@ The agent says so once, then backs off - one flush interval, then two, then
 four, up to one attempt an hour - until the credentials are fixed. They are
 read at startup, so that takes a restart. Leave `appKey` or `appSecret` unset,
 with nothing in `OBSERVE_APP_KEY` or `OBSERVE_APP_SECRET` either, and nothing
-is sent to the hosted collector at all, with a warning at startup instead; a collector of your own at `endpoint` still receives batches without
-them.
+is sent to the hosted collector at all, with a warning at startup instead; a proxy at `endpoint` that adds them on the way to NestJS Observe still
+receives batches without them.
 
 To keep an environment from reporting - local development, say - switch the
 agent off rather than supplying fake credentials, which are sent and refused:
@@ -409,7 +409,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `appKey`, `appSecret`    | required                            | The credentials the dashboard issues - see [Getting credentials](#getting-credentials).                                                                                                           |
 | `serviceId`              | required                            | Names the service in the dashboard, in at most 100 characters - a longer one is cut to fit, with a warning at startup.                                                                           |
 | `serviceVersion`         | inferred                            | The release the process runs, at most 50 characters - see [What it records without any code](#what-it-records-without-any-code). `false` reports none.                                          |
-| `endpoint`               | `https://observe-api.nestjs.com`    | The collector's base URL. `OBSERVE_ENDPOINT` in the environment changes the default without touching the config.                                                                                  |
+| `endpoint`               | `https://observe-api.nestjs.com`    | The collector's base URL - NestJS Observe, or a proxy that forwards to it. `OBSERVE_ENDPOINT` in the environment changes the default without touching the config.                                                                                  |
 | `flushInterval`          | `5000`                              | Milliseconds between sends of buffered telemetry; at least `1000`.                                                                                                                                |
 | `shutdownFlushTimeout`   | `2000`                              | Milliseconds closing the app waits for buffered telemetry to reach the collector before stopping the agent. `0` skips the final send - for test suites that boot the app with real credentials.   |
 | `maxTracesPerBatch`      | `1000`                              | The most traces one send carries.                                                                                                                                                                 |
@@ -500,4 +500,4 @@ const { createObserveModule } = require("@nestjs/observe");
 
 ## License
 
-`@nestjs/observe` is [MIT licensed](LICENSE).
+`@nestjs/observe` is source-available under the [NestJS Observe Agent License](LICENSE): free to use and modify to send your applications' telemetry to NestJS Observe. Version 0.3.20 and earlier remain [MIT licensed](NOTICE).

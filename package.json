@@ -42,7 +42,8 @@
   },
   "files": [
     "dist",
-    "!dist/**/*.tsbuildinfo"
+    "!dist/**/*.tsbuildinfo",
+    "NOTICE"
   ],
   "publishConfig": {
     "access": "public"
@@ -70,7 +71,7 @@
     "release": "release-it",
     "prepare": "husky"
   },
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "dependencies": {
     "@jridgewell/trace-mapping": "0.3.31"
   },
