@@ -1,5 +1,14 @@
 import { ServerKafka, Transport } from "@nestjs/microservices";
 import { AsyncLocalStorage } from "async_hooks";
+import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
+import { createInstanceDecorator } from "../instrument/create-instance-decorator.instrument.js";
+import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
+import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
+import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
+import { TraceSamplerService } from "../services/trace-sampler.service.js";
+import { TracerService } from "../services/tracer.service.js";
+import { waitFor } from "../testing/observe-harness.js";
 import { RpcObserveAgentService } from "./rpc-observe-agent.service.js";
 
 /**
@@ -68,6 +77,343 @@ describe("RpcObserveAgentService", () => {
 
     it("answers 'unknown' rather than throwing when a custom context exposes no accessor", () => {
       expect(getOperationId({})).toBe("unknown");
+    });
+  });
+
+  describe.each([
+    ["RPC", Transport.TCP],
+    ["gRPC", Transport.GRPC],
+  ] as const)("%s execution ownership", (_name, transport) => {
+    function createContext() {
+      const als = new AsyncLocalStorage<Map<string, any>>();
+      const registry = new OperationTraceRegistry(als as never, false);
+      let mode: "recorded" | "ignored" | "sampled out" | "disabled" =
+        "recorded";
+      const getUserId = vi.fn(() => "test-user");
+      const executionOptions: ObserveModuleOptionsWithDefaults = {
+        serviceId: "rpc-isolation-test",
+        traceIdKey: "correlationId",
+        traceIdGenerator: () => "shared-trace",
+        attachTraceIdToLogs: false,
+        skipInstrumentation: () => false,
+        sourceContext: false,
+        enabled: true,
+        rpc: { ignore: () => mode === "ignored", getUserId },
+        grpc: { ignore: () => mode === "ignored", getUserId },
+        tracesSampleRate: () => mode !== "sampled out",
+      };
+      const snapshots: RequestSnapshot[] = [];
+      const buffer = {
+        insertRequestSnapshot: (snapshot: RequestSnapshot) =>
+          snapshots.push(snapshot),
+      } as unknown as ObserveAgentSharedBuffer;
+      const agent = new RpcObserveAgentService(
+        als,
+        executionOptions,
+        {} as never,
+        registry,
+        buffer,
+        new TraceSamplerService(executionOptions),
+      );
+      agent.onModuleInit();
+      const tracer = new TracerService(
+        registry,
+        als as never,
+        buffer,
+        executionOptions,
+      );
+      const decorate = createInstanceDecorator(als, registry, {
+        traceIdKey: executionOptions.traceIdKey,
+        skipInstrumentation: () => false,
+      });
+      const handler = decorate({
+        async run(callback: () => Promise<void>) {
+          await callback();
+        },
+      }) as { run(callback: () => Promise<void>): Promise<void> };
+      const run = (name: string, callback: () => Promise<void>) => {
+        const ctx = { getPattern: () => name, operationId: name };
+        const done = async () => {
+          try {
+            await handler.run(callback);
+          } finally {
+            agent.endRpcRequestTracing(transport, ctx as never);
+          }
+        };
+        return transport === Transport.GRPC
+          ? agent.startGrpcRequestTracing(transport, ctx as never, done)
+          : agent.startRpcRequestTracing(transport, ctx as never, done);
+      };
+      return {
+        als,
+        registry,
+        snapshots,
+        tracer,
+        agent,
+        options: executionOptions,
+        getUserId,
+        run,
+        setMode(value: typeof mode) {
+          mode = value;
+          executionOptions.enabled = mode !== "disabled";
+        },
+      };
+    }
+
+    function startHttpTrace(registry: OperationTraceRegistry) {
+      // An ordinary HTTP request is registered under its public trace id.
+      registry.startTrace("shared-trace", {
+        protocol: "http",
+        operationId: "/http",
+      });
+      const spanId = registry.internalStartTraceStep(
+        "shared-trace",
+        "HttpController",
+        "handle",
+        undefined,
+      );
+      registry.internalEndTraceStep(
+        "shared-trace",
+        spanId,
+        "HttpController",
+        "handle",
+        spanId,
+      );
+    }
+
+    it("claims its key before an attribute callback can reach another operation", async () => {
+      const context = createContext();
+      startHttpTrace(context.registry);
+      let callbackKey: unknown;
+      let registeredDuringCallback: boolean | undefined;
+      const protocolOptions =
+        transport === Transport.GRPC
+          ? context.options.grpc!
+          : context.options.rpc!;
+      protocolOptions.setAttributes = () => {
+        callbackKey = context.als.getStore()!.get(TRACE_REGISTRY_KEY);
+        registeredDuringCallback =
+          typeof callbackKey === "string" &&
+          context.registry.hasTrace(callbackKey);
+        context.tracer.setOperationId("must-not-rename-http");
+        return {};
+      };
+
+      await context.run("rpc", async () => undefined);
+      await waitFor(() => context.snapshots.length === 1, 2000, "RPC snapshot");
+      context.registry.endTrace("shared-trace", { statusCode: 200 });
+      const httpSnapshot = await context.registry.pluckSnapshot("shared-trace");
+
+      // Assertions stay outside setAttributes: its safety wrapper catches
+      // thrown errors, which would also swallow a failing assertion.
+      expect(callbackKey).toEqual(expect.any(String));
+      expect(registeredDuringCallback).toBe(false);
+      expect(httpSnapshot).toMatchObject({ operationId: "/http" });
+      expect(context.snapshots[0]).toMatchObject({
+        traceId: "shared-trace",
+        operationId: "rpc",
+      });
+    });
+
+    it.each([
+      ["missing", undefined],
+      ["unregistered", "not-recorded"],
+      ["invalid", 42],
+    ] as const)(
+      "does not complete a context with a %s registry key",
+      async (_kind, key) => {
+        const context = createContext();
+        startHttpTrace(context.registry);
+        const endTrace = vi.spyOn(context.registry, "endTrace");
+        const pluckSnapshot = vi.spyOn(context.registry, "pluckSnapshot");
+        const store = new Map<string, unknown>([
+          [context.options.traceIdKey, "shared-trace"],
+        ]);
+        if (key !== undefined) {
+          store.set(TRACE_REGISTRY_KEY, key);
+        }
+
+        vi.useFakeTimers();
+        try {
+          context.als.run(store, () => {
+            context.agent.endRpcRequestTracing(transport, {} as never);
+          });
+          expect(vi.getTimerCount()).toBe(0);
+          await vi.runAllTimersAsync();
+          expect(context.getUserId).not.toHaveBeenCalled();
+          expect(endTrace).not.toHaveBeenCalled();
+          expect(pluckSnapshot).not.toHaveBeenCalled();
+          expect(context.registry.hasTrace("shared-trace")).toBe(true);
+          expect(context.snapshots).toHaveLength(0);
+        } finally {
+          vi.clearAllTimers();
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it.each(["ignored", "sampled out", "disabled"] as const)(
+      "keeps a %s operation out of a recorded operation sharing its id",
+      async (mode) => {
+        const context = createContext();
+        let release!: () => void;
+        let started = false;
+        const finish = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const recorded = context.run("recorded", async () => {
+          started = true;
+          await finish;
+        });
+        try {
+          await waitFor(() => started, 1000, "recorded handler to start");
+          context.setMode(mode);
+          await context.run("skipped", async () => {
+            const skippedKey = context.als.getStore()!.get(TRACE_REGISTRY_KEY);
+            expect(skippedKey).toEqual(expect.any(String));
+            expect(context.registry.hasTrace(skippedKey)).toBe(false);
+            expect(context.tracer.currentTraceId()).toBe("shared-trace");
+            context.tracer.setOperationId("must-not-rename-recorded");
+            expect((await context.tracer.activeSpan()).id).toBe("");
+            await context.tracer.createSpan("not-recorded", () => undefined);
+          });
+        } finally {
+          release();
+          await recorded;
+        }
+        await waitFor(
+          () => context.snapshots.length > 0,
+          2000,
+          "recorded snapshot",
+        );
+        expect(context.snapshots).toHaveLength(1);
+        expect(context.snapshots[0]).toMatchObject({
+          traceId: "shared-trace",
+          operationId: "recorded",
+          userId: "test-user",
+        });
+        expect(context.getUserId).toHaveBeenCalledTimes(1);
+        expect(JSON.stringify(context.snapshots[0].traces)).not.toContain(
+          "not-recorded",
+        );
+      },
+    );
+
+    it("does not let a completed context rename a later operation with the same id", async () => {
+      const context = createContext();
+      let finishedStore!: Map<string, any>;
+      await context.run("finished", async () => {
+        finishedStore = context.als.getStore()!;
+      });
+      await waitFor(
+        () => context.snapshots.length === 1,
+        2000,
+        "first snapshot",
+      );
+
+      await context.run("current", async () => {
+        // A timer or callback created by the completed operation keeps its
+        // old store. Reusing the public id must not give it the new snapshot.
+        context.als.run(finishedStore, () => {
+          context.tracer.setOperationId("late-rename");
+        });
+        expect(context.tracer.currentTraceId()).toBe("shared-trace");
+      });
+      await waitFor(
+        () => context.snapshots.length === 2,
+        2000,
+        "second snapshot",
+      );
+      expect(context.snapshots.map((snapshot) => snapshot.operationId)).toEqual(
+        ["finished", "current"],
+      );
+      expect(
+        context.registry.hasTrace(finishedStore.get(TRACE_REGISTRY_KEY)),
+      ).toBe(false);
+    });
+
+    it("isolates concurrent failures and releases each execution's registry state", async () => {
+      const context = createContext();
+      let release!: () => void;
+      const finish = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const keys = new Set<string>();
+      const error = new Error("first execution failed");
+      const operations = Array.from({ length: 20 }, (_, index) =>
+        context.run(`operation.${index}`, async () => {
+          keys.add(context.als.getStore()!.get(TRACE_REGISTRY_KEY));
+          (await context.tracer.activeSpan()).setTag("execution", index);
+          await finish;
+          if (index === 0) {
+            throw error;
+          }
+        }),
+      );
+      const settled = Promise.allSettled(operations);
+      try {
+        await waitFor(() => keys.size === 20, 2000, "all executions to start");
+      } finally {
+        release();
+        await settled;
+      }
+      const results = await settled;
+      expect(results[0]).toEqual({ status: "rejected", reason: error });
+      expect(
+        results.slice(1).every((result) => result.status === "fulfilled"),
+      ).toBe(true);
+      await waitFor(
+        () => context.snapshots.length === 20,
+        2000,
+        "all snapshots",
+      );
+      for (const snapshot of context.snapshots) {
+        const index = Number(snapshot.operationId!.split(".")[1]);
+        expect(snapshot.traceId).toBe("shared-trace");
+        expect(snapshot.traces).toHaveLength(1);
+        expect(snapshot.traces[0].tags?.execution).toBe(index);
+        expect(snapshot.error?.message).toBe(
+          index === 0 ? error.message : undefined,
+        );
+      }
+      expect([...keys].every((key) => !context.registry.hasTrace(key))).toBe(
+        true,
+      );
+    });
+
+    it("holds completion while a span of its own is still open", async () => {
+      // Asked under any key but this execution's own, the open-span check
+      // finds no trace, answers that none is open, and the trace completes in
+      // a microtask with its span still running.
+      const context = createContext();
+      const endTrace = vi.spyOn(context.registry, "endTrace");
+      let registryKey!: string;
+      let spanId: string | undefined;
+      await context.run("pending", async () => {
+        registryKey = context.als.getStore()!.get(TRACE_REGISTRY_KEY);
+        spanId = context.registry.internalStartTraceStep(
+          registryKey,
+          "PendingService",
+          "pending",
+          undefined,
+        );
+      });
+      for (let i = 0; i < 5; i += 1) {
+        await Promise.resolve();
+      }
+      expect(endTrace).not.toHaveBeenCalled();
+
+      context.registry.internalEndTraceStep(
+        registryKey,
+        spanId,
+        "PendingService",
+        "pending",
+        spanId,
+      );
+      await waitFor(() => context.snapshots.length === 1, 2000, "snapshot");
+      expect(JSON.stringify(context.snapshots[0].traces)).toContain(
+        "PendingService",
+      );
     });
   });
 

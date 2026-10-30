@@ -97,14 +97,12 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         if (!store) {
           return;
         }
-        const traceId =
-          store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
-          store.get(this.options.traceIdKey);
-        if (!traceId) {
+        const registryKey = store.get(TRACE_REGISTRY_KEY);
+        if (typeof registryKey !== "string") {
           return;
         }
         this.operationTraceRegistry.addRouteMetadataToTrace(
-          traceId,
+          registryKey,
           requestMethod,
           path,
         );
@@ -169,6 +167,14 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       );
       store.set(this.options.traceIdKey, traceId);
 
+      // An adopted `x-request-id` is not unique to this request: a caller that
+      // fans out, or retries, sends the same id twice. Claim this execution
+      // before option callbacks can reach another request's trace. A request
+      // that is not recorded keeps the key too, never registered, so its
+      // lookups stay off a recorded request sharing its id.
+      const registryKey = uuidv7();
+      store.set(TRACE_REGISTRY_KEY, registryKey);
+
       setAttributesSafely(
         this.options.http?.setAttributes,
         [req],
@@ -178,16 +184,8 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         "http",
       );
 
-      // A request that is not recorded still carries its trace id, which an
-      // adopted `x-request-id` can share with a recorded request. A registry
-      // key of its own, never registered, keeps its lookups off that trace.
-      const skip = () => {
-        store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, uuidv7());
-        done();
-      };
-
       if (this.shouldIgnoreRequest(req) || this.isUntracedPreflight(req)) {
-        return skip();
+        return done();
       }
 
       const shouldCapture = this.traceSamplerService.shouldCapture("http", {
@@ -195,7 +193,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         method: req.method,
       });
       if (!shouldCapture) {
-        return skip();
+        return done();
       }
       // Sensitive query parameters are masked whether or not the deployment
       // configured anything: an opt-in redactor protects only those who
@@ -210,16 +208,6 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const originalUrl = this.queryParamsObfuscateRegex
         ? redactedUrl.replaceAll(this.queryParamsObfuscateRegex, "[REDACTED]")
         : redactedUrl;
-
-      // An adopted `x-request-id` is not unique to this request: a caller
-      // that fans out, or retries, sends the same id twice, and both requests
-      // can be open here at once. The second gets a registry key of its own -
-      // only the second, so the ordinary request is still keyed by its id.
-      let registryKey = traceId;
-      if (this.operationTraceRegistry.hasTrace(traceId)) {
-        registryKey = uuidv7();
-        store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, registryKey);
-      }
 
       this.operationTraceRegistry.startTrace(
         registryKey,
@@ -243,10 +231,13 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     if (!store) {
       return;
     }
-    const traceId =
-      store.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
-      store.get(this.options.traceIdKey);
-    if (!traceId) {
+    // Only this execution's own key: a stale store left by a finished request
+    // must not complete a later one that reuses its id.
+    const registryKey = store.get(TRACE_REGISTRY_KEY);
+    if (
+      typeof registryKey !== "string" ||
+      !this.operationTraceRegistry.hasTrace(registryKey)
+    ) {
       return;
     }
     deferTraceCompletion(
@@ -258,13 +249,13 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           this.logger,
           "http",
         );
-        this.operationTraceRegistry.endTrace(traceId, {
+        this.operationTraceRegistry.endTrace(registryKey, {
           statusCode: res.statusCode,
           userId,
         });
 
         const snapshot =
-          await this.operationTraceRegistry.pluckSnapshot(traceId);
+          await this.operationTraceRegistry.pluckSnapshot(registryKey);
         if (!snapshot) {
           return;
         }
@@ -284,7 +275,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       },
       this.logger,
       "http",
-      () => this.operationTraceRegistry.hasOpenSpans(traceId),
+      () => this.operationTraceRegistry.hasOpenSpans(registryKey),
     );
   }
 

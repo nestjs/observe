@@ -368,9 +368,9 @@ describe.each<Platform>(["express", "node"])(
     });
 
     it("reports both of two concurrent operations that arrive under one x-request-id", async () => {
-      // A caller that fans out sends its trace id twice. The HTTP agent keys the
-      // second request apart, and the operation has to find its trace under
-      // that key rather than under the id the two share.
+      // A caller that fans out sends its trace id twice. The HTTP agent keys each
+      // request apart, and the operation has to find its trace under that key
+      // rather than under the id the two share.
       await Promise.all([
         gql("{ slowOrder { id } }").set("x-request-id", "shared-trace-1"),
         gql("{ slowOrder { id } }").set("x-request-id", "shared-trace-1"),

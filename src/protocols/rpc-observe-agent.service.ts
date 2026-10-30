@@ -15,7 +15,8 @@ import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
-import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { OBSERVE_OPTIONS, TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
   describePeerLoadError,
   loadOptionalPeer,
@@ -182,6 +183,11 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       );
       store.set(this.options.traceIdKey, traceId);
 
+      // Fan-out calls and retries can share a correlation id. Claim this
+      // execution before option callbacks can reach another operation's trace.
+      const registryKey = uuidv7();
+      store.set(TRACE_REGISTRY_KEY, registryKey);
+
       setAttributesSafely(
         this.options.rpc?.setAttributes,
         [transportId, ctx],
@@ -210,11 +216,15 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       if (!shouldCapture) {
         return done();
       }
-      this.operationTraceRegistry.startTrace(traceId, {
-        protocol: this.toProtocolName(transportId),
-        operationId: this.getOperationIdFromContext(ctx),
-        tags: this.options.rpc?.tags,
-      });
+      this.operationTraceRegistry.startTrace(
+        registryKey,
+        {
+          protocol: this.toProtocolName(transportId),
+          operationId: this.getOperationIdFromContext(ctx),
+          tags: this.options.rpc?.tags,
+        },
+        traceId,
+      );
       return done();
     });
   }
@@ -234,6 +244,10 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         this.logger,
       );
       store.set(this.options.traceIdKey, traceId);
+
+      // The key must precede callbacks here too, before the deferred startup.
+      const registryKey = uuidv7();
+      store.set(TRACE_REGISTRY_KEY, registryKey);
 
       setAttributesSafely(
         this.options.grpc?.setAttributes,
@@ -266,11 +280,15 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
           if (!shouldCapture) {
             return resolve(done());
           }
-          this.operationTraceRegistry.startTrace(traceId, {
-            protocol: this.toProtocolName(transportId),
-            operationId: call.operationId,
-            tags: this.options.grpc?.tags,
-          });
+          this.operationTraceRegistry.startTrace(
+            registryKey,
+            {
+              protocol: this.toProtocolName(transportId),
+              operationId: call.operationId,
+              tags: this.options.grpc?.tags,
+            },
+            traceId,
+          );
           resolve(done());
         }, 0);
       });
@@ -285,8 +303,11 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     if (!store) {
       return;
     }
-    const traceId = store.get(this.options.traceIdKey);
-    if (!traceId) {
+    const registryKey = store.get(TRACE_REGISTRY_KEY);
+    if (
+      typeof registryKey !== "string" ||
+      !this.operationTraceRegistry.hasTrace(registryKey)
+    ) {
       return;
     }
     const isGrpc = transportId === this.microservices!.Transport.GRPC;
@@ -310,12 +331,12 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
             "rpc",
           );
         }
-        this.operationTraceRegistry.endTrace(traceId, {
+        this.operationTraceRegistry.endTrace(registryKey, {
           userId,
         });
 
         const snapshot =
-          await this.operationTraceRegistry.pluckSnapshot(traceId);
+          await this.operationTraceRegistry.pluckSnapshot(registryKey);
         if (!snapshot) {
           return;
         }
@@ -325,7 +346,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       },
       this.logger,
       isGrpc ? "grpc" : "rpc",
-      () => this.operationTraceRegistry.hasOpenSpans(traceId),
+      () => this.operationTraceRegistry.hasOpenSpans(registryKey),
     );
   }
 

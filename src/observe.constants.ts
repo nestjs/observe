@@ -4,11 +4,11 @@ export const CALLER_METADATA_KEY = "#caller";
 /**
  * Where a store keeps the registry key when it differs from the trace id.
  *
- * A queued job reports under the trace id of the operation that enqueued it,
- * and that operation may still be open in this very process - an API that
- * also runs its own workers. The registry is keyed per execution, so the job
- * gets a key of its own here while `traceIdKey` keeps the id everything
- * user-facing reads: logs, `currentTraceId()`, the snapshot.
+ * Queued jobs and RPC calls can share the trace id of the operation that
+ * dispatched them, including one still open in this process. The registry is
+ * keyed per execution, so each gets a key of its own here while `traceIdKey`
+ * keeps the id everything user-facing reads: logs, `currentTraceId()`, the
+ * snapshot.
  */
 export const TRACE_REGISTRY_KEY = "#registryKey";
 
