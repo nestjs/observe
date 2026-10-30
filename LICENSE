@@ -1,6 +1,6 @@
 NestJS Observe Agent License
 
-Copyright (c) 2026-present Kamil Myśliwiec <https://kamilmysliwiec.com>
+Copyright (c) 2026-present NestJS Kamil Mysliwiec <https://nestjs.com>
 
 This license applies to this repository as published after the release of
 @nestjs/observe 0.3.20, and to every version of @nestjs/observe released
@@ -9,7 +9,7 @@ and remain available under it (see NOTICE).
 
 DEFINITIONS
 
-"Licensor" means Kamil Myśliwiec.
+"Licensor" or "NestJS" means NestJS Kamil Mysliwiec (https://nestjs.com).
 
 "Software" means the source code, object code and documentation this license
 applies to, and any modified version, part or derivative work of them.
