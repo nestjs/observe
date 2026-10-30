@@ -380,6 +380,41 @@ describe("RpcObserveAgentService", () => {
         true,
       );
     });
+
+    it("holds completion while a span of its own is still open", async () => {
+      // Asked under any key but this execution's own, the open-span check
+      // finds no trace, answers that none is open, and the trace completes in
+      // a microtask with its span still running.
+      const context = createContext();
+      const endTrace = vi.spyOn(context.registry, "endTrace");
+      let registryKey!: string;
+      let spanId: string | undefined;
+      await context.run("pending", async () => {
+        registryKey = context.als.getStore()!.get(TRACE_REGISTRY_KEY);
+        spanId = context.registry.internalStartTraceStep(
+          registryKey,
+          "PendingService",
+          "pending",
+          undefined,
+        );
+      });
+      for (let i = 0; i < 5; i += 1) {
+        await Promise.resolve();
+      }
+      expect(endTrace).not.toHaveBeenCalled();
+
+      context.registry.internalEndTraceStep(
+        registryKey,
+        spanId,
+        "PendingService",
+        "pending",
+        spanId,
+      );
+      await waitFor(() => context.snapshots.length === 1, 2000, "snapshot");
+      expect(JSON.stringify(context.snapshots[0].traces)).toContain(
+        "PendingService",
+      );
+    });
   });
 
   /**

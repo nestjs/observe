@@ -346,7 +346,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       },
       this.logger,
       isGrpc ? "grpc" : "rpc",
-      () => this.operationTraceRegistry.hasOpenSpans(traceId),
+      () => this.operationTraceRegistry.hasOpenSpans(registryKey),
     );
   }
 
