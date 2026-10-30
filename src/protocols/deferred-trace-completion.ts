@@ -154,13 +154,25 @@ export function getUserIdSafely<TArgs extends unknown[]>(
   );
 }
 
-/** Run deferred completion without ever leaking a rejection from its timer. */
+/**
+ * Completes a trace once its operation has ended, without ever leaking a
+ * rejection from the completion.
+ *
+ * Right away - in a microtask, once the rest of the listeners of the event
+ * that ended the operation have run - when `hasOpenSpans` says every span of
+ * the trace has closed, which is the usual case: spans close as the handler's
+ * calls return. Otherwise on a timer, so that a span still closing has that
+ * moment to end before the trace is plucked. A timer for every operation cost
+ * a lightly loaded process a wake-up of its event loop per request, about
+ * 35 µs of CPU each on a laptop, and a busy one nothing it would notice.
+ */
 export function deferTraceCompletion(
   completion: () => Promise<void>,
   logger: Logger,
   transport: string,
+  hasOpenSpans?: () => boolean,
 ): void {
-  setTimeout(() => {
+  const complete = () => {
     void Promise.resolve()
       .then(completion)
       .catch((error: unknown) => {
@@ -172,5 +184,16 @@ export function deferTraceCompletion(
           );
         }
       });
-  }, 0);
+  };
+  if (!hasOpenSpans) {
+    setTimeout(complete, 0);
+    return;
+  }
+  queueMicrotask(() => {
+    if (hasOpenSpans()) {
+      setTimeout(complete, 0);
+    } else {
+      complete();
+    }
+  });
 }

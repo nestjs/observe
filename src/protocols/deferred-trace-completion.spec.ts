@@ -130,6 +130,56 @@ describe("what each callback falls back to", () => {
 });
 
 describe("deferTraceCompletion", () => {
+  const quiet = { warn: vi.fn() } as unknown as Logger;
+  /** Lets queued microtasks - and the ones they queue - run. */
+  const settleMicrotasks = async () => {
+    for (let i = 0; i < 5; i += 1) {
+      await Promise.resolve();
+    }
+  };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("completes without a timer once every span has closed", async () => {
+    vi.useFakeTimers();
+    const completion = vi.fn(() => Promise.resolve());
+
+    deferTraceCompletion(completion, quiet, "http", () => false);
+    await settleMicrotasks();
+
+    expect(completion).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives a span still open the moment of a timer to close", async () => {
+    vi.useFakeTimers();
+    const completion = vi.fn(() => Promise.resolve());
+
+    deferTraceCompletion(completion, quiet, "http", () => true);
+    await settleMicrotasks();
+    expect(completion).not.toHaveBeenCalled();
+
+    await vi.runAllTimersAsync();
+    expect(completion).toHaveBeenCalledOnce();
+  });
+
+  it("asks about open spans after the rest of the event's listeners ran", async () => {
+    vi.useFakeTimers();
+    const completion = vi.fn(() => Promise.resolve());
+    let open = false;
+
+    deferTraceCompletion(completion, quiet, "http", () => open);
+    // A later listener of the same event starts a span synchronously.
+    open = true;
+    await settleMicrotasks();
+    expect(completion).not.toHaveBeenCalled();
+
+    await vi.runAllTimersAsync();
+    expect(completion).toHaveBeenCalledOnce();
+  });
+
   it("consumes rejected deferred completion and warns once", async () => {
     const warn = vi.fn();
     const logger = { warn } as unknown as Logger;

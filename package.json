@@ -62,6 +62,7 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:int": "vitest run --config vitest.int.config.ts",
+    "bench": "npm run build && tsc -p bench/tsconfig.json && node bench/.build/run.js",
     "prepack": "npm run build",
     "prepublish:next": "npm run build",
     "publish:next": "npm publish --access public --tag next",

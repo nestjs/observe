@@ -228,6 +228,7 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
           },
           this.logger,
           "ws",
+          () => this.operationTraceRegistry.hasOpenSpans(traceId),
         );
       };
 

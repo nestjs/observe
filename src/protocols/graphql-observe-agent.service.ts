@@ -493,6 +493,7 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       },
       this.logger,
       "graphql",
+      () => this.operationTraceRegistry.hasOpenSpans(traceId),
     );
   }
 

@@ -38,8 +38,10 @@ Install it, set two environment variables, and the application starts reporting:
   [custom metrics](https://www.observe.nestjs.com/documentation/sdk#custom-metrics)
   your code reports through `TracerService`.
 
-Telemetry is serialised on a detached worker thread and shipped from there, so
-the request path is untouched by the reporting.
+Telemetry is compressed and sent from a detached worker thread, so a slow or
+unreachable collector never holds a request up. Recording it does cost the
+request path a microsecond or two per traced call - [Overhead](#overhead) has
+the numbers.
 
 ### Why not just OpenTelemetry?
 
@@ -193,6 +195,92 @@ export class ObserveConfig implements ObserveOptionsFactory {
   }
 }
 ```
+
+## Overhead
+
+What the agent costs an application is mostly the spans it records: every
+provider method a request calls passes through the instrumentation, on the
+thread serving the request. Measured in October 2026 with
+[the benchmark in `bench/`](https://github.com/nestjs/observe/blob/master/bench/README.md),
+the agent at its defaults against the same Nest 12 application without it, on
+Express, Node 24 and an Apple M1 Pro:
+
+| Per request                            | 1 traced call | 9 traced calls | 102 traced calls |
+| -------------------------------------- | ------------- | -------------- | ---------------- |
+| CPU added, process fully busy          | +9 µs         | +29 µs         | +115 µs          |
+| Median latency added at 150 requests/s | +0.10 ms      | +0.09 ms       | +0.45 ms         |
+
+The nine calls are a guard, an interceptor, a pipe, a controller, a service and
+two repositories awaiting their results; the 102 are a service calling another
+provider in a loop, [collapsed](#repeated-spans) to six spans before shipping.
+
+| Per process                | Added                                                |
+| -------------------------- | ---------------------------------------------------- |
+| Memory at boot             | +11 MB RSS                                           |
+| Memory at 150 requests/s   | +32 MB to +64 MB RSS                                 |
+| CPU while idle             | 0.3-0.6% of one core, almost all off the main thread |
+| Process start to listening | +30 to +40 ms, within run-to-run noise               |
+
+As a rule of thumb, **about 8 µs per request plus 1-2.5 µs per traced call**,
+async methods at the dearer end. A traced provider reads its own fields -
+`this.repository`, `this.config.rate` - through a proxy, at about 30 ns a read,
+which a loop over thousands of items pays on every iteration.
+
+Spans are recorded on the thread that serves the request. Every
+`flushInterval` (5 s) that thread serialises the batch, and a worker thread
+compresses and sends it. A batch holds at most `maxTracesPerBatch` traces
+(1,000), which also caps what shipping costs: requests past it within a flush
+interval are recorded but not sent. A lightly loaded process pays more CPU per
+request than a busy one, with the agent or without, and the agent's share
+grows with it: at 150 requests a second it added 3.5 to 4 points of one core on
+the 1- and 9-call endpoints, and 10 on the 102-call one.
+
+These endpoints do almost no work of their own, so in relative terms the
+figures are a ceiling: an endpoint that spends a millisecond on a query pays
+the same microseconds. They were taken on a development machine with other
+work running, as medians of two runs, and moved by a third between runs - by
+half for a lightly loaded process. The run behind them is in
+[`bench/2026-10-30-results.md`](https://github.com/nestjs/observe/blob/master/bench/2026-10-30-results.md),
+and `npm run bench` in a clone of this repository reproduces it on your own
+hardware in about 8 minutes.
+
+### Compared with other agents
+
+We found no overhead figures published by the vendors below, so the table
+takes third-party benchmarks, each measuring an agent on a near-empty endpoint
+on its own hardware. It says which way things lean rather than ranking them:
+
+| Agent                                       | Benchmark                                      | Throughput lost | Time added per request |
+| ------------------------------------------- | ---------------------------------------------- | --------------- | ---------------------- |
+| New Relic                                   | [NodeSource][nodesource], Express, Node 22     | 72%             | 200 µs                 |
+| Datadog                                     | [NodeSource][nodesource], Express, Node 22     | 63%             | 130 µs                 |
+| Sentry                                      | [NodeSource][nodesource], Express, Node 22     | 37%             | 45 µs                  |
+| OpenTelemetry, all auto-instrumentations    | [Platformatic][platformatic], Fastify, Node 24 | 81%             | 77 µs                  |
+| OpenTelemetry, Fastify instrumentation only | [Platformatic][platformatic], Fastify, Node 24 | 64%             | 31 µs                  |
+| `@nestjs/observe`, 1 traced call            | this benchmark, Nest on Express, Node 24       | 22%             | 7 µs                   |
+| `@nestjs/observe`, 9 traced calls           | this benchmark, Nest on Express, Node 24       | 33%             | 20 µs                  |
+| `@nestjs/observe`, 102 traced calls         | this benchmark, Nest on Express, Node 24       | 69%             | 110 µs                 |
+
+Time added per request is what a fully busy process spends on each request with
+the agent, minus without it - one second divided by the requests per second,
+from each benchmark's own figures. It is the time of the thread that serves
+requests, so it reads a little under the CPU added above, which counts every
+thread of the process. Neither column ranks the agents. The machines differ:
+NodeSource's run (July 2025) is on a 4-core 3.6 GHz Linux server where plain
+Express answers 13,000 requests a second, so the same work takes longer there
+than on this laptop, where the Nest application answers 20,000 to 38,000. And a
+percentage depends on how fast the baseline is: the same microseconds are a
+bigger share of a faster one.
+
+What neither column shows is how much gets recorded. The agents above trace a
+request, its middleware and its calls out of the process, and OpenTelemetry's
+full set more kinds of call than its Fastify instrumentation alone - DNS
+lookups and sockets among them. This one also traces every provider method the
+request goes through: the class-level waterfall, and the reason an endpoint
+making a hundred provider calls costs it more than it would them.
+
+[nodesource]: https://benchmark.nodesource.com/
+[platformatic]: https://blog.platformatic.dev/the-hidden-cost-of-context
 
 ## Repeated spans
 
