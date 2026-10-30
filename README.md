@@ -201,9 +201,9 @@ export class ObserveConfig implements ObserveOptionsFactory {
 What the agent costs an application is mostly the spans it records: every
 provider method a request calls passes through the instrumentation, on the
 thread serving the request. Measured in October 2026 with
-[the benchmark in `bench/`](bench/README.md), the agent at its defaults against
-the same Nest 12 application without it, on Express, Node 24 and an Apple M1
-Pro:
+[the benchmark in `bench/`](https://github.com/nestjs/observe/blob/master/bench/README.md),
+the agent at its defaults against the same Nest 12 application without it, on
+Express, Node 24 and an Apple M1 Pro:
 
 | Per request                            | 1 traced call | 9 traced calls | 102 traced calls |
 | -------------------------------------- | ------------- | -------------- | ---------------- |
@@ -240,8 +240,9 @@ figures are a ceiling: an endpoint that spends a millisecond on a query pays
 the same microseconds. They were taken on a development machine with other
 work running, as medians of two runs, and moved by a third between runs - by
 half for a lightly loaded process. The run behind them is in
-[`bench/2026-10-30-results.md`](bench/2026-10-30-results.md), and
-`npm run bench` reproduces it on your own hardware in about 8 minutes.
+[`bench/2026-10-30-results.md`](https://github.com/nestjs/observe/blob/master/bench/2026-10-30-results.md),
+and `npm run bench` in a clone of this repository reproduces it on your own
+hardware in about 8 minutes.
 
 ### Compared with other agents
 
