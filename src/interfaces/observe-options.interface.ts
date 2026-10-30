@@ -73,9 +73,14 @@ export interface CreateObserveModuleOptions {
    * For HTTP protocols, the request object is passed to the function.
    * For non-HTTP protocols, the request object will be contextual and may not be available.
    * The default implementation uses the 'x-request-id' header if available,
-   * or mints a time-ordered UUID (version 7) if the header is not present -
-   * an id the collector can locate in time without a scan.
-   * @default (req) => req.headers['x-request-id'] || uuidv7()
+   * else the trace id of a W3C `traceparent` header, written as a UUID, or
+   * mints a time-ordered UUID (version 7) if neither is present - an id the
+   * collector can locate in time without a scan.
+   *
+   * Whatever this returns, a valid `traceparent` is still read alongside it:
+   * outbound calls carry that W3C trace on, so the request stays in the
+   * OpenTelemetry trace its caller is in.
+   * @default (req) => req.headers['x-request-id'] || traceparentTraceId(req) || uuidv7()
    */
   traceIdGenerator?: (req: unknown) => string;
 

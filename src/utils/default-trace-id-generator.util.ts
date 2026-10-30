@@ -1,3 +1,4 @@
+import { traceIdFromTraceparent } from "./trace-context.util.js";
 import { uuidv7 } from "./uuid-v7.util.js";
 
 /**
@@ -15,11 +16,19 @@ export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export function defaultTraceIdGenerator(req: unknown) {
   if (typeof req === "object" && req !== null && "headers" in req) {
-    const requestId = (req as { headers: Record<string, unknown> }).headers[
-      "x-request-id"
-    ];
+    const headers = (req as { headers: Record<string, unknown> }).headers;
+    const requestId = headers?.["x-request-id"];
     if (typeof requestId === "string" && REQUEST_ID_PATTERN.test(requestId)) {
       return requestId;
+    }
+    // A caller already in an OpenTelemetry trace - a service in another
+    // language, a mesh, a load balancer that starts traces - so the request
+    // joins it. After `x-request-id`, because another service running this
+    // agent sends both, and its id may be one `traceparent` cannot carry:
+    // anything that is not 128 bits of hex.
+    const fromTraceparent = traceIdFromTraceparent(headers);
+    if (fromTraceparent) {
+      return fromTraceparent;
     }
   }
   // A microservice context, on a transport whose packets carry metadata: the

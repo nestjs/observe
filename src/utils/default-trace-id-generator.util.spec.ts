@@ -36,6 +36,45 @@ describe("defaultTraceIdGenerator", () => {
     expect(ids.size).toBe(500);
   });
 
+  it("joins the W3C trace a caller is in when it sends no x-request-id", () => {
+    // What a service instrumented with OpenTelemetry sends: the trace id
+    // comes back as a UUID, the shape of every id the agent mints.
+    expect(
+      defaultTraceIdGenerator({
+        headers: {
+          traceparent:
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        },
+      }),
+    ).toBe("4bf92f35-77b3-4da6-a3ce-929d0e0e4736");
+  });
+
+  it("prefers x-request-id to traceparent, which cannot carry every id", () => {
+    // Another service running the agent sends both, and its trace id may be
+    // a custom one only x-request-id holds - which is also what a proxy in
+    // front of the service may already be setting.
+    expect(
+      defaultTraceIdGenerator({
+        headers: {
+          "x-request-id": "req_8f2c",
+          traceparent:
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        },
+      }),
+    ).toBe("req_8f2c");
+  });
+
+  it("mints its own over a traceparent the spec would refuse", () => {
+    const traceId = defaultTraceIdGenerator({
+      headers: {
+        traceparent: "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+      },
+    });
+
+    expect(traceId).toMatch(UUID);
+    expect(traceId).not.toBe("00000000-0000-0000-0000-000000000000");
+  });
+
   it("adopts the id a microservice client attached to the packet", () => {
     const ctx = { getMetadata: () => ({ "x-request-id": "rpc-trace-1" }) };
 

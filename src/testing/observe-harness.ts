@@ -1,4 +1,6 @@
 import { INestApplication, INestMicroservice } from "@nestjs/common";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { JobSnapshot } from "../interfaces/job-snapshot.interface.js";
 import { ObserveOptions } from "../interfaces/observe-options.interface.js";
@@ -243,4 +245,32 @@ export async function freePort(): Promise<number> {
       server.close(() => resolve(port));
     });
   });
+}
+
+/**
+ * Listens on 127.0.0.1, on a port the OS picks for that address, and returns
+ * the base URL - for a suite whose clients connect to 127.0.0.1.
+ *
+ * Not a port from `freePort` and a bind to every interface: on macOS such a
+ * bind can be given a port that another process already holds on 127.0.0.1
+ * alone - a stray `redis-server` from someone's test run, say - and a client
+ * dialling 127.0.0.1 then reaches that process and gets `socket hang up`.
+ * supertest's own `listen(0)` on an unlistened app has the same exposure.
+ */
+export async function listenOnLoopback(
+  target: INestApplication | Server,
+): Promise<string> {
+  let server: Server;
+  if ("getHttpServer" in target) {
+    await target.listen(0, "127.0.0.1");
+    server = target.getHttpServer() as Server;
+  } else {
+    server = target;
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+  }
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}`;
 }

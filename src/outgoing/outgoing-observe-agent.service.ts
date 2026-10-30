@@ -6,12 +6,13 @@ import {
 } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
-import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { OBSERVE_OPTIONS, TRACE_CONTEXT_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   loadAsResolvedBy,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
+import type { TraceContext } from "../utils/trace-context.util.js";
 import { subscribeOutgoingHttp } from "./http.integration.js";
 import {
   activateLlmFetchObserver,
@@ -139,10 +140,15 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
       this.unsubscribeHttp = subscribeOutgoingHttp(
         recorder,
         () => {
-          const traceId: unknown = asyncLocalStorage
-            .getStore()
-            ?.get(this.options.traceIdKey);
-          return typeof traceId === "string" ? traceId : undefined;
+          const store = asyncLocalStorage.getStore();
+          const traceId: unknown = store?.get(this.options.traceIdKey);
+          if (typeof traceId !== "string") {
+            return undefined;
+          }
+          const traceContext = store?.get(TRACE_CONTEXT_KEY) as
+            | TraceContext
+            | undefined;
+          return { traceId, traceContext };
         },
         typeof outgoing?.http === "object" ? outgoing.http : {},
         () => operationTraceRegistry.getRedactor(),
