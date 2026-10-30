@@ -763,18 +763,24 @@ export class OperationTraceRegistry {
     callerId: string | undefined,
     error: Error | string,
     tags: Record<string, string | number | boolean>,
+    /**
+     * The trace id the warnings below name, when it is not the registry key:
+     * the one the operation's logs carry. The key itself appears nowhere a
+     * reader could look it up.
+     */
+    reportedTraceId: string = traceId,
   ): void {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
       this.logger.warn(
-        `No request snapshot found for traceId: "${traceId}". Cannot capture error.`,
+        `No request snapshot found for traceId: "${reportedTraceId}". Cannot capture error.`,
       );
       return;
     }
 
     if (!snapshot.traces || snapshot.traces.length === 0) {
       this.logger.warn(
-        `No traces found for traceId: "${traceId}". Cannot capture error.`,
+        `No traces found for traceId: "${reportedTraceId}". Cannot capture error.`,
       );
       return;
     }
@@ -783,7 +789,7 @@ export class OperationTraceRegistry {
     const targetSpan = refsByCaller?.get(callerId);
     if (!targetSpan) {
       this.logger.warn(
-        `No active span found for traceId: "${traceId}". Cannot capture error.`,
+        `No active span found for traceId: "${reportedTraceId}". Cannot capture error.`,
       );
       return;
     }
@@ -939,6 +945,10 @@ export class OperationTraceRegistry {
    * One line per trace `pluckSnapshot` ships without its open spans, naming
    * them. Their late ends are silent: one un-awaited call usually holds a
    * whole chain of spans open, and a line per span said the same thing N times.
+   *
+   * The line names the trace id the snapshot reports under, which the
+   * operation's logs and its trace carry too - not the registry key, which
+   * appears nowhere a reader could look it up.
    */
   private reportUnfinishedSpans(
     traceId: TraceId,
@@ -953,9 +963,9 @@ export class OperationTraceRegistry {
     const operation =
       ("operationId" in snapshot && snapshot.operationId) ||
       ("name" in snapshot && snapshot.name) ||
-      traceId;
+      snapshot.traceId;
     this.logger.warn(
-      `Trace "${traceId}" (${operation}) was reported without ${open.join(", ") || "a span"}, which had not ended ${SNAPSHOT_COMPLETION_TIMEOUT_MS}ms after the operation did. Some of your async operations were not awaited and outlived the operation that started them. Ignore if this is the desired behavior.`,
+      `Trace "${snapshot.traceId}" (${operation}) was reported without ${open.join(", ") || "a span"}, which had not ended ${SNAPSHOT_COMPLETION_TIMEOUT_MS}ms after the operation did. Some of your async operations were not awaited and outlived the operation that started them. Ignore if this is the desired behavior.`,
     );
   }
 

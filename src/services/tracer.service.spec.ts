@@ -401,6 +401,35 @@ describe("TracerService", () => {
       ).rejects.toThrow(/No active span found/);
     });
 
+    it("names the trace id, not the registry key, when no span is active", async () => {
+      // Kept under a key of its own, as every HTTP, RPC and queued execution
+      // is. The key appears nowhere a reader could look it up.
+      registry.startTrace(
+        "registry-key-a4",
+        {
+          operationId: "GET /orders",
+          protocol: "http",
+          attributes: { method: "GET", originalUrl: "/orders" },
+          tags: {},
+        },
+        "public-a4",
+      );
+      const store = new Map<string, unknown>([
+        [TRACE_ID_KEY, "public-a4"],
+        [TRACE_REGISTRY_KEY, "registry-key-a4"],
+      ]);
+
+      const failure = await als
+        .run(store, () => tracer.activeSpan())
+        .then(
+          () => undefined,
+          (error: unknown) => error as Error,
+        );
+
+      expect(failure?.message).toContain("traceId: public-a4.");
+      expect(failure?.message).not.toContain("registry-key-a4");
+    });
+
     it("hands back a detached delegate when the operation is not recorded", async () => {
       // An ignored or sampled-out operation: the id is in the store for log
       // correlation, but no trace was ever opened under it.
@@ -455,6 +484,24 @@ describe("TracerService", () => {
       );
 
       expect(captureError).not.toHaveBeenCalled();
+    });
+
+    it("names the trace id, not the registry key, when it cannot capture", async () => {
+      const warn = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+      // An execution kept under a key of its own and not recorded - ignored
+      // or sampled out - so nothing is registered under the key.
+      const store = new Map<string, unknown>([
+        [TRACE_ID_KEY, "public-c2"],
+        [TRACE_REGISTRY_KEY, "registry-key-c2"],
+      ]);
+
+      await als.run(store, () => tracer.captureError(new Error("x")));
+
+      expect(warn).toHaveBeenCalledWith(
+        'No request snapshot found for traceId: "public-c2". Cannot capture error.',
+      );
     });
 
     it("fails clearly outside any async context", async () => {
