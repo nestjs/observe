@@ -22,3 +22,7 @@ yarn.lock
 
 # Claude Code
 .claude/worktrees/
+
+# benchmark build output and results
+/bench/.build/
+/bench/results/
