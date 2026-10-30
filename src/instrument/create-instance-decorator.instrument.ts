@@ -150,8 +150,88 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     const call = spec.call;
     const callUntraced = spec.callUntraced;
 
+    const endStep = (requestId: string, stepId: string) =>
+      operationTraceRegistry.internalEndTraceStep(
+        requestId,
+        spanId,
+        className,
+        methodName,
+        stepId,
+      );
+    const recordError = (requestId: string, stepId: string, err: any) => {
+      // Before the registry records the step: `internalEndTraceStep` copies
+      // `err.stack` into the span payload (and, on a root span, into the
+      // snapshot that becomes the error group's sample), so relabelling
+      // afterwards would leave that copy carrying this frame's `Proxy.`.
+      relabelProxyFrame(err, className, methodName);
+      operationTraceRegistry.internalEndTraceStep(
+        requestId,
+        spanId,
+        className,
+        methodName,
+        stepId,
+        err,
+      );
+    };
+
+    // Runs the call inside the span's own async context. Made once per
+    // wrapper rather than once per call: `als.run` hands it the receiver, the
+    // arguments and the span's ids, so a traced call allocates no closure for
+    // it - and does not rename one, which cost as much again.
+    const callTraced = named(
+      frameName,
+      (
+        thisArg: unknown,
+        args: unknown[],
+        requestId: string,
+        stepId: string,
+      ) => {
+        try {
+          const result = call(thisArg, args);
+          if (result instanceof Promise) {
+            // Closing the span is a side effect: a registry failure must
+            // leave the caller with the value or rejection it would have
+            // seen without the span.
+            const settled = (value: unknown) => {
+              ignoreFailure(() => endStep(requestId, stepId));
+              return value;
+            };
+            const failed = (err: unknown) => {
+              ignoreFailure(() => recordError(requestId, stepId, err));
+              throw err;
+            };
+            // A plain native promise is swapped for a chained one, just as
+            // the caller's own `.then` would: a rejection the caller drops
+            // still raises `unhandledRejection`, as without the span.
+            if (isPlainPromise(result)) {
+              return result.then(settled, failed);
+            }
+            // A promise carrying more than its value (`json()` on a `got`
+            // request, `kill()` on an `execa` child, a subclass and its own
+            // members) is handed back as-is, or the caller loses all that.
+            // It is watched on a side branch instead, the way
+            // `OutgoingSpanRecorder.endWhenSettled` watches outgoing calls.
+            // Watching marks it handled, so a rejection the caller drops no
+            // longer raises `unhandledRejection`; the span still records it.
+            result.then(settled, (err) =>
+              ignoreFailure(() => recordError(requestId, stepId, err)),
+            );
+            return result;
+          }
+          endStep(requestId, stepId);
+          return result;
+        } catch (err) {
+          recordError(requestId, stepId, err);
+          // Re-throw the error to maintain original behavior
+          throw err;
+        } finally {
+          spec.setActive(false);
+        }
+      },
+    );
+
     // A function expression, not an arrow: the wrapper has to forward whatever
-    // `this` the caller invoked it with. Nested arrows below inherit it.
+    // `this` the caller invoked it with.
     return named(frameName, function (this: unknown, ...args: unknown[]) {
       // Already tracing this callable, invoke it as-is
       if (spec.isActive()) {
@@ -187,82 +267,12 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         }
       }
 
-      const onReturnValue = (res: unknown) => {
-        operationTraceRegistry.internalEndTraceStep(
-          requestId,
-          spanId,
-          className,
-          methodName,
-          newStepId,
-        );
-        return res;
-      };
-      const recordError = (err: any) => {
-        // Before the registry records the step: `internalEndTraceStep` copies
-        // `err.stack` into the span payload (and, on a root span, into the
-        // snapshot that becomes the error group's sample), so relabelling
-        // afterwards would leave that copy carrying this frame's `Proxy.`.
-        relabelProxyFrame(err, className, methodName);
-        operationTraceRegistry.internalEndTraceStep(
-          requestId,
-          spanId,
-          className,
-          methodName,
-          newStepId,
-          err,
-        );
-      };
-      const onError = (err: any) => {
-        recordError(err);
-        // Re-throw the error to maintain original behavior
-        throw err;
-      };
-      return als.run(
-        new Map([
-          ...(store?.entries() ?? []),
-          [CALLER_METADATA_KEY, newStepId],
-        ]),
-        named(frameName, () => {
-          try {
-            const result = call(this, args);
-            if (result instanceof Promise) {
-              // Closing the span is a side effect: a registry failure must
-              // leave the caller with the value or rejection it would have
-              // seen without the span.
-              const settled = (value: unknown) => {
-                ignoreFailure(() => onReturnValue(value));
-                return value;
-              };
-              const failed = (err: unknown) => {
-                ignoreFailure(() => recordError(err));
-                throw err;
-              };
-              // A plain native promise is swapped for a chained one, just as
-              // the caller's own `.then` would: a rejection the caller drops
-              // still raises `unhandledRejection`, as without the span.
-              if (isPlainPromise(result)) {
-                return result.then(settled, failed);
-              }
-              // A promise carrying more than its value (`json()` on a `got`
-              // request, `kill()` on an `execa` child, a subclass and its own
-              // members) is handed back as-is, or the caller loses all that.
-              // It is watched on a side branch instead, the way
-              // `OutgoingSpanRecorder.endWhenSettled` watches outgoing calls.
-              // Watching marks it handled, so a rejection the caller drops no
-              // longer raises `unhandledRejection`; the span still records it.
-              result.then(settled, (err) =>
-                ignoreFailure(() => recordError(err)),
-              );
-              return result;
-            }
-            return onReturnValue(result);
-          } catch (err) {
-            onError(err);
-          } finally {
-            spec.setActive(false);
-          }
-        }),
-      );
+      // Everything the caller's context holds, with this span as the caller
+      // of whatever it calls. A copy, so the caller's context still names the
+      // caller once this call returns.
+      const spanStore = new Map(store);
+      spanStore.set(CALLER_METADATA_KEY, newStepId);
+      return als.run(spanStore, callTraced, this, args, requestId, newStepId);
     });
   };
 
@@ -355,15 +365,31 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     const methodRefsCache = new WeakMap<object, Function>();
-    const currentlyTracing = new WeakMap<object, Set<string>>();
+    // Functions read off the instance that are handed out as they are:
+    // constructors and callable objects.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+    const passedThrough = new WeakSet<Function>();
     return new Proxy(instance, {
+      // Runs for every property read through the proxy - each `this.field`
+      // and `this.dependency.method` inside a traced call - so the common
+      // answers come first: a value that is no method, then a method already
+      // wrapped.
       get: (target, prop, receiver) => {
         const attributeValue = Reflect.get(target, prop);
-        const isFunction =
-          typeof attributeValue === "function" && prop !== "constructor";
+        if (typeof attributeValue !== "function" || prop === "constructor") {
+          return attributeValue;
+        }
+
+        // When "originalMethod" is already proxied, return the cached version
+        const cached = methodRefsCache.get(attributeValue);
+        if (cached) {
+          return cached;
+        }
+        if (passedThrough.has(attributeValue)) {
+          return attributeValue;
+        }
 
         const shouldProxy =
-          isFunction &&
           // A constructor held in a field - pg-pool's `this.Promise` - is
           // invoked with `new` and read for statics (`this.Promise.reject`);
           // the traced wrapper supports neither.
@@ -377,17 +403,16 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           // own properties.
           !isCallableObject(attributeValue);
         if (!shouldProxy) {
-          return Reflect.get(target, prop);
+          // Remembered, as a wrapped method is: telling them apart reads the
+          // function's source and its prototype's keys, which a Mongoose
+          // model read on every query would otherwise pay each time.
+          passedThrough.add(attributeValue);
+          return attributeValue;
         }
 
         const className = classNameOf(target);
         const methodName = String(prop);
         const frameName = `${className}.${methodName}`;
-
-        // When "originalMethod" is already proxied, return the cached version
-        if (methodRefsCache.has(attributeValue)) {
-          return methodRefsCache.get(attributeValue);
-        }
 
         // For a private-member class, `Reflect.get` with the proxy as receiver
         // would already throw on an accessor that touches `this.#x`, so the
@@ -396,23 +421,17 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           ? attributeValue
           : Reflect.get(target, prop, receiver);
         const tracedReceiver = requiresRawReceiver ? target : receiver;
+        // The wrapper is made once per method of this instance and cached
+        // below, so a flag of its own guards exactly that callable - checked
+        // and flipped on every traced call, where a lookup keyed by instance
+        // and name used to be.
+        let active = false;
         const proxyFn = createTracedWrapper({
           className,
           methodName,
           spanId: generateSpanId(target, methodName),
-          isActive: () =>
-            currentlyTracing.get(target)?.has(methodName) ?? false,
-          setActive: (active) => {
-            if (!currentlyTracing.has(target)) {
-              currentlyTracing.set(target, new Set());
-            }
-            const activeMethods = currentlyTracing.get(target)!;
-            if (active) {
-              activeMethods.add(methodName);
-            } else {
-              activeMethods.delete(methodName);
-            }
-          },
+          isActive: () => active,
+          setActive: (value) => (active = value),
           // Traced calls run against the proxy so that a method calling into
           // itself (`this.other()`) is instrumented as a nested step - except
           // for private-member classes, whose brand checks only the raw

@@ -182,8 +182,9 @@ describe("ObserveAgentWorker shutdown flush", () => {
 
   it("waits for snapshots still queued behind a zero timer", async () => {
     const { agent, buffer, thread } = boot();
-    // How every protocol records a finished request or job: from a
-    // `setTimeout(0)` scheduled when it ended - here, just before shutdown.
+    // How a protocol records a finished request or job whose spans were still
+    // open: from a `setTimeout(0)` scheduled when it ended - here, just before
+    // shutdown.
     setTimeout(() => buffer.pushLogs(logLines(1, "just-finished")), 0);
 
     await agent.onApplicationShutdown();

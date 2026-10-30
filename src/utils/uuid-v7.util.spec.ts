@@ -25,4 +25,13 @@ describe("uuidv7", () => {
     const ids = new Set(Array.from({ length: 1000 }, () => uuidv7()));
     expect(ids.size).toBe(1000);
   });
+
+  it("stays well-formed and unique across refills of its random pool", () => {
+    // The pool holds 1,024 ids' worth of random bytes; this crosses several
+    // refills, including ids minted from the tail of one fill.
+    const ids = Array.from({ length: 5000 }, () => uuidv7());
+
+    expect(ids.every((id) => V7.test(id))).toBe(true);
+    expect(new Set(ids).size).toBe(5000);
+  });
 });

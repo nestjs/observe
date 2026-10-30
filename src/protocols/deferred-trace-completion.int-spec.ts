@@ -40,8 +40,8 @@ class DeferredCompletionTestModule {}
 type Platform = "express" | "node";
 
 /**
- * `getUserId` runs when the trace is completed, in a timer after the response
- * has gone out. A throw there used to surface as an unhandled rejection and
+ * `getUserId` runs when the trace is completed, after the response has gone
+ * out. A throw there used to surface as an unhandled rejection and
  * end the process; vitest fails the run on one, so without the guard these
  * tests fail even before their assertions do.
  */

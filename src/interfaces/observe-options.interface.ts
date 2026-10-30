@@ -204,7 +204,8 @@ export interface ObserveOptions {
    * One setting for telemetry and profiles both, so the two can never point at
    * different places. Defaults to the hosted collector; set `OBSERVE_ENDPOINT`
    * in the environment to override that without touching this config, which is
-   * how a self-hosted or local collector is usually pointed at.
+   * how a proxy or gateway that forwards to NestJS Observe is usually pointed
+   * at.
    *
    * @default 'https://observe-api.nestjs.com'
    */

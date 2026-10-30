@@ -13,6 +13,7 @@ CONTRIBUTE.md
 # source
 /src
 /coverage
+/bench
 
 # configuration
 renovate.json

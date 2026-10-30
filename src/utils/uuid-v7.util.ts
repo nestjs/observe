@@ -1,4 +1,43 @@
-import { randomBytes } from "crypto";
+import { randomFillSync } from "crypto";
+
+/** Random bytes in each id: 12 bits go into `rand_a`, 62 into `rand_b`. */
+const RANDOM_BYTES_PER_ID = 10;
+
+/**
+ * Random bytes for the ids below, refilled 1,024 ids' worth at a time.
+ *
+ * The agent mints an id for every span, so this runs once per provider call
+ * of every traced request. A `randomBytes(10)` per id - a native call and a
+ * buffer each time - was the agent's largest single cost on the request path:
+ * a fifth of the main thread's busy time on an endpoint with nine spans. The
+ * bytes still come from the CSPRNG; it is asked once per 1,024 ids, the way
+ * `crypto.randomUUID()` caches its own entropy.
+ */
+const pool = Buffer.allocUnsafe(RANDOM_BYTES_PER_ID * 1024);
+let poolOffset = pool.length;
+
+const HEX_DIGITS = "0123456789abcdef";
+
+/** Each byte value's two hex digits, as character codes. */
+const HIGH_DIGIT = Uint8Array.from({ length: 256 }, (_, byte) =>
+  HEX_DIGITS.charCodeAt(byte >>> 4),
+);
+const LOW_DIGIT = Uint8Array.from({ length: 256 }, (_, byte) =>
+  HEX_DIGITS.charCodeAt(byte & 0x0f),
+);
+
+/**
+ * The id's 36 characters, written in place and read out as one string; the
+ * hyphens never move. Joined from pieces instead, an id was a concatenation
+ * V8 had to flatten before it could hash it, and the registry hashes every
+ * span id - as a map key - the moment it is minted.
+ */
+const text = Buffer.alloc(36, "-");
+
+function writeByte(at: number, byte: number): void {
+  text[at] = HIGH_DIGIT[byte];
+  text[at + 1] = LOW_DIGIT[byte];
+}
 
 /**
  * A UUID whose first 48 bits are the minting time, milliseconds since the
@@ -16,22 +55,30 @@ import { randomBytes } from "crypto";
  * decode the same way.
  */
 export function uuidv7(now: number = Date.now()): string {
-  // Ten random bytes: 12 bits go into `rand_a`, 62 into `rand_b`. The two
-  // version and two variant bits overwrite what they need.
-  const rand = randomBytes(10);
+  if (poolOffset + RANDOM_BYTES_PER_ID > pool.length) {
+    randomFillSync(pool);
+    poolOffset = 0;
+  }
+  const r = poolOffset;
+  poolOffset += RANDOM_BYTES_PER_ID;
 
-  const bytes = Buffer.allocUnsafe(16);
-  // 48-bit big-endian timestamp, placed as a 32/16 split so no shift runs
-  // past 2^32.
-  bytes.writeUInt32BE(Math.floor(now / 0x10000), 0);
-  bytes.writeUInt16BE(now % 0x10000, 4);
+  // 48-bit big-endian timestamp, split 32/16 so no shift runs past 2^32.
+  const high = Math.floor(now / 0x10000);
+  const low = now % 0x10000;
+  writeByte(0, (high >>> 24) & 0xff);
+  writeByte(2, (high >>> 16) & 0xff);
+  writeByte(4, (high >>> 8) & 0xff);
+  writeByte(6, high & 0xff);
+  writeByte(9, (low >>> 8) & 0xff);
+  writeByte(11, low & 0xff);
   // Version 7 in the top nibble, 12 random bits below it.
-  bytes[6] = 0x70 | (rand[0] & 0x0f);
-  bytes[7] = rand[1];
+  writeByte(14, 0x70 | (pool[r] & 0x0f));
+  writeByte(16, pool[r + 1]);
   // Variant `10` in the top two bits, 62 random bits below.
-  bytes[8] = 0x80 | (rand[2] & 0x3f);
-  rand.copy(bytes, 9, 3, 10);
-
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  writeByte(19, 0x80 | (pool[r + 2] & 0x3f));
+  writeByte(21, pool[r + 3]);
+  for (let i = 0; i < 6; i++) {
+    writeByte(24 + i * 2, pool[r + 4 + i]);
+  }
+  return text.toString("latin1");
 }

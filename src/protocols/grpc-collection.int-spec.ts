@@ -93,8 +93,8 @@ class GrpcTestModule {}
  * agent branches on `Transport.GRPC` and runs `startGrpcRequestTracing`, which
  * is separate code from the message-based path the TCP suite covers. It reads
  * the operation id off the gRPC call rather than off a message pattern, and it
- * defers behind a `setTimeout(0)` - so the TCP suite passing says nothing about
- * whether this works.
+ * completes the trace on its own deferred path - so the TCP suite passing says
+ * nothing about whether this works.
  */
 describe("ObserveModule: gRPC collection", () => {
   let app: INestMicroservice;

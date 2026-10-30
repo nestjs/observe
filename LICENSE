@@ -1,22 +1,105 @@
-(The MIT License)
+NestJS Observe Agent License
 
-Copyright (c) 2017-present Kamil Mysliwiec <https://kamilmysliwiec.com>
+Copyright (c) 2026-present NestJS Kamil Mysliwiec <https://nestjs.com>
 
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of this software and associated documentation files (the
-'Software'), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+This license applies to this repository as published after the release of
+@nestjs/observe 0.3.20, and to every version of @nestjs/observe released
+after 0.3.20. Version 0.3.20 and earlier were released under the MIT License
+and remain available under it (see NOTICE).
 
-The above copyright notice and this permission notice shall be
-included in all copies or substantial portions of the Software.
+DEFINITIONS
 
-THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"Licensor" or "NestJS" means NestJS Kamil Mysliwiec (https://nestjs.com).
+
+"Software" means the source code, object code and documentation this license
+applies to, and any modified version, part or derivative work of them.
+
+"Service" means NestJS Observe, the hosted service the Licensor operates at
+observe.nestjs.com, together with the collector endpoints the Licensor
+operates for it.
+
+"Telemetry" means the data the Software records about the applications it
+instruments, such as traces, spans, errors, logs, metrics and profiles.
+
+"You" means the individual or entity exercising rights under this license.
+
+1. GRANT
+
+Subject to the conditions of this license, the Licensor grants You a
+worldwide, royalty-free, non-exclusive, non-transferable license to use,
+copy, modify and distribute the Software, solely to:
+
+  (a) instrument Your applications and send their Telemetry to the Service,
+      directly or through proxies and gateways that forward it to the
+      Service;
+
+  (b) develop, build, test, deploy and run those applications, including
+      with the Software disabled; and
+
+  (c) develop and test changes to the Software that You submit to the
+      Licensor.
+
+2. LIMITATIONS
+
+You may not:
+
+  (a) use the Software to send Telemetry to any collector, backend or
+      service other than the Service, or a proxy or gateway that forwards
+      it to the Service;
+
+  (b) use the Software, including its source code, to develop, test,
+      document or operate a collector, backend or service that receives
+      Telemetry from the Software, or that substitutes for the Service;
+
+  (c) remove, disable or circumvent any part of the Software that limits
+      where it sends Telemetry; or
+
+  (d) remove or obscure any licensing, copyright or trademark notice in the
+      Software.
+
+Exporting Telemetry through an export option included in a version of the
+Software the Licensor released, such as OpenTelemetry (OTLP) export, as
+documented for that version, does not violate (a).
+
+Passing trace context, such as traceparent or x-request-id headers, between
+Your applications and the services they call does not violate (a) or (b).
+
+A collector used solely to test the Software or Your applications, that does
+not store, display or provide monitoring of Telemetry for anyone, does not
+violate (a) or (b).
+
+3. DISTRIBUTION
+
+You may distribute the Software, modified or not, including as part of Your
+applications, but only under this license. This license covers only the
+Software, not the rest of Your applications. Every copy You distribute must
+include this license and the NOTICE file. Recipients receive their rights
+from the Licensor under this license, not from You.
+
+4. TERMINATION
+
+If You use the Software in violation of this license, Your rights under it
+end. If the Licensor notifies You of a violation and You stop it within 30
+days of that notice, Your rights are reinstated, unless You have been
+notified of a violation before.
+
+5. TRADEMARKS
+
+This license grants no rights to use the names "NestJS" or "NestJS Observe",
+or any related logos or trademarks, except to state that Your application
+uses the Software.
+
+6. OTHER USES
+
+Uses this license does not allow require a separate written agreement with
+the Licensor.
+
+7. NO WARRANTY; LIMITATION OF LIABILITY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+LICENSOR OR ANY CONTRIBUTOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.

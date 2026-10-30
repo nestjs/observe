@@ -230,6 +230,22 @@ describe("createInstanceDecorator", () => {
       expect(service.findAll).toBe(service.findAll);
     });
 
+    it("runs a getter once per read", () => {
+      class Counting {
+        reads = 0;
+        get value() {
+          this.reads += 1;
+          return 42;
+        }
+      }
+      const instance = new Counting();
+      const counting = decorate(instance) as Counting;
+
+      expect(counting.value).toBe(42);
+      expect(withTrace(() => counting.value)).toBe(42);
+      expect(instance.reads).toBe(2);
+    });
+
     it("ends the trace step with the error and re-throws", () => {
       const service = decorate(new UserService()) as UserService;
 
@@ -668,6 +684,17 @@ describe("createInstanceDecorator", () => {
       const wrapped = decorate(raw) as typeof raw;
 
       expect(withTrace(() => wrapped.Legacy)).toBe(Legacy);
+    });
+
+    it("keeps handing the constructor out untouched on later reads", () => {
+      const raw = { Promise };
+      const wrapped = decorate(raw) as typeof raw;
+
+      const reads = withTrace(() => [wrapped.Promise, wrapped.Promise]);
+
+      expect(reads).toEqual([Promise, Promise]);
+      expect(wrapped.Promise).toBe(Promise);
+      expect(startedSteps).toEqual([]);
     });
 
     it("runs a real pg.Pool query registered as a provider", async () => {

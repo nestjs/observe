@@ -77,6 +77,22 @@ describe("OperationTraceRegistry", () => {
       ).resolves.toBeUndefined();
     });
 
+    it("tells whether a span of the trace is still open", () => {
+      expect(registry.hasOpenSpans("t-open")).toBe(false);
+
+      startRequest("t-open");
+      const spanId = registry.internalStartTraceStep(
+        "t-open",
+        "Svc",
+        "handle",
+        undefined,
+      );
+      expect(registry.hasOpenSpans("t-open")).toBe(true);
+
+      registry.internalEndTraceStep("t-open", spanId, "Svc", "handle", spanId);
+      expect(registry.hasOpenSpans("t-open")).toBe(false);
+    });
+
     it("plucks a completed snapshot exactly once", async () => {
       startRequest("t1");
       const spanId = registry.internalStartTraceStep(
@@ -294,6 +310,52 @@ describe("OperationTraceRegistry", () => {
       // A parent back-reference would make the tree cyclic and unserialisable.
       expect(root).not.toHaveProperty("parent");
       expect(root.duration).toEqual(expect.any(Number));
+    });
+
+    it("ships nested spans with only the fields the encoder reads", async () => {
+      startRequest("t8n");
+      const rootId = registry.internalStartTraceStep(
+        "t8n",
+        "Svc",
+        "root",
+        undefined,
+      );
+      const leafId = registry.internalStartTraceStep(
+        "t8n",
+        "Repo",
+        "find",
+        rootId,
+      );
+      registry.internalEndTraceStep("t8n", leafId, "Repo", "find", leafId);
+      registry.internalEndTraceStep("t8n", rootId, "Svc", "root", rootId);
+      registry.endTrace("t8n");
+
+      const snapshot = await registry.pluckSnapshot("t8n");
+      const root = snapshot!.traces[0];
+      const leaf = root.children[0];
+
+      expect(new Set(Object.keys(root))).toEqual(
+        new Set([
+          "origin",
+          "className",
+          "methodKey",
+          "startOffset",
+          "children",
+          "spanId",
+          "duration",
+        ]),
+      );
+      // An empty `children` or `tags` is left out rather than shipped empty.
+      expect(new Set(Object.keys(leaf))).toEqual(
+        new Set([
+          "origin",
+          "className",
+          "methodKey",
+          "startOffset",
+          "spanId",
+          "duration",
+        ]),
+      );
     });
 
     it("records how far into the trace each span started", async () => {

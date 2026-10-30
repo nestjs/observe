@@ -79,9 +79,9 @@ it("delivers the requests served since the last flush when the app closes", asyn
   // Nothing has been flushed yet: the timer is a minute away.
   expect(collector.batches).toEqual([]);
 
-  // Closed straight after the response, while the HTTP agent usually still
-  // has the snapshot behind its `setTimeout(0)` - the case a final flush that
-  // only looked at the buffer as it stood would miss.
+  // Closed straight after the response, while the HTTP agent may still be
+  // completing the snapshot - the case a final flush that only looked at the
+  // buffer as it stood would miss.
   await app.close();
 
   // Recorded on arrival, before the collector answers - so it is here once
