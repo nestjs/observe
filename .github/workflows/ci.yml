@@ -30,9 +30,10 @@ jobs:
         # being flagged. It is tested precisely because dropping below it is
         # the regression nobody notices locally.
         node: ["20.19", "22", "24"]
-    # The queue suites need a real Redis, and the query-span suites a real
-    # Postgres, MySQL and MongoDB. Each skips itself when its server does not
-    # answer - which, without these, would be every CI run.
+    # The queue suites need a real Redis, the query-span suites a real
+    # Postgres, MySQL and MongoDB, and the Jaeger export suite a Jaeger. Each
+    # skips itself when its server does not answer - which, without these,
+    # would be every CI run.
     services:
       mysql:
         image: mysql:8
@@ -77,6 +78,19 @@ jobs:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      jaeger:
+        # OTLP/HTTP in on 4318, and on 16686 the query API the suite reads
+        # each trace back from. The health check asks what the suite asks
+        # before it runs, so a healthy container is one it will not skip.
+        image: jaegertracing/jaeger:2.22.0
+        ports:
+          - 4318:4318
+          - 16686:16686
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:16686/api/v3/services"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10

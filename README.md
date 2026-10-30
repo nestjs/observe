@@ -52,6 +52,12 @@ because it cannot see them. If you would otherwise spend a week wiring a
 collector and still not know which provider spent the time, this is the
 shortcut.
 
+It does not lock the data in, either. Traces carry W3C `traceparent` in and
+out, so a request through services instrumented with OpenTelemetry stays one
+trace, and the agent can export everything it records as OTLP to a collector,
+Jaeger, Tempo or any vendor, beside Observe or instead of it - see
+[Exporting to OpenTelemetry](#exporting-to-opentelemetry).
+
 ## Seeing it before installing
 
 **[observe-demo.nestjs.com](https://www.observe-demo.nestjs.com/dashboard)** is the whole
@@ -398,6 +404,41 @@ Declarations are checked when the application starts, and whatever fails is logg
 
 SLOs need a plan that has them - Scale or Enterprise. On any other plan, declarations are sent and ignored. The [documentation](https://www.observe.nestjs.com/documentation/sdk#declaring-objectives-in-code) has the rest.
 
+## Exporting to OpenTelemetry
+
+`otlp` exports every trace the agent records as OpenTelemetry spans, over OTLP/HTTP, to a receiver of your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb, Datadog's agent, or any vendor that takes OTLP. It runs beside what is sent to Observe, and needs no Observe credentials to run on its own.
+
+```typescript
+ObserveModule.forRoot({
+  serviceId: "orders-api",
+  otlp: {
+    endpoint: "https://api.honeycomb.io",
+    headers: { "x-honeycomb-team": process.env.HONEYCOMB_API_KEY! },
+  },
+});
+```
+
+`otlp: true` takes everything from the standard variables instead, as an OpenTelemetry SDK would: `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`), `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, with their `_TRACES_` forms. Options set in code win over them. The variables never turn export on by themselves: an application that also runs an OpenTelemetry SDK has them set for that SDK, and would export every trace twice.
+
+| Option               | Default                          | What it does                                                                                              |
+| -------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `endpoint`           | `http://localhost:4318`          | The receiver's base URL; `/v1/traces` is appended unless it is already there.                            |
+| `headers`            | none                             | Sent with every export - a vendor's API key, usually.                                                     |
+| `protocol`           | `'http/protobuf'`                | Or `'http/json'`. gRPC is not supported: point at the receiver's HTTP port.                               |
+| `compression`        | `'gzip'`                         | Or `'none'`.                                                                                              |
+| `timeoutMillis`      | `10000`                          | How long one export may take before it is abandoned and retried.                                          |
+| `serviceName`        | `serviceId`                      | The `service.name` spans are reported under.                                                              |
+| `resourceAttributes` | none                             | Added to the agent's own (`service.version`, `service.instance.id`, `host.name`, `process.pid`, ...).     |
+
+What a backend receives, for each operation:
+
+- **A SERVER span** for every request, GraphQL operation, RPC message and gateway message, named like the dashboard names it (`GET /orders/:id`), with the HTTP semantic conventions - `http.request.method`, `http.route`, `http.response.status_code`, `url.path` - plus `enduser.id`, your `tags`, and the headers `http.capture` recorded. A queue job is a CONSUMER span, a scheduled run an INTERNAL one.
+- **INTERNAL spans** for the provider methods and manual spans under it, named `OrdersService.findOne`, and **CLIENT spans** for queries and outbound HTTP calls, named for what they did (`SELECT orders`, `GET api.stripe.com`).
+- **The same trace ids `traceparent` carries.** A request that arrived with a `traceparent` goes under the caller's span, and a call this service makes names its CLIENT span as the parent the callee sees - so services instrumented with OpenTelemetry, and other services running the agent, assemble into one trace in the backend.
+- **Errors** as span status and an `exception` event, with the class, message and stack the dashboard shows - redacted the same way.
+
+What is exported is what is recorded: after `tracesSampleRate`, `skipSpans` and `spanCollapse`. What the Observe collector does with its own copy - an account over its allowance, a paused overage - does not reach the export. Spans wait in a queue of at most 10,000 while an export is retried (429, 502, 503 and 504, honouring `Retry-After`); past that, whole operations are dropped and counted. Exports run on the application's thread, outside its traces, and whatever is queued is exported when the application closes, within `shutdownFlushTimeout`. Traces only, for now: runtime metrics, custom metrics and logs are not exported.
+
 ## Configuration
 
 Every option, with its default. The [documentation](https://www.observe.nestjs.com/documentation/sdk) covers each in more depth.
@@ -411,6 +452,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `serviceId`              | required                            | Names the service in the dashboard, in at most 100 characters - a longer one is cut to fit, with a warning at startup.                                                                           |
 | `serviceVersion`         | inferred                            | The release the process runs, at most 50 characters - see [What it records without any code](#what-it-records-without-any-code). `false` reports none.                                          |
 | `endpoint`               | `https://observe-api.nestjs.com`    | The collector's base URL - NestJS Observe, or a proxy that forwards to it. `OBSERVE_ENDPOINT` in the environment changes the default without touching the config.                                                                                  |
+| `otlp`                   | `false`                             | Exports traces as OpenTelemetry spans to a receiver of your own - see [Exporting to OpenTelemetry](#exporting-to-opentelemetry). `true` reads the `OTEL_EXPORTER_OTLP_*` variables.                     |
 | `flushInterval`          | `5000`                              | Milliseconds between sends of buffered telemetry; at least `1000`.                                                                                                                                |
 | `shutdownFlushTimeout`   | `2000`                              | Milliseconds closing the app waits for buffered telemetry to reach the collector before stopping the agent. `0` skips the final send - for test suites that boot the app with real credentials.   |
 | `maxTracesPerBatch`      | `1000`                              | The most traces one send carries.                                                                                                                                                                 |
@@ -469,16 +511,17 @@ $ npm run typecheck
 $ npm run test:int
 ```
 
-The MSSQL unit suite uses the real driver's public request APIs with stubbed transport methods and needs no SQL Server. The queue suites need a Redis, and the query-span integration suites a PostgreSQL, MySQL and MongoDB. Each integration suite skips itself when its server does not answer, so without them `test:int` passes having tested less. CI starts them with these ports and credentials, which the suites default to:
+The MSSQL unit suite uses the real driver's public request APIs with stubbed transport methods and needs no SQL Server. The queue suites need a Redis, the query-span integration suites a PostgreSQL, MySQL and MongoDB, and the OTLP export suite's Jaeger case a Jaeger. Each integration suite skips itself when its server does not answer, so without them `test:int` passes having tested less. CI starts them with these ports and credentials, which the suites default to:
 
 ```bash
 $ docker run -d -p 6379:6379 redis:7-alpine
 $ docker run -d -p 54321:5432 -e POSTGRES_PASSWORD=postgres-whisprr postgres:16-alpine
 $ docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=test mysql:8
 $ docker run -d -p 27027:27017 mongo:7
+$ docker run -d -p 4318:4318 -p 16686:16686 jaegertracing/jaeger:2.22.0
 ```
 
-To point them elsewhere, set `REDIS_HOST`/`REDIS_PORT`, `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE` or `MONGO_HOST`/`MONGO_PORT`.
+To point them elsewhere, set `REDIS_HOST`/`REDIS_PORT`, `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE`, `MONGO_HOST`/`MONGO_PORT`, or `JAEGER_OTLP_ENDPOINT`/`JAEGER_QUERY_URL` for the suite that exports traces into Jaeger.
 
 ## Module format
 

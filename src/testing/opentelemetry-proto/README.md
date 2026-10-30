@@ -1,0 +1,1 @@
+These `.proto` files are taken from [opentelemetry-proto](https://github.com/open-telemetry/opentelemetry-proto) v1.11.1 and stay under its Apache License 2.0, as each file's header states, not under this repository's license. `fake-otlp-receiver.ts` decodes the agent's exports with them in the tests; they are not part of the published package.

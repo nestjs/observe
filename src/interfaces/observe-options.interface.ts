@@ -1,5 +1,6 @@
 import type { OutgoingHttpOptions } from "../outgoing/http.integration.js";
 import type { OutgoingLlmOptions } from "../outgoing/llm/llm-fetch.integration.js";
+import type { OtlpExportOptions } from "../otlp/otlp-options.interface.js";
 import type { HttpCaptureOptions } from "../utils/capture-request.util.js";
 import {
   FactoryProvider,
@@ -215,6 +216,32 @@ export interface ObserveOptions {
    * @default 'https://observe-api.nestjs.com'
    */
   endpoint?: string;
+
+  /**
+   * Exports traces as OpenTelemetry spans, over OTLP/HTTP, to a receiver of
+   * your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb,
+   * or any vendor that takes OTLP - beside what is sent to Observe.
+   *
+   * Every operation becomes a SERVER span (CONSUMER for a queue job) with its
+   * provider method calls as INTERNAL spans and its queries and outbound
+   * calls as CLIENT spans, on the same trace ids the W3C `traceparent`
+   * headers carry - so services instrumented with OpenTelemetry land in the
+   * same traces. What is exported is what is recorded: after
+   * `tracesSampleRate`, `skipSpans`, `spanCollapse` and redaction, and
+   * whatever the Observe collector does with its own copy.
+   *
+   * `true` takes everything from the standard `OTEL_EXPORTER_OTLP_*`,
+   * `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` variables, as an
+   * OpenTelemetry SDK would; an object sets any of it in code. Those
+   * variables never turn export on by themselves - an application that also
+   * runs an OpenTelemetry SDK has them set for that SDK, and would send
+   * every trace twice.
+   *
+   * Works without Observe credentials, and is off with `enabled: false`.
+   * Traces only: metrics and logs are not exported.
+   * @default false
+   */
+  otlp?: boolean | OtlpExportOptions;
 
   /**
    * Unique identifier for the service.

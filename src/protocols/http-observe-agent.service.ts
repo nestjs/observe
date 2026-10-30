@@ -247,6 +247,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           },
         },
         traceId,
+        traceContext,
       );
       this.evictTraceOnClientAbort(res, registryKey);
       done();

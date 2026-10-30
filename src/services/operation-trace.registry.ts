@@ -14,6 +14,7 @@ import { KeyOf } from "../types/key-of.type.js";
 import { CodeFrame, collectCodeFrames } from "../utils/source-context.util.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
 import { LogRedactor } from "../utils/log-redactor.js";
+import type { TraceContext } from "../utils/trace-context.util.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
 import {
   collapseRepeatedSpans,
@@ -130,6 +131,16 @@ export class OperationTraceRegistry {
    * switched off explicitly.
    */
   private redactor: LogRedactor | null = new LogRedactor();
+  /**
+   * The W3C trace context each operation arrived with, by snapshot.
+   *
+   * Beside the snapshot rather than on it: both encoders map every key a
+   * snapshot has onto the wire, and the collector refuses a batch carrying a
+   * key it does not know. The snapshot object `startTrace` builds is the one
+   * `pluckSnapshot` hands out, so whoever receives it can still look its
+   * context up - and the entry goes when the snapshot does.
+   */
+  private readonly traceContexts = new WeakMap<object, TraceContext>();
 
   constructor(
     private readonly als: AsyncLocalStorage<
@@ -253,6 +264,8 @@ export class OperationTraceRegistry {
      * key - a job inheriting the id of the operation that enqueued it.
      */
     reportedTraceId: string = traceId,
+    /** The `traceparent` the operation arrived with, when it had one. */
+    traceContext?: TraceContext,
   ): void {
     if (this.traceSnapshots.has(traceId)) {
       this.logger.warn(
@@ -272,6 +285,17 @@ export class OperationTraceRegistry {
       refsMarkedAsComplete: 0,
     };
     this.traceSnapshots.set(traceId, snapshot);
+    if (traceContext) {
+      this.traceContexts.set(snapshot, traceContext);
+    }
+  }
+
+  /**
+   * The `traceparent` a snapshot's operation arrived with, if it had one -
+   * for the exporter, which puts the operation under the caller's span.
+   */
+  traceContextOf(snapshot: object): TraceContext | undefined {
+    return this.traceContexts.get(snapshot);
   }
 
   endTrace(traceId: string): void;

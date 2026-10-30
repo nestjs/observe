@@ -29,6 +29,7 @@ import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "./observe.constants.js";
 import { GraphQLObserveAgentService } from "./protocols/graphql-observe-agent.service.js";
 import { HttpObserveAgentService } from "./protocols/http-observe-agent.service.js";
 import { OutgoingObserveAgentService } from "./outgoing/outgoing-observe-agent.service.js";
+import { OtlpTraceExporter } from "./otlp/otlp-trace-exporter.service.js";
 import {
   installLlmFetchObserver,
   llmCallsOff,
@@ -256,6 +257,8 @@ export function createObserveModule<Store extends Record<string, unknown>>(
       // A no-op unless @nestjs/websockets is installed.
       WsObserveAgentService,
       OutgoingObserveAgentService,
+      // A no-op unless `otlp` asks for export.
+      OtlpTraceExporter,
     ],
     exports: [AsyncLocalStorage, TracerService],
   })
@@ -393,6 +396,9 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         instance instanceof ScheduleObserveAgentService ||
         instance instanceof WsObserveAgentService ||
         instance instanceof OutgoingObserveAgentService ||
+        // Handed every finished operation from inside its completion: agent
+        // bookkeeping, like the buffer that hands them over.
+        instance instanceof OtlpTraceExporter ||
         // Nest's discovery machinery, which the GraphQL agent walks to map
         // root fields back to their resolver classes. It has to stay
         // unproxied: ModulesContainer extends Map, and a Map method invoked

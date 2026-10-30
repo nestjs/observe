@@ -173,6 +173,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
               ? "appKey"
               : "appSecret",
         production: process.env.NODE_ENV === "production",
+        exportsOtlp: Boolean(this.options.otlp),
       });
       if (notice.level === "warn") {
         this.logger.warn(notice.message);
