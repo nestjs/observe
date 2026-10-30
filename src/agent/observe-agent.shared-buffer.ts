@@ -35,6 +35,7 @@ import { NodeRuntimeMetrics } from "../interfaces/node-runtime-metrics.interface
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { OtlpTraceExporter } from "../otlp/otlp-trace-exporter.service.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
 
 const SHARED_BUFFER_SIZE = 1024 * 1024 * 16; // 16 MB
@@ -233,6 +234,9 @@ export class ObserveAgentSharedBuffer {
     // build it; the module always provides it.
     @Optional()
     private readonly objectivesRegistry?: ObjectivesRegistry,
+    // Optional for the same reason.
+    @Optional()
+    private readonly otlpTraceExporter?: OtlpTraceExporter,
   ) {}
 
   insertRequestSnapshot(snapshot: RequestSnapshot) {
@@ -247,6 +251,11 @@ export class ObserveAgentSharedBuffer {
     snapshot.operationId ??= fallbackOperationId(
       snapshot.attributes?.originalUrl,
     );
+    // Ahead of everything below that can leave the snapshot out: the
+    // collector's limits and its answers about this account decide what
+    // reaches Observe, not what an OTLP receiver of the application's own
+    // is sent. The raw snapshot, which the encoder below only copies.
+    this.otlpTraceExporter?.exportRequestSnapshot(snapshot);
     if (!snapshot.operationId) {
       if (this.options.debug) {
         this.logger.debug(
@@ -316,6 +325,8 @@ export class ObserveAgentSharedBuffer {
   }
 
   insertJobSnapshot(jobSnapshot: JobSnapshot) {
+    // Before the cap below, as for a request.
+    this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot);
     if (!this._mainThreadBuffer) {
       this._mainThreadBuffer = this.createEmptyPayload();
     }

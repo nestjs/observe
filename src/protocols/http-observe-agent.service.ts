@@ -196,12 +196,13 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // outbound calls carry that one on either way - for an unrecorded
       // request too, so the trace does not break here. An OpenTelemetry SDK
       // in this process has the say on which trace that is, when one runs -
-      // see `inboundTraceContext`.
-      if (openTelemetry) {
-        const traceContext = inboundTraceContext(req.headers);
-        if (traceContext) {
-          store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
-        }
+      // see `inboundTraceContext`. The registry keeps it beside the
+      // snapshot too, for `otlp`, which puts the operation's span under it.
+      const traceContext = openTelemetry
+        ? inboundTraceContext(req.headers)
+        : undefined;
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
       }
 
       setAttributesSafely(
@@ -249,6 +250,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           },
         },
         traceId,
+        traceContext,
       );
       this.evictTraceOnClientAbort(res, registryKey);
       done();

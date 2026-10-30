@@ -42,6 +42,25 @@ export function describeMissingCredentials(input: {
   scaffold: boolean;
   unset?: "both" | "appKey" | "appSecret";
   production: boolean;
+  /**
+   * `otlp` is on, so traces still leave the process - only not for Observe.
+   * Said, or "sends nothing" would read as the export being off too.
+   */
+  exportsOtlp?: boolean;
+}): CredentialsNotice {
+  const notice = describeForObserve(input);
+  return input.exportsOtlp
+    ? {
+        ...notice,
+        message: `${notice.message} OTLP export is not affected: traces still go to the receiver \`otlp\` names.`,
+      }
+    : notice;
+}
+
+function describeForObserve(input: {
+  scaffold: boolean;
+  unset?: "both" | "appKey" | "appSecret";
+  production: boolean;
 }): CredentialsNotice {
   if (input.production) {
     const state = input.scaffold
