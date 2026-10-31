@@ -6,7 +6,7 @@ import {
 } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { validateTelemetryPayload } from "../agent/telemetry-wire-contract.js";
-import { freePort, waitFor } from "./observe-harness.js";
+import { listenOnLoopback, waitFor } from "./observe-harness.js";
 
 /** A span as the encoders put it on the wire. */
 export interface WireSpan {
@@ -156,11 +156,10 @@ export async function startFakeCollector(): Promise<FakeCollector> {
     });
   });
 
-  const port = await freePort();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
-  });
+  // A port the OS picks as it binds: one from `freePort`, released before
+  // the bind, can meanwhile become the local port of a connection the suite
+  // opens, and the bind then fails with EADDRINUSE.
+  const url = await listenOnLoopback(server);
 
   const batchCarrying = (traceId: string) =>
     batches.find((batch) =>
@@ -168,7 +167,7 @@ export async function startFakeCollector(): Promise<FakeCollector> {
     );
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url,
     batches,
     requests,
     violations,

@@ -73,8 +73,16 @@ export interface CreateObserveModuleOptions {
    * For HTTP protocols, the request object is passed to the function.
    * For non-HTTP protocols, the request object will be contextual and may not be available.
    * The default implementation uses the 'x-request-id' header if available,
-   * or mints a time-ordered UUID (version 7) if the header is not present -
-   * an id the collector can locate in time without a scan.
+   * or mints a time-ordered UUID (version 7) if not - an id the collector can
+   * locate in time without a scan.
+   *
+   * With `openTelemetry` on, the default names a request in a W3C trace after
+   * that trace instead: the trace id of its `traceparent`, written as a UUID,
+   * or of the span an OpenTelemetry SDK in the same process opened for it.
+   * An 'x-request-id' that names the same trace is kept. Whatever this
+   * returns, the W3C trace is then still read alongside it: outbound calls
+   * carry it on, so the request stays in the OpenTelemetry trace its caller
+   * is in.
    * @default (req) => req.headers['x-request-id'] || uuidv7()
    */
   traceIdGenerator?: (req: unknown) => string;
@@ -674,6 +682,36 @@ export interface ObserveOptions {
      */
     getUserId?: (call: any) => string;
   };
+  /**
+   * Interoperates with OpenTelemetry. Off by default, and off, the agent
+   * reads and sends `x-request-id` alone, as it always has.
+   *
+   * On:
+   * - A request that arrives in a W3C trace (`traceparent`) is reported under
+   *   that trace's id, written as a UUID, so it has the id the rest of the
+   *   trace has in the caller's OpenTelemetry backend. An `x-request-id` is
+   *   kept when it names the same trace, which is what another service
+   *   running the agent sends.
+   * - Outbound `fetch` and `node:http` calls carry a `traceparent` beside
+   *   `x-request-id` - see `outgoing.http.traceContext`.
+   * - With an OpenTelemetry SDK running in the same process - or an SDK
+   *   built on it, as Sentry's Node SDK is from version 8 - a request is
+   *   reported under the trace of the server span the SDK opened for it, the
+   *   request that starts a trace included, and `traceparent` on outbound
+   *   calls is left to the SDK.
+   *
+   * A `traceIdGenerator` passed to `createObserveModule()` still names the
+   * trace; the W3C one is carried on beside it.
+   *
+   * It works only beside reporting to NestJS Observe: from the first batch
+   * the collector accepts, and paused - each time with a line in the log -
+   * while the collector refuses the app's credentials, once batches have
+   * failed to get in for a minute, or while the agent's worker is down. It
+   * resumes with the next batch the collector accepts. With `enabled: false`,
+   * or without credentials for the hosted collector, it never turns on.
+   * @default false
+   */
+  openTelemetry?: boolean;
   /**
    * Spans for what leaves the process: database queries (`pg`, `mysql2`, `mssql`,
    * `mongodb` - and so every ORM built on them) and outbound HTTP requests

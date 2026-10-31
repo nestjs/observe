@@ -85,6 +85,7 @@
     "@nestjs/microservices": "^11.0.0 || ^12.0.0",
     "@nestjs/schedule": "^4.0.0 || ^5.0.0 || ^6.0.0 || ^12.0.0",
     "@nestjs/websockets": "^11.0.0 || ^12.0.0",
+    "@opentelemetry/api": "^1.0.0",
     "@taskforcesh/bullmq-pro": "^7.0.0",
     "bull": "^3.3.0 || ^4.0.0",
     "bullmq": "^5.0.0 || ^6.0.0",
@@ -108,6 +109,9 @@
       "optional": true
     },
     "@nestjs/websockets": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
       "optional": true
     },
     "@taskforcesh/bullmq-pro": {
@@ -145,6 +149,12 @@
     "@nestjs/schedule": "12.0.1",
     "@nestjs/testing": "12.0.1",
     "@nestjs/websockets": "12.0.3",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "0.81.0",
+    "@opentelemetry/context-async-hooks": "2.12.0",
+    "@opentelemetry/core": "2.12.0",
+    "@opentelemetry/sdk-node": "0.223.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
     "@swc/core": "1.16.1",
     "@types/mssql": "12.3.0",
     "@types/node": "22.20.5",
