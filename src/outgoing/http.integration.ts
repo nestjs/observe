@@ -1,5 +1,6 @@
 import { subscribe, unsubscribe } from "diagnostics_channel";
 import { LogRedactor } from "../utils/log-redactor.js";
+import { openTelemetryWritesTraceparent } from "../utils/opentelemetry.util.js";
 import { redactUrlQuery } from "../utils/redact-url-query.js";
 import {
   formatTraceparent,
@@ -37,7 +38,10 @@ export interface OutgoingHttpOptions {
    * with, if any. It is what a service instrumented with OpenTelemetry - in
    * any language - reads, so the call stays one trace through it. The trace
    * is the one the operation's own `traceparent` named, when it arrived with
-   * one. Never added to a request that already carries a `traceparent`.
+   * one. Never added to a request that already carries a `traceparent`, nor
+   * while an OpenTelemetry SDK that propagates W3C Trace Context runs in the
+   * same process: its instrumentations write the header on the calls they
+   * cover, and a request takes only one.
    * @default true
    */
   traceContext?: boolean;
@@ -123,7 +127,11 @@ export function subscribeOutgoingHttp(
     typeof options.propagateTraceId === "function"
       ? options.propagateTraceId(url)
       : options.propagateTraceId !== false;
-  const sendsTraceContext = options.traceContext !== false;
+  // Left to an OpenTelemetry SDK in this process when it propagates W3C
+  // Trace Context - see `openTelemetryWritesTraceparent`. Asked per call: an
+  // SDK may be registered after the application starts.
+  const sendsTraceContext = () =>
+    options.traceContext !== false && !openTelemetryWritesTraceparent();
 
   const open = (
     request: object,
@@ -179,7 +187,7 @@ export function subscribeOutgoingHttp(
       request.addHeader(TRACE_HEADER, trace.traceId);
     }
     if (
-      sendsTraceContext &&
+      sendsTraceContext() &&
       !hasUndiciHeader(request.headers, TRACEPARENT_HEADER)
     ) {
       const span = spans.get(request);
@@ -226,7 +234,7 @@ export function subscribeOutgoingHttp(
       if (!request.getHeader?.(TRACE_HEADER)) {
         request.setHeader?.(TRACE_HEADER, trace.traceId);
       }
-      if (sendsTraceContext && !request.getHeader?.(TRACEPARENT_HEADER)) {
+      if (sendsTraceContext() && !request.getHeader?.(TRACEPARENT_HEADER)) {
         // The span only opens at `start`, by when the header has gone, so
         // its id is minted here - and only for a call that will have one.
         const recorded = recorder.isRecording();

@@ -1,4 +1,4 @@
-import { traceIdFromTraceparent, w3cTraceIdOf } from "./trace-context.util.js";
+import { inboundTraceId, w3cTraceIdOf } from "./trace-context.util.js";
 import { uuidv7 } from "./uuid-v7.util.js";
 
 /**
@@ -25,18 +25,20 @@ export function defaultTraceIdGenerator(req: unknown) {
     // A caller already in an OpenTelemetry trace - a service in another
     // language, a mesh, a load balancer that starts traces - names the trace,
     // so the request is found under the id the rest of it has in that
-    // tracing backend. An `x-request-id` beside it names some other trace
-    // when a mesh or a router stamped it (Envoy and Heroku's router stamp
-    // every request), and gives way. It stays only when it names this same
-    // trace: another service running this agent sends both, and its id may
-    // be one `traceparent` cannot carry - a custom id, or a UUIDv7 whose mint
-    // time the collector reads.
-    const fromTraceparent = traceIdFromTraceparent(headers);
-    if (fromTraceparent) {
+    // tracing backend. So does an OpenTelemetry SDK in this process, which
+    // has already continued or started the trace for the request. An
+    // `x-request-id` beside it names some other trace when a mesh or a
+    // router stamped it (Envoy and Heroku's router stamp every request), and
+    // gives way. It stays only when it names this same trace: another
+    // service running this agent sends both, and its id may be one
+    // `traceparent` cannot carry - a custom id, or a UUIDv7 whose mint time
+    // the collector reads.
+    const fromTraceContext = inboundTraceId(headers);
+    if (fromTraceContext) {
       return requestId !== undefined &&
-        w3cTraceIdOf(requestId) === w3cTraceIdOf(fromTraceparent)
+        w3cTraceIdOf(requestId) === w3cTraceIdOf(fromTraceContext)
         ? requestId
-        : fromTraceparent;
+        : fromTraceContext;
     }
     if (requestId !== undefined) {
       return requestId;

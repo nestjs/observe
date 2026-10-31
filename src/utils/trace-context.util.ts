@@ -1,4 +1,8 @@
 import { createHash, randomBytes } from "crypto";
+import {
+  activeOpenTelemetrySpanContext,
+  OpenTelemetrySpanContext,
+} from "./opentelemetry.util.js";
 
 /**
  * W3C Trace Context (https://www.w3.org/TR/trace-context/): the `traceparent`
@@ -46,6 +50,10 @@ const MAX_TRACE_STATE_LENGTH = 512;
 
 /** Printable ASCII: no control characters, nothing a header cannot carry. */
 const TRACE_STATE_PATTERN = /^[\x20-\x7e]+$/;
+
+/** What a span context's ids must be: lowercase hex, never all zeros. */
+const SPAN_CONTEXT_TRACE_ID_PATTERN = /^(?![0]{32})[0-9a-f]{32}$/;
+const SPAN_CONTEXT_SPAN_ID_PATTERN = /^(?![0]{16})[0-9a-f]{16}$/;
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -138,6 +146,71 @@ export function traceIdFromTraceparent(
 ): string | undefined {
   const traceId = readTraceContext(headers)?.traceId;
   return traceId === undefined ? undefined : toUuid(traceId);
+}
+
+/**
+ * The W3C trace context an operation runs in: the span an OpenTelemetry SDK
+ * in this process opened for it, when one runs, else the `traceparent` it
+ * arrived with.
+ *
+ * The SDK's span first, because the SDK has already decided the trace: it
+ * continued the caller's, through whichever propagator it was given, or
+ * started one when there was nothing to continue. Taking that decision is
+ * what makes a service running both report one trace id to both, the
+ * service at the root of a trace included.
+ */
+export function inboundTraceContext(
+  headers: Record<string, unknown> | undefined,
+): TraceContext | undefined {
+  return (
+    traceContextOfSpan(activeOpenTelemetrySpanContext()) ??
+    readTraceContext(headers)
+  );
+}
+
+/**
+ * `inboundTraceContext`'s trace id, written as a UUID - as
+ * `traceIdFromTraceparent` writes it.
+ */
+export function inboundTraceId(
+  headers: Record<string, unknown> | undefined,
+): string | undefined {
+  const traceId = inboundTraceContext(headers)?.traceId;
+  return traceId === undefined ? undefined : toUuid(traceId);
+}
+
+/**
+ * An OpenTelemetry span context as the trace context an operation runs in,
+ * the span becoming the operation's parent - or `undefined` for one the spec
+ * would not accept, such as the all-zero context of a span never started.
+ */
+function traceContextOfSpan(
+  spanContext: OpenTelemetrySpanContext | undefined,
+): TraceContext | undefined {
+  if (
+    !spanContext ||
+    typeof spanContext.traceId !== "string" ||
+    typeof spanContext.spanId !== "string" ||
+    !SPAN_CONTEXT_TRACE_ID_PATTERN.test(spanContext.traceId) ||
+    !SPAN_CONTEXT_SPAN_ID_PATTERN.test(spanContext.spanId)
+  ) {
+    return undefined;
+  }
+  const context: TraceContext = {
+    traceId: spanContext.traceId,
+    parentSpanId: spanContext.spanId,
+    sampled: (spanContext.traceFlags & 0x01) === 0x01,
+  };
+  let traceState: string | undefined;
+  try {
+    traceState = fitTraceState(spanContext.traceState?.serialize());
+  } catch {
+    // A trace state that cannot be written out is no trace state.
+  }
+  if (traceState) {
+    context.traceState = traceState;
+  }
+  return context;
 }
 
 /**

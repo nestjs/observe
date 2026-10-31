@@ -7,6 +7,8 @@ import {
   Query,
 } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
+import { propagation } from "@opentelemetry/api";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import {
   createServer,
   IncomingHttpHeaders,
@@ -397,6 +399,42 @@ describe("ObserveModule: W3C trace context", () => {
         expect(call.headers["x-request-id"]).toBeDefined();
         expect(call.headers).not.toHaveProperty("traceparent");
         expect(call.headers).not.toHaveProperty("tracestate");
+      }
+    });
+  });
+
+  describe("beside an OpenTelemetry SDK that propagates W3C trace context", () => {
+    let app: INestApplication;
+    let url = "";
+
+    beforeAll(async () => {
+      // What registering an SDK does to the global API. Its instrumentations
+      // write traceparent on the calls they cover, so the agent writing one
+      // too would put two on a request - see the coexistence suite for the
+      // SDK itself.
+      propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+      ({ app, url } = await bootApp());
+    });
+
+    afterAll(async () => {
+      await app?.close();
+      propagation.disable();
+    });
+
+    it("leaves traceparent to it, and still sends x-request-id", async () => {
+      received.length = 0;
+      const routes = nodeHttpCanPropagate ? ["/fetch", "/node"] : ["/fetch"];
+      for (const route of routes) {
+        await request(url)
+          .get(route)
+          .query({ path: `/beside-sdk${route}` })
+          .expect(200);
+      }
+
+      expect(received).toHaveLength(routes.length);
+      for (const call of received) {
+        expect(call.headers["x-request-id"]).toBeDefined();
+        expect(call.headers).not.toHaveProperty("traceparent");
       }
     });
   });
