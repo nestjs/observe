@@ -6,7 +6,10 @@ import {
   W3CTraceContextPropagator,
 } from "@opentelemetry/core";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
-import { defaultTraceIdGenerator } from "./default-trace-id-generator.util.js";
+import {
+  defaultTraceIdGenerator,
+  openTelemetryTraceIdGenerator,
+} from "./default-trace-id-generator.util.js";
 import {
   activeOpenTelemetrySpanContext,
   openTelemetryWritesTraceparent,
@@ -75,13 +78,26 @@ describe("OpenTelemetry in the same process", () => {
         const { traceId } = span.spanContext();
         const expected = `${traceId.slice(0, 8)}-${traceId.slice(8, 12)}-${traceId.slice(12, 16)}-${traceId.slice(16, 20)}-${traceId.slice(20)}`;
 
-        expect(defaultTraceIdGenerator({ headers: {} })).toBe(expected);
+        expect(openTelemetryTraceIdGenerator({ headers: {} })).toBe(expected);
         // A mesh's request id names no trace the SDK knows, and gives way.
         expect(
-          defaultTraceIdGenerator({
+          openTelemetryTraceIdGenerator({
             headers: { "x-request-id": "6f1a52c4-3d0b-4e8a-9c2f-7b1d0e9a8c34" },
           }),
         ).toBe(expected);
+        span.end();
+      });
+    });
+
+    it("leaves the default generator to x-request-id and UUIDv7, as with openTelemetry off", () => {
+      trace.getTracer("test").startActiveSpan("GET /orders", (span) => {
+        const { traceId } = span.spanContext();
+        const minted = defaultTraceIdGenerator({ headers: {} });
+
+        expect(minted).not.toBe(
+          `${traceId.slice(0, 8)}-${traceId.slice(8, 12)}-${traceId.slice(12, 16)}-${traceId.slice(16, 20)}-${traceId.slice(20)}`,
+        );
+        expect(minted[14]).toBe("7");
         span.end();
       });
     });

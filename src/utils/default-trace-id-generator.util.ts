@@ -16,31 +16,10 @@ export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export function defaultTraceIdGenerator(req: unknown) {
   if (typeof req === "object" && req !== null && "headers" in req) {
-    const headers = (req as { headers: Record<string, unknown> }).headers;
-    const header = headers?.["x-request-id"];
-    const requestId =
-      typeof header === "string" && REQUEST_ID_PATTERN.test(header)
-        ? header
-        : undefined;
-    // A caller already in an OpenTelemetry trace - a service in another
-    // language, a mesh, a load balancer that starts traces - names the trace,
-    // so the request is found under the id the rest of it has in that
-    // tracing backend. So does an OpenTelemetry SDK in this process, which
-    // has already continued or started the trace for the request. An
-    // `x-request-id` beside it names some other trace when a mesh or a
-    // router stamped it (Envoy and Heroku's router stamp every request), and
-    // gives way. It stays only when it names this same trace: another
-    // service running this agent sends both, and its id may be one
-    // `traceparent` cannot carry - a custom id, or a UUIDv7 whose mint time
-    // the collector reads.
-    const fromTraceContext = inboundTraceId(headers);
-    if (fromTraceContext) {
-      return requestId !== undefined &&
-        w3cTraceIdOf(requestId) === w3cTraceIdOf(fromTraceContext)
-        ? requestId
-        : fromTraceContext;
-    }
-    if (requestId !== undefined) {
+    const requestId = (req as { headers: Record<string, unknown> }).headers[
+      "x-request-id"
+    ];
+    if (typeof requestId === "string" && REQUEST_ID_PATTERN.test(requestId)) {
       return requestId;
     }
   }
@@ -59,4 +38,37 @@ export function defaultTraceIdGenerator(req: unknown) {
   }
   // Minted here, so it can carry its time - see uuidv7.
   return uuidv7();
+}
+
+/**
+ * The default `traceIdGenerator` with `openTelemetry` on.
+ *
+ * A request in a W3C trace is named after that trace, so it has the id the
+ * rest of the trace has in the caller's OpenTelemetry backend: the trace a
+ * caller's `traceparent` names - a service in another language, a mesh, a
+ * load balancer that starts traces - or, when an OpenTelemetry SDK runs in
+ * this process, the one it continued or started for the request (see
+ * `inboundTraceContext`). Anything else is named as `defaultTraceIdGenerator`
+ * names it.
+ *
+ * An `x-request-id` beside the trace names some other one when a mesh or a
+ * router stamped it (Envoy and Heroku's router stamp every request), and gives
+ * way. It stays only when it names this same trace: another service running
+ * this agent sends both, and its id may be one `traceparent` cannot carry - a
+ * custom id, or a UUIDv7 whose mint time the collector reads.
+ */
+export function openTelemetryTraceIdGenerator(req: unknown) {
+  if (typeof req === "object" && req !== null && "headers" in req) {
+    const headers = (req as { headers: Record<string, unknown> }).headers;
+    const fromTraceContext = inboundTraceId(headers);
+    if (fromTraceContext) {
+      const requestId = headers?.["x-request-id"];
+      return typeof requestId === "string" &&
+        REQUEST_ID_PATTERN.test(requestId) &&
+        w3cTraceIdOf(requestId) === w3cTraceIdOf(fromTraceContext)
+        ? requestId
+        : fromTraceContext;
+    }
+  }
+  return defaultTraceIdGenerator(req);
 }

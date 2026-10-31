@@ -137,6 +137,7 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     }
 
     if (outgoing?.http !== false) {
+      const http = typeof outgoing?.http === "object" ? outgoing.http : {};
       this.unsubscribeHttp = subscribeOutgoingHttp(
         recorder,
         () => {
@@ -150,7 +151,12 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
             | undefined;
           return { traceId, traceContext };
         },
-        typeof outgoing?.http === "object" ? outgoing.http : {},
+        {
+          ...http,
+          // W3C Trace Context goes out only with `openTelemetry` on.
+          traceContext:
+            this.options.openTelemetry === true && http.traceContext !== false,
+        },
         () => operationTraceRegistry.getRedactor(),
       );
       // Model calls are read off the spans above, so they go with them.

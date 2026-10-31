@@ -72,18 +72,18 @@ export interface CreateObserveModuleOptions {
    * If not provided, a default trace ID generator will be used.
    * For HTTP protocols, the request object is passed to the function.
    * For non-HTTP protocols, the request object will be contextual and may not be available.
-   * The default implementation uses the trace id of a W3C `traceparent`
-   * header, written as a UUID, so the request has the id its trace has in
-   * the caller's OpenTelemetry backend. An 'x-request-id' header is used
-   * instead when it names that same trace - what another service running
-   * this agent sends - or when no `traceparent` came. With neither, it mints
-   * a time-ordered UUID (version 7) - an id the collector can locate in time
-   * without a scan.
+   * The default implementation uses the 'x-request-id' header if available,
+   * or mints a time-ordered UUID (version 7) if not - an id the collector can
+   * locate in time without a scan.
    *
-   * Whatever this returns, a valid `traceparent` is still read alongside it:
-   * outbound calls carry that W3C trace on, so the request stays in the
-   * OpenTelemetry trace its caller is in.
-   * @default (req) => traceparentTraceId(req) || req.headers['x-request-id'] || uuidv7()
+   * With `openTelemetry` on, the default names a request in a W3C trace after
+   * that trace instead: the trace id of its `traceparent`, written as a UUID,
+   * or of the span an OpenTelemetry SDK in the same process opened for it.
+   * An 'x-request-id' that names the same trace is kept. Whatever this
+   * returns, the W3C trace is then still read alongside it: outbound calls
+   * carry it on, so the request stays in the OpenTelemetry trace its caller
+   * is in.
+   * @default (req) => req.headers['x-request-id'] || uuidv7()
    */
   traceIdGenerator?: (req: unknown) => string;
 
@@ -682,6 +682,29 @@ export interface ObserveOptions {
      */
     getUserId?: (call: any) => string;
   };
+  /**
+   * Interoperates with OpenTelemetry. Off by default, and off, the agent
+   * reads and sends `x-request-id` alone, as it always has.
+   *
+   * On:
+   * - A request that arrives in a W3C trace (`traceparent`) is reported under
+   *   that trace's id, written as a UUID, so it has the id the rest of the
+   *   trace has in the caller's OpenTelemetry backend. An `x-request-id` is
+   *   kept when it names the same trace, which is what another service
+   *   running the agent sends.
+   * - Outbound `fetch` and `node:http` calls carry a `traceparent` beside
+   *   `x-request-id` - see `outgoing.http.traceContext`.
+   * - With an OpenTelemetry SDK running in the same process - or an SDK
+   *   built on it, as Sentry's Node SDK is from version 8 - a request is
+   *   reported under the trace of the server span the SDK opened for it, the
+   *   request that starts a trace included, and `traceparent` on outbound
+   *   calls is left to the SDK.
+   *
+   * A `traceIdGenerator` passed to `createObserveModule()` still names the
+   * trace; the W3C one is carried on beside it.
+   * @default false
+   */
+  openTelemetry?: boolean;
   /**
    * Spans for what leaves the process: database queries (`pg`, `mysql2`, `mssql`,
    * `mongodb` - and so every ORM built on them) and outbound HTTP requests

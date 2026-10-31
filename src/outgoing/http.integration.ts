@@ -42,7 +42,9 @@ export interface OutgoingHttpOptions {
    * while an OpenTelemetry SDK that propagates W3C Trace Context runs in the
    * same process: its instrumentations write the header on the calls they
    * cover, and a request takes only one.
-   * @default true
+   *
+   * Only with `openTelemetry` on; without it, no `traceparent` is sent.
+   * @default true, with `openTelemetry` on
    */
   traceContext?: boolean;
 }
@@ -127,11 +129,12 @@ export function subscribeOutgoingHttp(
     typeof options.propagateTraceId === "function"
       ? options.propagateTraceId(url)
       : options.propagateTraceId !== false;
-  // Left to an OpenTelemetry SDK in this process when it propagates W3C
-  // Trace Context - see `openTelemetryWritesTraceparent`. Asked per call: an
-  // SDK may be registered after the application starts.
+  // Only when asked for, and then left to an OpenTelemetry SDK in this
+  // process when it propagates W3C Trace Context - see
+  // `openTelemetryWritesTraceparent`. Asked per call: an SDK may be
+  // registered after the application starts.
   const sendsTraceContext = () =>
-    options.traceContext !== false && !openTelemetryWritesTraceparent();
+    options.traceContext === true && !openTelemetryWritesTraceparent();
 
   const open = (
     request: object,

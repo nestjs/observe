@@ -93,7 +93,11 @@ async function bootApp(overrides: Partial<ObserveOptions> = {}) {
   const { ObserveModule, ObserveInstrument } = createObserveModule();
 
   @Module({
-    imports: [ObserveModule.forRoot(testObserveOptions(overrides))],
+    imports: [
+      ObserveModule.forRoot(
+        testObserveOptions({ openTelemetry: true, ...overrides }),
+      ),
+    ],
     controllers: [CallerController],
     providers: [CallerService],
   })
@@ -149,7 +153,7 @@ describe("ObserveModule: W3C trace context", () => {
     return call;
   };
 
-  describe("with the defaults", () => {
+  describe("with openTelemetry on", () => {
     let app: INestApplication;
     let url = "";
     let collected: CollectedSnapshots;
@@ -403,6 +407,75 @@ describe("ObserveModule: W3C trace context", () => {
     });
   });
 
+  describe("with openTelemetry off, the default", () => {
+    let app: INestApplication;
+    let url = "";
+    let collected: CollectedSnapshots;
+
+    beforeAll(async () => {
+      ({ app, collected, url } = await bootApp({ openTelemetry: undefined }));
+    });
+
+    afterAll(async () => {
+      await app?.close();
+    });
+
+    beforeEach(() => {
+      collected.clear();
+      received.length = 0;
+    });
+
+    const snapshotFor = (path: string) =>
+      waitForSnapshot(collected, (item) =>
+        decodeURIComponent(item.attributes?.originalUrl ?? "").includes(
+          `path=${path}`,
+        ),
+      );
+
+    it("names a request in a W3C trace as before, by a UUIDv7 of its own", async () => {
+      await request(url)
+        .get("/fetch")
+        .query({ path: "/off-joined" })
+        .set("traceparent", TRACEPARENT)
+        .expect(200);
+
+      const snapshot = await snapshotFor("/off-joined");
+
+      expect(snapshot.traceId).not.toBe("4bf92f35-77b3-4da6-a3ce-929d0e0e4736");
+      expect(snapshot.traceId[14]).toBe("7");
+    });
+
+    it("keeps x-request-id as the trace id when a traceparent comes beside it", async () => {
+      await request(url)
+        .get("/fetch")
+        .query({ path: "/off-both" })
+        .set("x-request-id", "proxy-request-1")
+        .set("traceparent", TRACEPARENT)
+        .expect(200);
+
+      expect((await snapshotFor("/off-both")).traceId).toBe("proxy-request-1");
+    });
+
+    it("sends x-request-id alone on calls out", async () => {
+      const routes = nodeHttpCanPropagate ? ["/fetch", "/node"] : ["/fetch"];
+      for (const route of routes) {
+        await request(url)
+          .get(route)
+          .query({ path: `/off${route}` })
+          .set("traceparent", TRACEPARENT)
+          .set("tracestate", "vendor=abc")
+          .expect(200);
+      }
+
+      expect(received).toHaveLength(routes.length);
+      for (const call of received) {
+        expect(call.headers["x-request-id"]).toBeDefined();
+        expect(call.headers).not.toHaveProperty("traceparent");
+        expect(call.headers).not.toHaveProperty("tracestate");
+      }
+    });
+  });
+
   describe("beside an OpenTelemetry SDK that propagates W3C trace context", () => {
     let app: INestApplication;
     let url = "";
@@ -508,7 +581,9 @@ describe("ObserveModule: a trace through a hop that only passes traceparent on",
 
   @Module({
     imports: [
-      front.ObserveModule.forRoot(testObserveOptions({ serviceId: "front" })),
+      front.ObserveModule.forRoot(
+        testObserveOptions({ serviceId: "front", openTelemetry: true }),
+      ),
     ],
     controllers: [FrontController],
   })
@@ -516,7 +591,9 @@ describe("ObserveModule: a trace through a hop that only passes traceparent on",
 
   @Module({
     imports: [
-      back.ObserveModule.forRoot(testObserveOptions({ serviceId: "back" })),
+      back.ObserveModule.forRoot(
+        testObserveOptions({ serviceId: "back", openTelemetry: true }),
+      ),
     ],
     controllers: [BackController],
   })

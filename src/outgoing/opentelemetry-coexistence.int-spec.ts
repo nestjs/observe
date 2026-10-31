@@ -143,10 +143,15 @@ afterAll(async () => {
   await shutdownOpenTelemetry();
 });
 
-/** Each HTTP adapter Nest ships, `undefined` being Express, the default. */
-const adapters: Array<[string, () => FastifyAdapter | undefined]> = [
-  ["Express", () => undefined],
-  ["Fastify", () => new FastifyAdapter()],
+/**
+ * Each HTTP adapter Nest ships, `undefined` being Express, the default - and
+ * once more with `openTelemetry` left off, where the agent must not notice
+ * the SDK at all.
+ */
+const suites: Array<[string, () => FastifyAdapter | undefined, boolean]> = [
+  ["Express", () => undefined, true],
+  ["Fastify", () => new FastifyAdapter(), true],
+  ["Express, with openTelemetry off", () => undefined, false],
 ];
 
 /**
@@ -156,9 +161,9 @@ const adapters: Array<[string, () => FastifyAdapter | undefined]> = [
  * trace: one trace id for a request in both tools, and one `traceparent` on
  * every call out, the SDK's.
  */
-describe.each(adapters)(
+describe.each(suites)(
   "ObserveModule beside the OpenTelemetry Node SDK, on %s",
-  (_, adapter) => {
+  (_, adapter, openTelemetry) => {
     let app: INestApplication;
     let url = "";
     let collected: CollectedSnapshots;
@@ -183,7 +188,7 @@ describe.each(adapters)(
       const { ObserveModule, ObserveInstrument } = createObserveModule();
 
       @Module({
-        imports: [ObserveModule.forRoot(testObserveOptions())],
+        imports: [ObserveModule.forRoot(testObserveOptions({ openTelemetry }))],
         controllers: [OrdersController],
         providers: [OrdersService],
       })
@@ -270,6 +275,46 @@ describe.each(adapters)(
         (value, index) =>
           index % 2 === 0 && value.toLowerCase() === "traceparent",
       ).length;
+
+    if (!openTelemetry) {
+      it("names requests by a UUIDv7 of its own, as before, whatever trace the SDK is in", async () => {
+        expect(await call("/orders/off-root")).toBe(200);
+        expect(
+          await call("/orders/off-joined", { traceparent: TRACEPARENT }),
+        ).toBe(200);
+
+        const root = await snapshotFor("/orders/off-root");
+        const joined = await snapshotFor("/orders/off-joined");
+        const server = await serverSpanFor("/orders/off-root");
+
+        expect(root.traceId[14]).toBe("7");
+        expect(root.traceId).not.toBe(asUuid(server.spanContext().traceId));
+        expect(joined.traceId[14]).toBe("7");
+        expect(joined.traceId).not.toBe(asUuid(TRACE_ID));
+      });
+
+      it("sends its own x-request-id on calls out, and only the SDK's traceparent", async () => {
+        expect(await call("/fetch/off-out")).toBe(200);
+
+        const snapshot = await snapshotFor("/fetch/off-out");
+        const server = await serverSpanFor("/fetch/off-out");
+        const outbound = callTo("/off-out");
+        const traceContext = readTraceContext(outbound.headers);
+
+        expect(outbound.headers["x-request-id"]).toBe(snapshot.traceId);
+        expect(traceparentsOf(outbound.rawHeaders)).toBe(1);
+        // The SDK's own, as it would be without the agent there at all.
+        expect(traceContext?.traceId).toBe(server.spanContext().traceId);
+        expect(
+          spansInTrace(server.spanContext().traceId).some(
+            (span) =>
+              span.kind === SpanKind.CLIENT &&
+              span.spanContext().spanId === traceContext?.parentSpanId,
+          ),
+        ).toBe(true);
+      });
+      return;
+    }
 
     it("reports a request that starts a trace under the trace id the SDK gave it", async () => {
       expect(await call("/orders/root")).toBe(200);

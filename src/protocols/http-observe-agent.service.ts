@@ -180,15 +180,18 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
 
-      // Read whatever produced the trace id: a `traceIdGenerator` of the
-      // application's own decides what Observe calls the trace, not which
-      // OpenTelemetry trace the caller is in, and outbound calls carry that
-      // one on either way - for an unrecorded request too, so the trace does
-      // not break here. An OpenTelemetry SDK in this process has the say on
-      // which trace that is, when one runs - see `inboundTraceContext`.
-      const traceContext = inboundTraceContext(req.headers);
-      if (traceContext) {
-        store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
+      // With `openTelemetry` on, read whatever produced the trace id: a
+      // `traceIdGenerator` of the application's own decides what Observe
+      // calls the trace, not which OpenTelemetry trace the caller is in, and
+      // outbound calls carry that one on either way - for an unrecorded
+      // request too, so the trace does not break here. An OpenTelemetry SDK
+      // in this process has the say on which trace that is, when one runs -
+      // see `inboundTraceContext`.
+      if (this.options.openTelemetry === true) {
+        const traceContext = inboundTraceContext(req.headers);
+        if (traceContext) {
+          store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
+        }
       }
 
       setAttributesSafely(
