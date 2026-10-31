@@ -43,16 +43,16 @@ unreachable collector never holds a request up. Recording it does cost the
 request path a microsecond or two per traced call - [Overhead](#overhead) has
 the numbers.
 
-### Why not just OpenTelemetry?
+### Observe and OpenTelemetry
 
-OpenTelemetry is the right answer when you need vendor neutrality across a
-polyglot estate, and this agent is not a replacement for it. It is a different
-trade: no collector to run, no exporter pipeline to configure, no manual
-instrumentation for the framework's own lifecycle — and spans named after your
-Nest classes and methods, which generic Node.js instrumentation cannot produce
-because it cannot see them. If you would otherwise spend a week wiring a
-collector and still not know which provider spent the time, this is the
-shortcut.
+OpenTelemetry is the vendor-neutral standard across a polyglot estate, and
+this agent isn't a replacement for it: it works on its own, or beside the
+OpenTelemetry you already have. What it brings to a Nest service is no
+collector to run, no exporter pipeline to configure, no manual instrumentation
+for the framework's own lifecycle — and spans named after your Nest classes
+and methods, which generic Node.js instrumentation cannot produce because it
+cannot see them. If you would otherwise spend a week wiring a collector and
+still not know which provider spent the time, this is the shortcut.
 
 It also runs beside OpenTelemetry, with `openTelemetry: true`. The agent then
 continues and sends W3C `traceparent`, so a trace that runs through services
@@ -537,7 +537,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `forwardLogs`            | `false`                             | Sends the application's log lines, each correlated to the trace it was written in - see [Logs](https://www.observe.nestjs.com/documentation/sdk#logs).                                           |
 | `redaction`              | on                                  | How log lines, error messages and captured requests are scrubbed before they leave the process: `enabled`, `useDefaultPatterns`, `patterns`, `keys` and `replacement`.                           |
 | `outgoing`               | on                                  | Query and outbound-HTTP spans. `false` turns both off; `{ database: false }` or `{ http: false }` one of them. `{ http: { propagateTraceId, traceContext } }` tunes the `x-request-id` and `traceparent` headers outbound calls carry - `traceparent` only with `openTelemetry`. |
-| `openTelemetry`          | `false`                             | Continues and sends W3C `traceparent`, names a request after the W3C trace it is in, and follows an OpenTelemetry SDK running in the same process - see [Why not just OpenTelemetry?](#why-not-just-opentelemetry). Works only while the agent is reporting to NestJS Observe. Off, the agent reads and sends `x-request-id` alone. |
+| `openTelemetry`          | `false`                             | Continues and sends W3C `traceparent`, names a request after the W3C trace it is in, and follows an OpenTelemetry SDK running in the same process - see [Observe and OpenTelemetry](#observe-and-opentelemetry). Works only while the agent is reporting to NestJS Observe. Off, the agent reads and sends `x-request-id` alone. |
 | `http`                   |                                     | `ignore`, `tags`, `setAttributes`, `getUserId`, `queryParamsObfuscateRegex`, `tracePreflights` and `capture` - see [Capturing failed and slow requests](#capturing-failed-and-slow-requests).    |
 | `rpc`, `grpc`            |                                     | `ignore`, `tags`, `setAttributes` and `getUserId` for microservice and gRPC handlers.                                                                                                             |
 | `graphql`                |                                     | The same four, once per GraphQL operation.                                                                                                                                                        |
