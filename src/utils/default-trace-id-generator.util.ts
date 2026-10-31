@@ -1,4 +1,4 @@
-import { traceIdFromTraceparent } from "./trace-context.util.js";
+import { traceIdFromTraceparent, w3cTraceIdOf } from "./trace-context.util.js";
 import { uuidv7 } from "./uuid-v7.util.js";
 
 /**
@@ -17,18 +17,29 @@ export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 export function defaultTraceIdGenerator(req: unknown) {
   if (typeof req === "object" && req !== null && "headers" in req) {
     const headers = (req as { headers: Record<string, unknown> }).headers;
-    const requestId = headers?.["x-request-id"];
-    if (typeof requestId === "string" && REQUEST_ID_PATTERN.test(requestId)) {
-      return requestId;
-    }
+    const header = headers?.["x-request-id"];
+    const requestId =
+      typeof header === "string" && REQUEST_ID_PATTERN.test(header)
+        ? header
+        : undefined;
     // A caller already in an OpenTelemetry trace - a service in another
-    // language, a mesh, a load balancer that starts traces - so the request
-    // joins it. After `x-request-id`, because another service running this
-    // agent sends both, and its id may be one `traceparent` cannot carry:
-    // anything that is not 128 bits of hex.
+    // language, a mesh, a load balancer that starts traces - names the trace,
+    // so the request is found under the id the rest of it has in that
+    // tracing backend. An `x-request-id` beside it names some other trace
+    // when a mesh or a router stamped it (Envoy and Heroku's router stamp
+    // every request), and gives way. It stays only when it names this same
+    // trace: another service running this agent sends both, and its id may
+    // be one `traceparent` cannot carry - a custom id, or a UUIDv7 whose mint
+    // time the collector reads.
     const fromTraceparent = traceIdFromTraceparent(headers);
     if (fromTraceparent) {
-      return fromTraceparent;
+      return requestId !== undefined &&
+        w3cTraceIdOf(requestId) === w3cTraceIdOf(fromTraceparent)
+        ? requestId
+        : fromTraceparent;
+    }
+    if (requestId !== undefined) {
+      return requestId;
     }
   }
   // A microservice context, on a transport whose packets carry metadata: the

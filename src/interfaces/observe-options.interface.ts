@@ -72,15 +72,18 @@ export interface CreateObserveModuleOptions {
    * If not provided, a default trace ID generator will be used.
    * For HTTP protocols, the request object is passed to the function.
    * For non-HTTP protocols, the request object will be contextual and may not be available.
-   * The default implementation uses the 'x-request-id' header if available,
-   * else the trace id of a W3C `traceparent` header, written as a UUID, or
-   * mints a time-ordered UUID (version 7) if neither is present - an id the
-   * collector can locate in time without a scan.
+   * The default implementation uses the trace id of a W3C `traceparent`
+   * header, written as a UUID, so the request has the id its trace has in
+   * the caller's OpenTelemetry backend. An 'x-request-id' header is used
+   * instead when it names that same trace - what another service running
+   * this agent sends - or when no `traceparent` came. With neither, it mints
+   * a time-ordered UUID (version 7) - an id the collector can locate in time
+   * without a scan.
    *
    * Whatever this returns, a valid `traceparent` is still read alongside it:
    * outbound calls carry that W3C trace on, so the request stays in the
    * OpenTelemetry trace its caller is in.
-   * @default (req) => req.headers['x-request-id'] || traceparentTraceId(req) || uuidv7()
+   * @default (req) => traceparentTraceId(req) || req.headers['x-request-id'] || uuidv7()
    */
   traceIdGenerator?: (req: unknown) => string;
 

@@ -199,10 +199,10 @@ describe("ObserveModule: W3C trace context", () => {
       });
     });
 
-    it("keeps x-request-id as the trace id and the traceparent's trace for W3C, when both arrive", async () => {
-      // A proxy setting x-request-id in front of a caller already in an
-      // OpenTelemetry trace: Observe keeps the id it always did, and the
-      // OpenTelemetry trace still runs through this service unbroken.
+    it("lets the traceparent name the trace over a proxy's x-request-id, and sends that id on", async () => {
+      // A mesh setting x-request-id in front of a caller already in an
+      // OpenTelemetry trace: the request is reported under the id the trace
+      // has in the caller's backend, and both headers name it from here on.
       await request(url)
         .get("/fetch")
         .query({ path: "/both" })
@@ -213,9 +213,32 @@ describe("ObserveModule: W3C trace context", () => {
       const snapshot = await snapshotFor("/both");
       const call = callTo("/both");
 
-      expect(snapshot.traceId).toBe("proxy-request-1");
-      expect(call.headers["x-request-id"]).toBe("proxy-request-1");
+      expect(snapshot.traceId).toBe("4bf92f35-77b3-4da6-a3ce-929d0e0e4736");
+      expect(call.headers["x-request-id"]).toBe(snapshot.traceId);
       expect(readTraceContext(call.headers)?.traceId).toBe(TRACE_ID);
+    });
+
+    it("keeps an x-request-id that names the traceparent's own trace", async () => {
+      // What another service running the agent sends for a custom id: the
+      // id itself, and a traceparent carrying the trace id derived from it.
+      await request(url)
+        .get("/fetch")
+        .query({ path: "/same-trace" })
+        .set("x-request-id", "req_8f2c")
+        .set(
+          "traceparent",
+          `00-${w3cTraceIdOf("req_8f2c")}-${CALLER_SPAN_ID}-01`,
+        )
+        .expect(200);
+
+      const snapshot = await snapshotFor("/same-trace");
+      const call = callTo("/same-trace");
+
+      expect(snapshot.traceId).toBe("req_8f2c");
+      expect(call.headers["x-request-id"]).toBe("req_8f2c");
+      expect(readTraceContext(call.headers)?.traceId).toBe(
+        w3cTraceIdOf("req_8f2c"),
+      );
     });
 
     it("starts a W3C trace of its own from the trace id it minted", async () => {
