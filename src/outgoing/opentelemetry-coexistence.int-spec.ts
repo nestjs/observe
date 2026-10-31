@@ -28,6 +28,7 @@ import {
   CollectedSnapshots,
   collectSnapshots,
   listenOnLoopback,
+  markIngesting,
   testObserveOptions,
   waitFor,
   waitForSnapshot,
@@ -200,6 +201,9 @@ describe.each(suites)(
         ? await NestFactory.create(OrdersModule, httpAdapter, options)
         : await NestFactory.create(OrdersModule, options);
       collected = collectSnapshots(app);
+      // As though the collector had taken a first batch, which interop
+      // waits for - with the option off too, which must not care.
+      markIngesting(app);
       url = await listenOnLoopback(app);
       if (postgresReachable) {
         // After the app: the agent patches the driver as it starts.

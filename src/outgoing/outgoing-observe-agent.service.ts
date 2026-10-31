@@ -3,8 +3,10 @@ import {
   Injectable,
   Logger,
   OnApplicationShutdown,
+  Optional,
 } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
+import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { OBSERVE_OPTIONS, TRACE_CONTEXT_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
@@ -102,6 +104,13 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     private readonly options: ObserveModuleOptionsWithDefaults,
     operationTraceRegistry: OperationTraceRegistry,
     asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
+    /**
+     * Says whether the collector takes this app's telemetry, which W3C Trace
+     * Context waits on. Absent only where a test builds the service by hand,
+     * and interop then stays off.
+     */
+    @Optional()
+    private readonly observeAgentSharedBuffer?: ObserveAgentSharedBuffer,
   ) {
     const outgoing = this.options.outgoing;
     // `forRoot` has given `fetch` back already; `forRootAsync` options are
@@ -151,13 +160,15 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
             | undefined;
           return { traceId, traceContext };
         },
-        {
-          ...http,
-          // W3C Trace Context goes out only with `openTelemetry` on.
-          traceContext:
-            this.options.openTelemetry === true && http.traceContext !== false,
-        },
+        http,
         () => operationTraceRegistry.getRedactor(),
+        // W3C Trace Context goes out only with `openTelemetry` on, and only
+        // while the collector takes this app's telemetry - see
+        // `ObserveAgentSharedBuffer.isIngesting`.
+        () =>
+          this.options.openTelemetry === true &&
+          http.traceContext !== false &&
+          this.observeAgentSharedBuffer?.isIngesting() === true,
       );
       // Model calls are read off the spans above, so they go with them.
       if (outgoing?.llm !== false) {

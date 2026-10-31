@@ -1,8 +1,4 @@
-import {
-  Logger,
-  type FactoryProvider,
-  type ValueProvider,
-} from "@nestjs/common";
+import { Logger, type FactoryProvider } from "@nestjs/common";
 import type {
   ObserveOptions,
   ObserveOptionsFactory,
@@ -13,10 +9,6 @@ import { OBSERVE_OPTIONS } from "./observe.constants.js";
 import { DEFAULT_SPAN_COLLAPSE } from "./services/collapse-repeated-spans.util.js";
 import { OperationTraceRegistry } from "./services/operation-trace.registry.js";
 import { fitToLength } from "./utils/fit-to-length.util.js";
-import {
-  defaultTraceIdGenerator,
-  openTelemetryTraceIdGenerator,
-} from "./utils/default-trace-id-generator.util.js";
 import { LogRedactor } from "./utils/log-redactor.js";
 
 /**
@@ -316,76 +308,6 @@ describe("createObserveModule#forRootAsync", () => {
  * boot a real module for each configuration shape and read the settings back
  * off the instance the container resolved.
  */
-/**
- * `openTelemetry` decides which default names a trace. Off, the options come
- * out of both `forRoot` and `forRootAsync` exactly as they always did.
- */
-describe("createObserveModule#openTelemetry wiring", () => {
-  const observeOptions = (overrides: Partial<ObserveOptions> = {}) =>
-    ({
-      appKey: "key",
-      appSecret: "secret",
-      serviceId: "svc",
-      ...overrides,
-    }) as ObserveOptions;
-
-  const generatorOf = (options: unknown) =>
-    (options as { traceIdGenerator?: unknown }).traceIdGenerator;
-
-  const fromForRoot = (
-    module: ReturnType<typeof createObserveModule>["ObserveModule"],
-    options: ObserveOptions,
-  ) =>
-    generatorOf(
-      (module.forRoot(options).providers![0] as ValueProvider).useValue,
-    );
-
-  const fromForRootAsync = async (
-    module: ReturnType<typeof createObserveModule>["ObserveModule"],
-    options: ObserveOptions,
-  ) => {
-    const [provider] = module.createAsyncProviders({
-      useFactory: () => options,
-    });
-    return generatorOf(await (provider as FactoryProvider).useFactory());
-  };
-
-  it("keeps the default trace id generator with the option off", async () => {
-    const { ObserveModule } = createObserveModule();
-
-    expect(fromForRoot(ObserveModule, observeOptions())).toBe(
-      defaultTraceIdGenerator,
-    );
-    expect(
-      fromForRoot(ObserveModule, observeOptions({ openTelemetry: false })),
-    ).toBe(defaultTraceIdGenerator);
-    await expect(
-      fromForRootAsync(ObserveModule, observeOptions()),
-    ).resolves.toBe(defaultTraceIdGenerator);
-  });
-
-  it("names traces after their W3C trace with the option on", async () => {
-    const { ObserveModule } = createObserveModule();
-    const options = observeOptions({ openTelemetry: true });
-
-    expect(fromForRoot(ObserveModule, options)).toBe(
-      openTelemetryTraceIdGenerator,
-    );
-    await expect(fromForRootAsync(ObserveModule, options)).resolves.toBe(
-      openTelemetryTraceIdGenerator,
-    );
-  });
-
-  it("leaves a generator the application passed alone", async () => {
-    const own = () => "own-trace-id";
-    const { ObserveModule } = createObserveModule({ traceIdGenerator: own });
-    const options = observeOptions({ openTelemetry: true });
-
-    expect(fromForRoot(ObserveModule, options)).toBe(own);
-    await expect(fromForRootAsync(ObserveModule, options)).resolves.toBe(own);
-  });
-});
-
 describe("createObserveModule#spanCollapse wiring", () => {
   const credentials = { appKey: "key", appSecret: "secret", serviceId: "svc" };
 

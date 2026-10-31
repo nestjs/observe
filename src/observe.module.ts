@@ -49,10 +49,8 @@ import { TraceSamplerService } from "./services/trace-sampler.service.js";
 import { TracerService } from "./services/tracer.service.js";
 import { KeyOf } from "./types/key-of.type.js";
 import { assertModuleOptions } from "./utils/assert-module-options.util.js";
-import {
-  defaultTraceIdGenerator,
-  openTelemetryTraceIdGenerator,
-} from "./utils/default-trace-id-generator.util.js";
+import { defaultTraceIdGenerator } from "./utils/default-trace-id-generator.util.js";
+import { recordTraceIdGeneratorOrigin } from "./utils/trace-id-generator-origin.util.js";
 import {
   fitServiceVersion,
   MAX_SERVICE_VERSION_LENGTH,
@@ -120,25 +118,6 @@ function credentialFromEnv(
     : value;
 }
 
-/**
- * With `openTelemetry` on, the default `traceIdGenerator` is the one that
- * names a request after the W3C trace it is in - see
- * `openTelemetryTraceIdGenerator`. A generator the application passed to
- * `createObserveModule()` is left as it is, and so is everything with the
- * option off.
- */
-function withOpenTelemetryTraceIds<
-  Options extends {
-    openTelemetry?: boolean;
-    traceIdGenerator?: (req: unknown) => string;
-  },
->(options: Options): Options {
-  return options.openTelemetry === true &&
-    options.traceIdGenerator === defaultTraceIdGenerator
-    ? { ...options, traceIdGenerator: openTelemetryTraceIdGenerator }
-    : options;
-}
-
 function withCredentialsFromEnv<
   Options extends Pick<ObserveOptions, "appKey" | "appSecret">,
 >(options: Options): Options {
@@ -197,6 +176,8 @@ export function createObserveModule<Store extends Record<string, unknown>>(
   options.traceIdKey ??= "traceId";
   options.attachTraceIdToLogs ??= true;
   options.traceIdGenerator ??= defaultTraceIdGenerator;
+  // While the options are a plain object - see the function.
+  recordTraceIdGeneratorOrigin(options);
   options.skipInstrumentation ??= () => false;
 
   // Inert until the agent starts with `outgoing.llm` on - see the function.
@@ -307,12 +288,10 @@ export function createObserveModule<Store extends Record<string, unknown>>(
             provide: OBSERVE_OPTIONS,
             useValue: withServiceVersion(
               withServiceId(
-                withCredentialsFromEnv(
-                  withOpenTelemetryTraceIds({
-                    ...options,
-                    ...observeOpts,
-                  }),
-                ),
+                withCredentialsFromEnv({
+                  ...options,
+                  ...observeOpts,
+                }),
               ),
             ),
           },
@@ -362,12 +341,10 @@ export function createObserveModule<Store extends Record<string, unknown>>(
             const opts = await useFactory(...args);
             return withServiceVersion(
               withServiceId(
-                withCredentialsFromEnv(
-                  withOpenTelemetryTraceIds({
-                    ...options,
-                    ...opts,
-                  }),
-                ),
+                withCredentialsFromEnv({
+                  ...options,
+                  ...opts,
+                }),
               ),
             );
           },
@@ -384,12 +361,10 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         useFactory: async (optionsFactory: ObserveOptionsFactory) =>
           withServiceVersion(
             withServiceId(
-              withCredentialsFromEnv(
-                withOpenTelemetryTraceIds({
-                  ...options,
-                  ...(await optionsFactory.createObserveOptions()),
-                }),
-              ),
+              withCredentialsFromEnv({
+                ...options,
+                ...(await optionsFactory.createObserveOptions()),
+              }),
             ),
           ),
         inject: [optionsFactoryToken],

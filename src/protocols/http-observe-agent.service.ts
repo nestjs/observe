@@ -25,6 +25,8 @@ import { OperationTraceRegistry } from "../services/operation-trace.registry.js"
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { redactUrlQuery } from "../utils/redact-url-query.js";
+import { openTelemetryTraceIdGenerator } from "../utils/default-trace-id-generator.util.js";
+import { usesDefaultTraceIdGenerator } from "../utils/trace-id-generator-origin.util.js";
 import { inboundTraceContext } from "../utils/trace-context.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
@@ -164,8 +166,16 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     // identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
     this.asyncLocalStorage.run(store, () => {
+      // OpenTelemetry interop runs only while the collector takes this app's
+      // telemetry - see `ObserveAgentSharedBuffer.isIngesting`. Asked once
+      // per request, so a request is named and carried on one way throughout.
+      const openTelemetry =
+        this.options.openTelemetry === true &&
+        this.observeAgentSharedBuffer.isIngesting();
       const traceId = generateTraceIdSafely(
-        this.options.traceIdGenerator,
+        openTelemetry && usesDefaultTraceIdGenerator(this.options)
+          ? openTelemetryTraceIdGenerator
+          : this.options.traceIdGenerator,
         req,
         this.options,
         this.logger,
@@ -180,14 +190,14 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
 
-      // With `openTelemetry` on, read whatever produced the trace id: a
+      // With OpenTelemetry interop on, read whatever produced the trace id: a
       // `traceIdGenerator` of the application's own decides what Observe
       // calls the trace, not which OpenTelemetry trace the caller is in, and
       // outbound calls carry that one on either way - for an unrecorded
       // request too, so the trace does not break here. An OpenTelemetry SDK
       // in this process has the say on which trace that is, when one runs -
       // see `inboundTraceContext`.
-      if (this.options.openTelemetry === true) {
+      if (openTelemetry) {
         const traceContext = inboundTraceContext(req.headers);
         if (traceContext) {
           store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);

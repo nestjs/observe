@@ -23,6 +23,7 @@ import {
   CollectedSnapshots,
   collectSnapshots,
   listenOnLoopback,
+  markIngesting,
   testObserveOptions,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
@@ -108,6 +109,9 @@ async function bootApp(overrides: Partial<ObserveOptions> = {}) {
     logger: false,
   });
   const collected = collectSnapshots(app);
+  // As though the collector had taken a first batch, which interop waits
+  // for - with the option off too, which must not care.
+  markIngesting(app);
   const url = await listenOnLoopback(app);
   return { app, collected, url };
 }
@@ -605,6 +609,7 @@ describe("ObserveModule: a trace through a hop that only passes traceparent on",
       logger: false,
     });
     backSnapshots = collectSnapshots(backApp);
+    markIngesting(backApp);
     backUrl = await listenOnLoopback(backApp);
 
     hop = createServer((req, res) => {
@@ -630,6 +635,7 @@ describe("ObserveModule: a trace through a hop that only passes traceparent on",
       logger: false,
     });
     frontSnapshots = collectSnapshots(frontApp);
+    markIngesting(frontApp);
     frontUrl = await listenOnLoopback(frontApp);
   });
 

@@ -21,8 +21,11 @@ import { NodeRuntimeMetricsService } from "../services/node-runtime-metrics.serv
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   IngestMode,
+  NOT_INGESTED_GRACE_MS,
+  NotIngestedReason,
   OveragePauseReason,
   parseDegradedMessage,
+  parseNotIngestedMessage,
   parseOveragePauseReason,
   parsePausedMessage,
 } from "./degraded-ingest.protocol.js";
@@ -181,6 +184,13 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       }
     } else {
       this.initializeWorker();
+    }
+
+    if (this.options.openTelemetry === true && this.sendsNothing) {
+      this.logger.warn(
+        "openTelemetry is on, but this agent reports nothing to NestJS Observe, so OpenTelemetry interop stays off: " +
+          "it runs only beside reporting to Observe.",
+      );
     }
 
     this.flushInterval = setInterval(() => this.flush(), flushIntervalTime);
@@ -672,6 +682,10 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
         this.logger.debug("Worker exited on shutdown.");
         return;
       }
+      // Whatever comes next, this worker gets nothing in any more: a
+      // restarted one has to get a batch in again first.
+      this.observeAgentSharedBuffer.recordStopped();
+      this.reportOpenTelemetryInterop("stopped");
       if (code !== 0) {
         this.logger.error(
           `Worker stopped with exit code ${code}. Restarting worker...`,
@@ -690,8 +704,22 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       return;
     }
 
+    const notIngested = parseNotIngestedMessage(msg);
+    if (notIngested !== null) {
+      if (notIngested === "refused") {
+        this.observeAgentSharedBuffer.recordRefused();
+      } else {
+        // After the paused line, when the worker pauses: it posts that first.
+        this.observeAgentSharedBuffer.recordFailed(this.sendsPausedUntil);
+      }
+      this.reportOpenTelemetryInterop(notIngested);
+      return;
+    }
+
     const mode = parseDegradedMessage(msg);
     if (mode !== null) {
+      this.observeAgentSharedBuffer.recordAccepted();
+      this.reportOpenTelemetryInterop();
       this.reportFirstAcceptedBatch();
       this.applyIngestMode(mode, parseOveragePauseReason(msg));
       return;
@@ -705,6 +733,47 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     if (this.options.debug) {
       this.logger.debug(msg);
     }
+  }
+
+  /**
+   * Whether OpenTelemetry interop was last said to be on - see
+   * `reportOpenTelemetryInterop`. It starts off, as the buffer's state does.
+   */
+  private reportedOpenTelemetry = false;
+
+  /**
+   * Says when OpenTelemetry interop turns on or off, with `openTelemetry` on:
+   * it runs only while the collector takes this app's telemetry (see
+   * `ObserveAgentSharedBuffer.isIngesting`), and a `traceparent` that stops
+   * going out with no word would read as a bug in the agent.
+   */
+  private reportOpenTelemetryInterop(
+    why?: NotIngestedReason | "stopped",
+  ): void {
+    if (this.options.openTelemetry !== true) {
+      return;
+    }
+    const on = this.observeAgentSharedBuffer.isIngesting();
+    if (on === this.reportedOpenTelemetry) {
+      return;
+    }
+    this.reportedOpenTelemetry = on;
+    if (on) {
+      this.logger.log(
+        "OpenTelemetry interop is on: the collector is taking this app's telemetry, so traceparent is read and sent.",
+      );
+      return;
+    }
+    const reason =
+      why === "refused"
+        ? "the collector refused this app's credentials"
+        : why === "stopped"
+          ? "the telemetry worker stopped"
+          : `no batch has reached the collector for ${NOT_INGESTED_GRACE_MS / 1000} seconds`;
+    this.logger.warn(
+      `OpenTelemetry interop is paused: ${reason}. It runs only while the agent is reporting to NestJS Observe, ` +
+        `and resumes with the next batch the collector accepts.`,
+    );
   }
 
   /** Whether this process has said the collector accepted its first batch. */
