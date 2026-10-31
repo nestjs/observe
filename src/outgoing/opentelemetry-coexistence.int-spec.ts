@@ -42,6 +42,15 @@ import { readTraceContext } from "../utils/trace-context.util.js";
  */
 const http = createRequire(import.meta.url)("http") as typeof import("http");
 
+/**
+ * `http.client.request.created` - the only `node:http` channel published
+ * while headers can still be set - arrived in Node 22.12. Before it, the
+ * agent adds no header to a `node:http` call, with or without the SDK.
+ */
+const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+const nodeHttpCanPropagate =
+  nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 12);
+
 const PG = {
   host: process.env.PGHOST ?? "127.0.0.1",
   port: Number(process.env.PGPORT ?? 54321),
@@ -366,7 +375,7 @@ describe.each(suites)(
     });
 
     for (const client of ["fetch", "node"] as const) {
-      it(`sends one traceparent on a ${client === "fetch" ? "fetch" : "node:http"} call, the SDK's, beside the agent's x-request-id`, async () => {
+      it(`sends one traceparent on a ${client === "fetch" ? "fetch" : "node:http"} call, the SDK's, and the agent's x-request-id where Node lets it add one`, async () => {
         const path = `/${client}/out-${client}`;
         expect(await call(path)).toBe(200);
 
@@ -386,7 +395,11 @@ describe.each(suites)(
         // The SDK's client span is the parent the callee sees, so the services
         // behind this one nest where the rest of its trace expects them.
         expect(clientSpan).toBeDefined();
-        expect(outbound.headers["x-request-id"]).toBe(snapshot.traceId);
+        if (client === "fetch" || nodeHttpCanPropagate) {
+          expect(outbound.headers["x-request-id"]).toBe(snapshot.traceId);
+        } else {
+          expect(outbound.headers).not.toHaveProperty("x-request-id");
+        }
         expect(snapshot.traceId).toBe(asUuid(traceId));
         expect(
           spansOf(snapshot.traces as CompleteTraceEventNode[], "http"),
