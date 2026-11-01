@@ -18,7 +18,7 @@ import type { ExportedSpan } from "./otlp-receiver.js";
  * where it was produced.
  */
 
-/** What `opentelemetry-service.cjs` answers with, at the end of the line. */
+/** What `traced-service.cjs` answers with, at the end of the line. */
 export interface ReceivedRequest {
   headers: Record<string, string>;
   rawHeaders: string[];

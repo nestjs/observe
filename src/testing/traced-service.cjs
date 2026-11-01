@@ -1,12 +1,13 @@
 "use strict";
 
 /**
- * A Node service instrumented with OpenTelemetry the zero-code way: started
- * with `--require @opentelemetry/auto-instrumentations-node/register` and
- * configured by `OTEL_*` variables alone, as the OpenTelemetry Operator
- * injects it. There is no tracing code here, which is the point - this is
- * what the services around a Nest service run when a team says it already
- * has OpenTelemetry. See `opentelemetry-service.ts`, which starts it.
+ * A Node service instrumented the zero-code way: started with the tracer's
+ * `--require` - `@opentelemetry/auto-instrumentations-node/register`, as the
+ * OpenTelemetry Operator injects it, or `dd-trace/init` - and configured by
+ * environment variables alone. There is no tracing code here, which is the
+ * point - this is what the services around a Nest service run when a team
+ * says it already has OpenTelemetry, or Datadog. See `traced-service.ts`,
+ * which starts it.
  *
  * With `NEXT_URL` set it passes every request on to that service, and
  * `x-request-id` with it, as a mesh's sidecar does. Without, it answers with
