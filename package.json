@@ -125,7 +125,7 @@
     "@as-integrations/express5": "1.1.2",
     "@commitlint/cli": "21.2.4",
     "@commitlint/config-angular": "21.2.4",
-    "@grpc/grpc-js": "1.14.6",
+    "@grpc/grpc-js": "1.14.7",
     "@grpc/proto-loader": "0.8.1",
     "@mikro-orm/core": "7.2.0",
     "@mikro-orm/mysql": "7.2.0",
