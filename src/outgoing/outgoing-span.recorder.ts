@@ -16,6 +16,11 @@ const HOLD_GRACE_MS = 250;
 
 /** A span that has been opened and is waiting to be told how the call went. */
 export interface OpenOutgoingSpan {
+  /**
+   * The span's id, for a call that names its span to the service it calls -
+   * the parent id of an outbound `traceparent`.
+   */
+  readonly spanId: string;
   end(error?: unknown): void;
   /** Adds tags to the span - what the response said, once it has been read. */
   tag?(tags: Tags): void;
@@ -65,6 +70,11 @@ export class OutgoingSpanRecorder {
     className: string,
     methodKey: string,
     tags: Tags,
+    /**
+     * The id to open the span under, minted by a caller that had to name the
+     * span before it could open it. A fresh one otherwise.
+     */
+    presetSpanId?: string,
   ): OpenOutgoingSpan | undefined {
     if (this.covered.getStore()) {
       return undefined;
@@ -81,6 +91,7 @@ export class OutgoingSpanRecorder {
       className,
       methodKey,
       callerId,
+      presetSpanId,
     );
     if (spanId === undefined) {
       return undefined;
@@ -121,6 +132,7 @@ export class OutgoingSpanRecorder {
       }
     };
     return {
+      spanId,
       end: (error?: unknown) => {
         if (ended || deferred) {
           return;

@@ -6,8 +6,11 @@ import {
   DEGRADED_TTL_MS,
   isNotableSnapshot,
   isServerErrorSnapshot,
+  NOT_INGESTED_GRACE_MS,
+  NOT_INGESTED_MESSAGE_PREFIX,
   NOTABLE_DURATION_MS,
   parseDegradedMessage,
+  parseNotIngestedMessage,
   parseOveragePauseReason,
 } from "./degraded-ingest.protocol.js";
 import { ObserveAgentSharedBuffer } from "./observe-agent.shared-buffer.js";
@@ -301,5 +304,111 @@ describe("counting what was withheld", () => {
     expect(countTraceNodes(null)).toBe(0);
     expect(countTraceNodes({})).toBe(0);
     expect(countTraceNodes([])).toBe(0);
+  });
+});
+
+describe("the not-ingested line", () => {
+  it("names a refusal apart from every other failure", () => {
+    expect(
+      parseNotIngestedMessage(`${NOT_INGESTED_MESSAGE_PREFIX}refused`),
+    ).toBe("refused");
+    expect(
+      parseNotIngestedMessage(`${NOT_INGESTED_MESSAGE_PREFIX}failed`),
+    ).toBe("failed");
+  });
+
+  it("is not any other line, nor a value it does not know", () => {
+    expect(
+      parseNotIngestedMessage(`${DEGRADED_MESSAGE_PREFIX}false`),
+    ).toBeNull();
+    expect(
+      parseNotIngestedMessage("Error: Telemetry rejected (401)."),
+    ).toBeNull();
+    expect(
+      parseNotIngestedMessage(`${NOT_INGESTED_MESSAGE_PREFIX}maybe`),
+    ).toBeNull();
+  });
+});
+
+/**
+ * Whether the collector is taking this app's telemetry, which OpenTelemetry
+ * interop runs on: only beside reporting to NestJS Observe.
+ */
+describe("the shared buffer's ingest health", () => {
+  const bufferOf = () =>
+    new ObserveAgentSharedBuffer({
+      serviceId: "svc",
+    } as ObserveModuleOptionsWithDefaults);
+
+  it("starts off, until a first batch gets in", () => {
+    const buffer = bufferOf();
+    expect(buffer.isIngesting()).toBe(false);
+
+    buffer.recordAccepted();
+    expect(buffer.isIngesting()).toBe(true);
+  });
+
+  it("never turns on while every batch fails", () => {
+    const buffer = bufferOf();
+    buffer.recordFailed(0, 1_000);
+    buffer.recordFailed(0, 1_000 + 10 * NOT_INGESTED_GRACE_MS);
+
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("stops at once when the collector refuses the credentials", () => {
+    const buffer = bufferOf();
+    buffer.recordAccepted();
+    buffer.recordRefused();
+
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("stops at once when the worker stops", () => {
+    const buffer = bufferOf();
+    buffer.recordAccepted();
+    buffer.recordStopped();
+
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("rides out failures shorter than the grace, and stops once they last it", () => {
+    const buffer = bufferOf();
+    buffer.recordAccepted();
+
+    buffer.recordFailed(0, 1_000);
+    buffer.recordFailed(0, 1_000 + NOT_INGESTED_GRACE_MS - 1);
+    expect(buffer.isIngesting()).toBe(true);
+
+    buffer.recordFailed(0, 1_000 + NOT_INGESTED_GRACE_MS);
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("stops at once for a pause longer than the grace", () => {
+    // A 429 says when the worker sends again; nothing gets in before then.
+    const buffer = bufferOf();
+    buffer.recordAccepted();
+    buffer.recordFailed(1_000 + NOT_INGESTED_GRACE_MS, 1_000);
+
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("measures the grace from the first failure since the last batch that got in", () => {
+    const buffer = bufferOf();
+    buffer.recordAccepted();
+    buffer.recordFailed(0, 1_000);
+    buffer.recordAccepted();
+    buffer.recordFailed(0, 1_000 + NOT_INGESTED_GRACE_MS);
+
+    expect(buffer.isIngesting()).toBe(true);
+  });
+
+  it("turns back on with the next batch that gets in", () => {
+    const buffer = bufferOf();
+    buffer.recordAccepted();
+    buffer.recordRefused();
+    buffer.recordAccepted();
+
+    expect(buffer.isIngesting()).toBe(true);
   });
 });

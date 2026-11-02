@@ -4,6 +4,7 @@ import {
   IngestMode,
   isNotableSnapshot,
   isServerErrorSnapshot,
+  NOT_INGESTED_GRACE_MS,
 } from "./degraded-ingest.protocol.js";
 import { MAX_BATCH_ITEMS } from "./telemetry-wire-contract.js";
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
@@ -376,6 +377,19 @@ export class ObserveAgentSharedBuffer {
   private errorsOnly = false;
 
   /**
+   * Whether the collector is taking this app's telemetry - see `isIngesting`.
+   * False until it accepts a first batch: what has not been shown to reach
+   * NestJS Observe does not count as reaching it.
+   */
+  private ingesting = false;
+
+  /**
+   * When batches began failing to get in, since the last one that did; zero
+   * while they get in.
+   */
+  private failingSince = 0;
+
+  /**
    * Requests and jobs that errors-only ingest withheld from the batch being
    * built, cleared with it.
    *
@@ -415,6 +429,57 @@ export class ObserveAgentSharedBuffer {
   /** Whether only server errors are being sent, until the same window lapses. */
   isErrorsOnly(): boolean {
     return this.errorsOnly && this.isDegraded();
+  }
+
+  /**
+   * Whether the collector is taking this app's telemetry: from the first
+   * batch it accepts, until it refuses the app's credentials, the worker
+   * stops, or batches have kept failing to get in for
+   * `NOT_INGESTED_GRACE_MS` - and again from the next batch it accepts.
+   *
+   * OpenTelemetry interop runs on it (see `openTelemetry`): the agent reads
+   * and sends `traceparent`, and follows an OpenTelemetry SDK in the process,
+   * only while it is also reporting to NestJS Observe. So an agent that sends
+   * Observe nothing - `enabled: false`, no credentials, credentials the
+   * collector refuses - never turns it on.
+   */
+  isIngesting(): boolean {
+    return this.ingesting;
+  }
+
+  /** The collector accepted a batch, whatever it then kept of it. */
+  recordAccepted(): void {
+    this.ingesting = true;
+    this.failingSince = 0;
+  }
+
+  /** The collector refused the app's credentials. */
+  recordRefused(): void {
+    this.ingesting = false;
+    this.failingSince = 0;
+  }
+
+  /**
+   * A batch did not get in - see `NotIngestedReason`. `pausedUntil` is when a
+   * paused worker sends again: nothing gets in before then, so a pause longer
+   * than the grace ends ingesting at once rather than after it.
+   */
+  recordFailed(pausedUntil = 0, now = Date.now()): void {
+    if (this.failingSince === 0) {
+      this.failingSince = now;
+    }
+    if (
+      Math.max(now, pausedUntil) - this.failingSince >=
+      NOT_INGESTED_GRACE_MS
+    ) {
+      this.ingesting = false;
+    }
+  }
+
+  /** The worker stopped; a restarted one has to get a batch in again. */
+  recordStopped(): void {
+    this.ingesting = false;
+    this.failingSince = 0;
   }
 
   /**

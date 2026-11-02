@@ -3,15 +3,18 @@ import {
   Injectable,
   Logger,
   OnApplicationShutdown,
+  Optional,
 } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
+import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
-import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { OBSERVE_OPTIONS, TRACE_CONTEXT_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   loadAsResolvedBy,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
+import type { TraceContext } from "../utils/trace-context.util.js";
 import { subscribeOutgoingHttp } from "./http.integration.js";
 import {
   activateLlmFetchObserver,
@@ -101,6 +104,13 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     private readonly options: ObserveModuleOptionsWithDefaults,
     operationTraceRegistry: OperationTraceRegistry,
     asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
+    /**
+     * Says whether the collector takes this app's telemetry, which W3C Trace
+     * Context waits on. Absent only where a test builds the service by hand,
+     * and interop then stays off.
+     */
+    @Optional()
+    private readonly observeAgentSharedBuffer?: ObserveAgentSharedBuffer,
   ) {
     const outgoing = this.options.outgoing;
     // `forRoot` has given `fetch` back already; `forRootAsync` options are
@@ -136,16 +146,29 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     }
 
     if (outgoing?.http !== false) {
+      const http = typeof outgoing?.http === "object" ? outgoing.http : {};
       this.unsubscribeHttp = subscribeOutgoingHttp(
         recorder,
         () => {
-          const traceId: unknown = asyncLocalStorage
-            .getStore()
-            ?.get(this.options.traceIdKey);
-          return typeof traceId === "string" ? traceId : undefined;
+          const store = asyncLocalStorage.getStore();
+          const traceId: unknown = store?.get(this.options.traceIdKey);
+          if (typeof traceId !== "string") {
+            return undefined;
+          }
+          const traceContext = store?.get(TRACE_CONTEXT_KEY) as
+            | TraceContext
+            | undefined;
+          return { traceId, traceContext };
         },
-        typeof outgoing?.http === "object" ? outgoing.http : {},
+        http,
         () => operationTraceRegistry.getRedactor(),
+        // W3C Trace Context goes out only with `openTelemetry` on, and only
+        // while the collector takes this app's telemetry - see
+        // `ObserveAgentSharedBuffer.isIngesting`.
+        () =>
+          this.options.openTelemetry === true &&
+          http.traceContext !== false &&
+          this.observeAgentSharedBuffer?.isIngesting() === true,
       );
       // Model calls are read off the spans above, so they go with them.
       if (outgoing?.llm !== false) {

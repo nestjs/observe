@@ -50,6 +50,7 @@ import { TracerService } from "./services/tracer.service.js";
 import { KeyOf } from "./types/key-of.type.js";
 import { assertModuleOptions } from "./utils/assert-module-options.util.js";
 import { defaultTraceIdGenerator } from "./utils/default-trace-id-generator.util.js";
+import { recordTraceIdGeneratorOrigin } from "./utils/trace-id-generator-origin.util.js";
 import {
   fitServiceVersion,
   MAX_SERVICE_VERSION_LENGTH,
@@ -175,6 +176,8 @@ export function createObserveModule<Store extends Record<string, unknown>>(
   options.traceIdKey ??= "traceId";
   options.attachTraceIdToLogs ??= true;
   options.traceIdGenerator ??= defaultTraceIdGenerator;
+  // While the options are a plain object - see the function.
+  recordTraceIdGeneratorOrigin(options);
   options.skipInstrumentation ??= () => false;
 
   // Inert until the agent starts with `outgoing.llm` on - see the function.

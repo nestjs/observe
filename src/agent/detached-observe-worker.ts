@@ -25,6 +25,8 @@ export interface DetachedWorkerConfig {
   degradedPrefix: string;
   /** `PAUSED_MESSAGE_PREFIX`, as data, for the same reason. */
   pausedPrefix: string;
+  /** `NOT_INGESTED_MESSAGE_PREFIX`, as data, for the same reason. */
+  notIngestedPrefix: string;
   /**
    * This package's version (`readSdkVersion`), read on the main thread: the
    * worker runs as eval'd source and cannot resolve a manifest of its own.
@@ -95,6 +97,7 @@ export const detachedObserveWorker = (
   // that `parseDegradedMessage` still matches.
   const degradedPrefix = config.degradedPrefix;
   const pausedPrefix = config.pausedPrefix;
+  const notIngestedPrefix = config.notIngestedPrefix;
 
   /**
    * Built here, used only when the collector answers 400. The shapes travel
@@ -478,6 +481,7 @@ export const detachedObserveWorker = (
           `Error: Telemetry batch was rejected (400), repaired (${summary}), and rejected again ` +
             `(${retry.status})${retryBody ? ` - ${retryBody.slice(0, 500)}` : ""}. The batch was dropped.`,
         );
+        parentPort.postMessage(`${notIngestedPrefix}failed`);
       }
       return true;
     } catch {
@@ -548,6 +552,7 @@ export const detachedObserveWorker = (
                 (reason ? ` (${reason})` : "") +
                 `. Check that it is running and that \`endpoint\` points at it.`,
         );
+        parentPort.postMessage(`${notIngestedPrefix}failed`);
         // Discarded rather than retried - `clearBuffer` in `finally` - which
         // is the right call for a fixed-size buffer the application is still
         // writing into: holding it for a retry would block every batch behind
@@ -569,6 +574,7 @@ export const detachedObserveWorker = (
           // The slot is left alone until then, which a final flush would
           // otherwise read as a send still in progress.
           parentPort.postMessage(`${pausedPrefix}${pausedUntil}`);
+          parentPort.postMessage(`${notIngestedPrefix}refused`);
 
           // Said plainly, and once. The batch is well-formed and the
           // credentials are not accepted for this application; left as a
@@ -598,6 +604,7 @@ export const detachedObserveWorker = (
           // The slot is left alone until then, which a final flush would
           // otherwise read as a send still in progress.
           parentPort.postMessage(`${pausedPrefix}${pausedUntil}`);
+          parentPort.postMessage(`${notIngestedPrefix}failed`);
 
           // The body says which refusal this is - a quota, a quota frozen by
           // a declined payment, or a rate cap - and each needs a different
@@ -630,6 +637,7 @@ export const detachedObserveWorker = (
           `Error: Failed to send data. ${response.statusText} (${response.status})` +
             (errorBody ? ` - ${errorBody.slice(0, 500)}` : ""),
         );
+        parentPort.postMessage(`${notIngestedPrefix}failed`);
         return true;
       }
 
@@ -719,6 +727,7 @@ export const detachedObserveWorker = (
           `. This is most likely a fault in the observe agent rather than a ` +
           `connectivity problem; please report it.`,
       );
+      parentPort.postMessage(`${notIngestedPrefix}failed`);
       return true;
     } finally {
       clearBuffer();

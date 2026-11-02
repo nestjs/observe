@@ -1,5 +1,6 @@
 import {
   DEGRADED_MESSAGE_PREFIX,
+  NOT_INGESTED_MESSAGE_PREFIX,
   PAUSED_MESSAGE_PREFIX,
 } from "./degraded-ingest.protocol.js";
 import { detachedObserveWorker } from "./detached-observe-worker.js";
@@ -45,6 +46,7 @@ export function detachedWorkerData(input: {
     wireShapes: SECTION_SHAPES,
     degradedPrefix: DEGRADED_MESSAGE_PREFIX,
     pausedPrefix: PAUSED_MESSAGE_PREFIX,
+    notIngestedPrefix: NOT_INGESTED_MESSAGE_PREFIX,
     sdkVersion: readSdkVersion(),
   };
   return { sharedBuffer: input.sharedBuffer, config };

@@ -152,6 +152,36 @@ export function parsePausedMessage(msg: string): number | null {
 }
 
 /**
+ * How the detached worker tells the main thread a batch did not get in:
+ * `refused` when the collector turned the credentials away (401 or 403), and
+ * `failed` for anything else that kept a batch out - a 429, an unreachable
+ * collector, any other status, a fault in the worker. A batch that got in
+ * says so with its degraded verdict instead.
+ *
+ * Read for OpenTelemetry interop, which runs only while the collector takes
+ * this app's telemetry - see `ObserveAgentSharedBuffer.isIngesting`.
+ */
+export const NOT_INGESTED_MESSAGE_PREFIX = "observe:not-ingested=";
+
+export type NotIngestedReason = "refused" | "failed";
+
+/** Why a batch did not get in, or null if this is not that line. */
+export function parseNotIngestedMessage(msg: string): NotIngestedReason | null {
+  if (!msg.startsWith(NOT_INGESTED_MESSAGE_PREFIX)) {
+    return null;
+  }
+  const reason = msg.slice(NOT_INGESTED_MESSAGE_PREFIX.length);
+  return reason === "refused" || reason === "failed" ? reason : null;
+}
+
+/**
+ * How long batches may keep failing to get in before the collector counts as
+ * no longer taking this app's telemetry - a collector restarting, a network
+ * blip, a short rate-limit pause. Refused credentials end it at once.
+ */
+export const NOT_INGESTED_GRACE_MS = 60 * 1000;
+
+/**
  * Duration past which the collector treats an execution as notable, in
  * milliseconds.
  *
