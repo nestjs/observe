@@ -1,4 +1,6 @@
 import { ServerKafka, Transport } from "@nestjs/microservices";
+import { context as otelContext, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createInstanceDecorator } from "../instrument/create-instance-decorator.instrument.js";
@@ -497,6 +499,119 @@ describe("RpcObserveAgentService", () => {
           // gRPC calls done from a timer; let it fire so an extra call counts.
           await new Promise((resolve) => setTimeout(resolve, 0));
           expect(done).toHaveBeenCalledTimes(2);
+        },
+      );
+    });
+
+    /**
+     * With `openTelemetry` on, a TCP or Redis message carries W3C trace
+     * context in its metadata beside the trace id, and its handler runs in it
+     * for an OpenTelemetry SDK in this process.
+     */
+    describe("W3C trace context sent with a message", () => {
+      // The W3C spec's own example, and the id Observe writes it as.
+      const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+      const TRACE_ID_AS_UUID = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+      const SPAN_ID = "00f067aa0ba902b7";
+      const TRACEPARENT = `00-${TRACE_ID}-${SPAN_ID}-01`;
+
+      beforeEach(() => {
+        otelContext.setGlobalContextManager(
+          new AsyncLocalStorageContextManager().enable(),
+        );
+      });
+
+      afterEach(() => {
+        otelContext.disable();
+      });
+
+      const startHookFor = (
+        openTelemetry: boolean | undefined,
+        reporting = true,
+        overrides: { ignore?: boolean; capture?: boolean } = {},
+      ) => {
+        const agent = new RpcObserveAgentService(
+          new AsyncLocalStorage<Map<string, any>>(),
+          {
+            traceIdKey: "traceId",
+            // What the default makes of the id the sending agent attached.
+            traceIdGenerator: () => TRACE_ID_AS_UUID,
+            openTelemetry,
+            rpc: { ignore: () => overrides.ignore ?? false },
+          } as never,
+          {
+            getRpcTargetRegistry: () => ({
+              subscribe: () => ({ unsubscribe: vi.fn() }),
+            }),
+          } as never,
+          {
+            startTrace: vi.fn(),
+            endTrace: vi.fn(),
+            pluckSnapshot: vi.fn(),
+            hasTrace: vi.fn(() => false),
+          } as never,
+          { isIngesting: () => reporting } as never,
+          { shouldCapture: () => overrides.capture ?? true } as never,
+        );
+        agent.onModuleInit();
+        return captureStartHook(agent);
+      };
+
+      /** The OpenTelemetry span context a message's handler ran in. */
+      const handledIn = (
+        startHook: ReturnType<typeof startHookFor>,
+        metadata: Record<string, string> | undefined,
+      ) =>
+        Promise.resolve(
+          startHook(Transport.TCP, { getMetadata: () => metadata }, async () =>
+            trace.getSpanContext(otelContext.active()),
+          ),
+        );
+
+      it.each([
+        ["traced", {}],
+        ["ignored", { ignore: true }],
+        ["sampled out", { capture: false }],
+      ])(
+        "runs the handler of a %s message in the trace it was sent in",
+        async (_, overrides) => {
+          const startHook = startHookFor(true, true, overrides);
+
+          await expect(
+            handledIn(startHook, {
+              "x-request-id": TRACE_ID_AS_UUID,
+              traceparent: TRACEPARENT,
+            }),
+          ).resolves.toEqual({
+            traceId: TRACE_ID,
+            spanId: SPAN_ID,
+            traceFlags: 1,
+            isRemote: true,
+          });
+        },
+      );
+
+      it.each([
+        ["openTelemetry off", undefined, true, TRACEPARENT],
+        ["the agent not reporting", true, false, TRACEPARENT],
+        [
+          "a traceparent for another trace",
+          true,
+          true,
+          `00-${"a".repeat(32)}-${SPAN_ID}-01`,
+        ],
+        ["no traceparent", true, true, undefined],
+      ])(
+        "runs the handler in no trace with %s",
+        async (_, openTelemetry, reporting, traceparent) => {
+          const startHook = startHookFor(openTelemetry, reporting);
+
+          await expect(
+            handledIn(
+              startHook,
+              traceparent === undefined ? undefined : { traceparent },
+            ),
+          ).resolves.toBeUndefined();
         },
       );
     });

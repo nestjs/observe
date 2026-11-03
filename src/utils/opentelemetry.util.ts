@@ -12,15 +12,37 @@ export interface OpenTelemetrySpanContext {
 }
 
 /**
- * The slice of `@opentelemetry/api` the agent reads: enough to tell which span
- * an OpenTelemetry SDK running in this process has open, and whether it writes
- * `traceparent` on the calls it instruments.
+ * The slice of `@opentelemetry/api` the agent uses: enough to tell which span
+ * an OpenTelemetry SDK running in this process has open, whether it writes
+ * `traceparent` on the calls it instruments, and to hand it a remote parent
+ * to continue.
  */
 interface OpenTelemetryApi {
   trace: {
     getActiveSpan(): { spanContext(): OpenTelemetrySpanContext } | undefined;
+    setSpanContext(
+      context: unknown,
+      spanContext: OpenTelemetrySpanContext & { isRemote: boolean },
+    ): unknown;
+  };
+  context: {
+    active(): unknown;
+    with<T>(context: unknown, fn: () => T): T;
   };
   propagation: { fields(): string[] };
+}
+
+/**
+ * A span in another process, or in the operation that handed this work on,
+ * for an OpenTelemetry SDK here to continue - what its propagator reads off
+ * a `traceparent`.
+ */
+export interface RemoteParent {
+  /** 32 lowercase hex digits. */
+  traceId: string;
+  /** 16 lowercase hex digits. */
+  spanId: string;
+  sampled: boolean;
 }
 
 /** `undefined` until first asked for, `null` when the package is absent. */
@@ -77,5 +99,55 @@ export function openTelemetryWritesTraceparent(): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+/**
+ * Runs `run` with `parent` as the span an OpenTelemetry SDK in this process
+ * continues, as its propagator continues a `traceparent` read off an
+ * incoming request: the spans its instrumentations open inside `run` join
+ * `parent`'s trace, under it, and the calls they cover carry that trace on.
+ *
+ * For work that reaches this process by a way no OpenTelemetry
+ * instrumentation covers - a queue job, a microservice message - and that
+ * would otherwise run in no trace at all. Without `@opentelemetry/api`, or
+ * with no SDK registered on it, `run` just runs. Never the reason `run`
+ * fails: an API this cannot use is treated as absent, and what `run` itself
+ * throws is thrown as it is.
+ */
+export function withRemoteOpenTelemetryParent<T>(
+  parent: RemoteParent,
+  run: () => T,
+): T {
+  let enter: ((fn: () => T) => T) | undefined;
+  try {
+    const otel = openTelemetryApi();
+    if (otel) {
+      const parentContext = otel.trace.setSpanContext(otel.context.active(), {
+        traceId: parent.traceId,
+        spanId: parent.spanId,
+        traceFlags: parent.sampled ? 0x01 : 0x00,
+        isRemote: true,
+      });
+      enter = (fn) => otel.context.with(parentContext, fn);
+    }
+  } catch {
+    enter = undefined;
+  }
+  if (!enter) {
+    return run();
+  }
+  let entered = false;
+  try {
+    return enter(() => {
+      entered = true;
+      return run();
+    });
+  } catch (error) {
+    if (entered) {
+      throw error;
+    }
+    // The SDK's context manager failed before `run` started.
+    return run();
   }
 }
