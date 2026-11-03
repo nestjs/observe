@@ -80,7 +80,7 @@ function stripLiteralsAndComments(sql: string, dialect: SqlDialect): string {
 
 /** Where a Postgres block comment opened before `index` ends. */
 function endOfNestedComment(sql: string, index: number): number {
-  for (let depth = 1; depth && index < sql.length;) {
+  for (let depth = 1; depth && index < sql.length; ) {
     if (sql.startsWith("/*", index)) {
       depth++;
       index += 2;
