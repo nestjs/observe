@@ -1279,41 +1279,30 @@ describe("OperationTraceRegistry", () => {
       expect(result).toBe("");
     });
 
-    it("keeps a failure to open the span from reaching the callback's caller", async () => {
-      startJob("r5");
+    it("keeps a failure to close the span from replacing the callback's outcome", async () => {
       const recorder = new SpanSliceRecorder();
-      vi.spyOn(recorder, "enter").mockImplementation(() => {
+      vi.spyOn(recorder, "exit").mockImplementation(() => {
         throw new Error("bookkeeping");
       });
       setActiveSliceRecorder(recorder);
-      const callback = vi.fn(() => "still ran");
       try {
+        startJob("r5");
         await expect(
-          registry.createRootSpan("r5", labels, "orders.created", callback),
-        ).resolves.toBe("still ran");
+          registry.createRootSpan("r5", labels, "ok", () => "value"),
+        ).resolves.toBe("value");
+        expect(registry.hasOpenSpans("r5")).toBe(false);
+
+        startJob("r6");
+        const failure = new Error("consumer boom");
+        await expect(
+          registry.createRootSpan("r6", labels, "failing", () => {
+            throw failure;
+          }),
+        ).rejects.toBe(failure);
+        expect(registry.hasOpenSpans("r6")).toBe(false);
       } finally {
         setActiveSliceRecorder(null);
       }
-
-      expect(callback).toHaveBeenCalledOnce();
-    });
-
-    it("keeps a failure to close the span from replacing the callback's outcome", async () => {
-      startJob("r6");
-      vi.spyOn(registry, "internalEndTraceStep").mockImplementation(() => {
-        throw new Error("bookkeeping");
-      });
-
-      await expect(
-        registry.createRootSpan("r6", labels, "ok", () => "value"),
-      ).resolves.toBe("value");
-
-      const failure = new Error("consumer boom");
-      await expect(
-        registry.createRootSpan("r6", labels, "failing", () => {
-          throw failure;
-        }),
-      ).rejects.toBe(failure);
     });
   });
 

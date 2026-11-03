@@ -20,16 +20,17 @@ import { uuidv7 } from "../utils/uuid-v7.util.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 
 /**
- * Longest operation id the collector stores, counted by code point as it
- * counts. A longer one is cut there anyway; cut here, a name built from a
- * request body cannot grow the batch it rides in without bound.
+ * Longest operation id the collector stores, and span label a job's names
+ * become, counted by code point as it counts. A longer one is cut there
+ * anyway; cut here, a name built from a request body cannot grow the batch it
+ * rides in without bound.
  */
-const MAX_OPERATION_ID_LENGTH = 255;
+const MAX_NAME_LENGTH = 255;
 
 function toBoundedName(value: unknown): string {
   const name = typeof value === "string" ? value.trim() : "";
-  return name.length > MAX_OPERATION_ID_LENGTH
-    ? Array.from(name).slice(0, MAX_OPERATION_ID_LENGTH).join("")
+  return name.length > MAX_NAME_LENGTH
+    ? Array.from(name).slice(0, MAX_NAME_LENGTH).join("")
     : name;
 }
 
@@ -106,47 +107,66 @@ export class TracerService<
    * calls nest under a root span named after the run. Its result is returned
    * and its error re-thrown unchanged; an error also marks the run failed.
    *
-   * Every call outside a trace is a job of its own, so use stable, bounded
-   * names, not per-run values. Both are trimmed and cut to 255 characters, and
-   * a blank or non-string one runs the callback untraced. Inside a traced
-   * operation, it opens a child span there instead, as `createSpan` does.
+   * Every call outside a recorded trace is a job of its own, so use stable,
+   * bounded names, not per-run values. Both are trimmed and cut to 255
+   * characters, and a blank or non-string one runs the callback untraced.
+   * Inside a recorded operation, it opens a child span there instead, as
+   * `createSpan` does.
    */
   async runJob<T>(
     job: RunJobOptions,
     callback: (span: TraceSpanDelegate) => T | Promise<T>,
   ): Promise<Awaited<T>> {
+    if (this.options.enabled === false) {
+      return await callback(new TraceSpanDelegate("", undefined, {}));
+    }
     const queueName = toBoundedName(job?.queueName);
     const name = toBoundedName(job?.name);
     if (!queueName || !name) {
       this.reportUnusableJobName(queueName ? job?.name : job?.queueName);
       return await callback(new TraceSpanDelegate("", undefined, {}));
     }
-    if (this.options.enabled === false) {
-      return await callback(new TraceSpanDelegate("", name, {}));
-    }
 
     const store = this.als.getStore();
     const outerTraceId =
       store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
-    if (typeof outerTraceId === "string") {
-      return this.createSpan(name, callback) as Promise<Awaited<T>>;
+    if (
+      typeof outerTraceId === "string" &&
+      this.operationTraceRegistry.hasTrace(outerTraceId)
+    ) {
+      return await this.createSpan(name, callback);
     }
 
-    return this.runner.run(
-      {
-        queueName,
-        name,
-        id: typeof job.id === "string" && job.id ? job.id : uuidv7(),
-        opts: { [JOB_TRACE_OPTION_KEY]: job.traceId },
-        metadata: {},
-      },
-      () =>
-        this.operationTraceRegistry.createRootSpan(
-          this.als.getStore()?.get(TRACE_REGISTRY_KEY),
-          { className: queueName, methodKey: name },
+    // A context whose trace is no longer open - a timer or consumer set up
+    // inside a request that has since been shipped - is left behind, or the
+    // runner would read its trace id as an outer operation and record nothing.
+    // Its trace id is still inherited, so the run correlates with it.
+    const traceId = job.traceId ?? this.currentTraceId();
+    return await this.als.exit(() =>
+      this.runner.run(
+        {
+          queueName,
           name,
-          callback,
-        ),
+          id:
+            typeof job.id === "number" || (typeof job.id === "string" && job.id)
+              ? job.id
+              : uuidv7(),
+          opts: { [JOB_TRACE_OPTION_KEY]: traceId },
+          metadata: {},
+        },
+        () => {
+          const registryKey = this.als.getStore()?.get(TRACE_REGISTRY_KEY);
+          if (typeof registryKey !== "string") {
+            return callback(new TraceSpanDelegate("", name, {}));
+          }
+          return this.operationTraceRegistry.createRootSpan(
+            registryKey,
+            { className: queueName, methodKey: name },
+            name,
+            callback,
+          );
+        },
+      ),
     );
   }
 

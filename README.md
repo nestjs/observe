@@ -484,11 +484,13 @@ and each name is a route of its own.
 
 ## Tracing work outside a request
 
-Requests, BullMQ and Bull jobs, and `@nestjs/schedule` handlers are traced
-without any code. Work that arrives some other way - a Kafka consumer, a cron
-registered at runtime, a script run on a standalone application context - has
-no trace to record its spans in. Wrap it in `runJob()` and it is reported as a
-job, with every provider it calls nested under a root span named after it:
+Requests, BullMQ and Bull jobs, `@nestjs/schedule` handlers and
+`@nestjs/microservices` message handlers - its Kafka transport included - are
+traced without any code. Work that arrives some other way - a raw kafkajs
+consumer, a cron registered at runtime, a script run on a standalone
+application context - has no trace to record its spans in. Wrap it in
+`runJob()` and it is reported as a job, with every provider it calls nested
+under a root span named after it:
 
 ```ts
 import { TracerService } from "@nestjs/observe";
@@ -503,7 +505,7 @@ await consumer.run({
       {
         queueName: "kafka",
         name: topic,
-        traceId: message.headers?.["x-trace-id"]?.toString(),
+        traceId: message.headers?.["x-request-id"]?.toString(),
       },
       () => this.orders.handle(JSON.parse(message.value!.toString())),
     ),
@@ -516,9 +518,21 @@ await producer.send({
   messages: [
     {
       value: JSON.stringify(order),
-      headers: traceId ? { "x-trace-id": traceId } : {},
+      headers: traceId ? { "x-request-id": traceId } : {},
     },
   ],
+});
+```
+
+One run per message is one event per message. To record a share of a busy
+topic, sample it with `jobs.ignore` - which sees BullMQ and Bull jobs too, so
+match on the `queueName` you gave:
+
+```ts
+ObserveModule.forRoot({
+  jobs: {
+    ignore: (job) => job.queueName === "kafka" && Math.random() >= 0.1,
+  },
 });
 ```
 
@@ -554,14 +568,16 @@ re-thrown unchanged and reports the run as failed. Each run gets an `id` of its
 own unless you pass one, and a `traceId` is used only if it is 1-128 characters
 of letters, digits and `._:-` - otherwise the run mints its own. The `jobs`
 options - `ignore`, `tags`, `setAttributes` - see these runs like any other job,
-with `queueName` and `name` as given. Called inside an operation that is already
-traced, `runJob()` opens a child span there instead of a job of its own.
+with `queueName` and `name` as given. Called inside an operation that is being
+recorded, `runJob()` opens a child span there instead of a job of its own.
 
-Every run outside a trace is a job snapshot of its own, and counts as an event
-like any queue job or cron firing. Keep `queueName` and `name` to stable,
-bounded values - a topic, a cron name - never per-message ones such as order or
-message ids. Both are trimmed and cut to 255 characters; a blank or non-string
-one runs the callback untraced and is reported once.
+Every other run is a job snapshot of its own, and counts as an event like any
+queue job or cron firing - including one called inside a request that is not
+recorded, because it was sampled out or matched `http.ignore`, or whose trace
+has already been sent. Keep `queueName` and `name` to stable, bounded values -
+a topic, a cron name - never per-message ones such as order or message ids.
+Both are trimmed and cut to 255 characters; a blank or non-string one runs the
+callback untraced and is reported once.
 
 ## Declaring objectives in code
 

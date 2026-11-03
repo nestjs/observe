@@ -208,6 +208,16 @@ describe("TracerService", () => {
       });
     });
 
+    it("reports a numeric run id as a string, and mints one in place of a blank id", async () => {
+      await tracer.runJob({ ...job, id: 42 }, () => null);
+      await tracer.runJob({ ...job, id: "" }, () => null);
+
+      await vi.waitFor(() => expect(jobSnapshots).toHaveLength(2));
+      expect(jobSnapshots[0].id).toBe("42");
+      expect(jobSnapshots[1].id).toEqual(expect.any(String));
+      expect(jobSnapshots[1].id).not.toBe("");
+    });
+
     it("mints its own trace id in place of a malformed one", async () => {
       await tracer.runJob({ ...job, traceId: "not a trace id" }, () => null);
 
@@ -230,7 +240,39 @@ describe("TracerService", () => {
       expect(snapshot.error).toMatchObject({ message: "consumer boom" });
     });
 
-    it("opens a child span, not a job, inside a traced operation", async () => {
+    it("re-throws a synchronous throw unchanged and reports the run failed", async () => {
+      const failure = new Error("consumer boom");
+
+      await expect(
+        tracer.runJob(job, () => {
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+
+      expect((await nextJobSnapshot()).status).toBe("failed");
+    });
+
+    it("leaves a run matched by jobs.ignore unreported, and still runs it", async () => {
+      const ignore = vi.fn(() => true);
+      const ignoring = new TracerService(registry, als as never, buffer, {
+        traceIdKey: TRACE_ID_KEY,
+        jobs: { ignore },
+      } as unknown as ObserveModuleOptionsWithDefaults);
+
+      await expect(
+        ignoring.runJob({ ...job, id: "m-1" }, () => "ran"),
+      ).resolves.toBe("ran");
+
+      expect(ignore).toHaveBeenCalledWith({
+        queueName: "kafka",
+        name: "orders.created",
+        id: "m-1",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(jobSnapshots).toEqual([]);
+    });
+
+    it("opens a child span, not a job, inside a recorded operation", async () => {
       await inTrace("nested", async (spanId) => {
         await tracer.runJob(job, () => "ok");
         registry.internalEndTraceStep(
@@ -249,6 +291,47 @@ describe("TracerService", () => {
       ]);
       await new Promise((resolve) => setTimeout(resolve, 5));
       expect(jobSnapshots).toEqual([]);
+    });
+
+    it("records a job of its own, under the old trace id, once that operation has shipped", async () => {
+      // A timer set inside a request keeps the request's context after the
+      // request's trace has been handed off.
+      let fired!: Promise<string>;
+      await inTrace("shipped", (spanId) => {
+        fired = new Promise((resolve) =>
+          setTimeout(() => resolve(tracer.runJob(job, () => "late")), 50),
+        );
+        registry.internalEndTraceStep(
+          "shipped",
+          spanId,
+          "OrdersController",
+          "findAll",
+          spanId,
+        );
+      });
+      registry.endTrace("shipped");
+      await registry.pluckSnapshot("shipped");
+      expect(registry.hasTrace("shipped")).toBe(false);
+
+      await expect(fired).resolves.toBe("late");
+      const snapshot = await nextJobSnapshot();
+      expect(snapshot.traceId).toBe("shipped");
+      expect(snapshot.traces).toEqual([
+        expect.objectContaining({ name: "orders.created", className: "kafka" }),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(jobSnapshots).toHaveLength(1);
+    });
+
+    it("records a job of its own inside an operation that is not recorded", async () => {
+      await als.run(new Map([[TRACE_ID_KEY, "sampled-out"]]), () =>
+        tracer.runJob(job, () => null),
+      );
+
+      expect(await nextJobSnapshot()).toMatchObject({
+        name: "orders.created",
+        traceId: "sampled-out",
+      });
     });
 
     it("cuts a long name to 255 characters, counted as the collector counts them", async () => {
@@ -304,6 +387,17 @@ describe("TracerService", () => {
             "runJob ran a job untraced, given a value of type number",
           ),
         );
+      });
+
+      it("says nothing when the agent is disabled", async () => {
+        const disabled = new TracerService(registry, als as never, buffer, {
+          traceIdKey: TRACE_ID_KEY,
+          enabled: false,
+        } as ObserveModuleOptionsWithDefaults);
+
+        await disabled.runJob({ ...job, name: "" }, () => null);
+
+        expect(warn).not.toHaveBeenCalled();
       });
     });
   });

@@ -875,7 +875,7 @@ export interface RunJobOptions {
    */
   name: string;
   /** Identifies this particular run. A fresh one is minted when absent. */
-  id?: string;
+  id?: string | number;
   /**
    * The trace id to report under, as read off an inbound message. Held to the
    * shape of an inbound `x-request-id`; anything else is ignored and the run

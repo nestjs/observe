@@ -76,12 +76,12 @@ const UNHANDLED_ERROR_STATUS_CODE = 500;
  */
 const HANDLED_ERROR_STATUS_CODE = 400;
 
-/** Runs manual span bookkeeping whose failure must not reach the caller. */
-function guardBookkeeping<T>(fn: () => T): T | undefined {
+/** Runs span bookkeeping whose failure must not reach the caller. */
+function ignoreFailure(fn: () => unknown): void {
   try {
-    return fn();
+    fn();
   } catch {
-    return undefined;
+    // The span is a side effect of the call, not part of its outcome.
   }
 }
 
@@ -1057,15 +1057,15 @@ export class OperationTraceRegistry {
    * a caller's class and method. A trace that ends with no span at all is
    * dropped, so a run no instrumented call opened one for needs this one.
    */
-  async createRootSpan(
+  async createRootSpan<T>(
     traceId: string,
     labels: { className: string; methodKey: string },
     name: string,
-    spanFunction: (span: TraceSpanDelegate) => any,
-  ) {
+    spanFunction: (span: TraceSpanDelegate) => T | Promise<T>,
+  ): Promise<Awaited<T>> {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
-      return spanFunction(new TraceSpanDelegate("", name, {}));
+      return await spanFunction(new TraceSpanDelegate("", name, {}));
     }
     return this.runManualSpan(
       traceId,
@@ -1085,16 +1085,47 @@ export class OperationTraceRegistry {
     name: string,
     spanFunction: (span: TraceSpanDelegate) => any,
   ) {
-    const newNodeId = uuidv7();
-    const manualSpan = guardBookkeeping(() =>
-      this.openManualSpan(traceId, snapshot, callerId, labels, name, newNodeId),
-    );
-    if (!manualSpan) {
-      return spanFunction(new TraceSpanDelegate("", name, {}));
-    }
+    // Book the span in the same ledger auto spans use. Completion goes through
+    // internalEndTraceStep, which increments refsMarkedAsComplete - without
+    // the matching increment here, every completed manual span pushed the
+    // completed count one ahead, and a trace holding one leaked auto span plus
+    // one manual span read as complete: pluckSnapshot then shipped a
+    // half-built tree whose ongoing node still held its circular `parent`
+    // reference, and JSON.stringify threw away the whole flush window.
+    snapshot.refsCounter += 1;
 
-    const onResponse = (res: unknown) => {
-      guardBookkeeping(() =>
+    const newNodeId = uuidv7();
+    const startTime = performance.now();
+
+    // Same as internalStartTraceStep: without an enter, the exit issued on
+    // completion no-ops and the span's execution time is silently attributed
+    // to its parent - profile correlation for manual spans found nothing.
+    activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
+    const manualSpan: OngoingTraceEventNode = {
+      // Same identity rule as auto spans: the span id *is* the caller id it is
+      // registered under, so a log line written inside this span carries an id
+      // that resolves back to this node.
+      spanId: newNodeId,
+      name,
+      origin: "manual",
+      type: "start",
+      className: labels.className,
+      methodKey: labels.methodKey,
+      startTime,
+      startOffset: this.toStartOffset(snapshot, startTime),
+      children: [],
+    };
+    let refsByCaller = this.callerIdsByTraceId.get(traceId);
+    this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);
+
+    if (!refsByCaller) {
+      refsByCaller = new Map<string, OngoingTraceEventNode>();
+      this.callerIdsByTraceId.set(traceId, refsByCaller);
+    }
+    refsByCaller.set(newNodeId, manualSpan);
+
+    const onResponse = <R>(res: R) => {
+      ignoreFailure(() =>
         this.internalEndTraceStep(
           traceId,
           newNodeId,
@@ -1106,7 +1137,7 @@ export class OperationTraceRegistry {
       return res;
     };
     const onError = (err: unknown) => {
-      guardBookkeeping(() =>
+      ignoreFailure(() =>
         this.internalEndTraceStep(
           traceId,
           newNodeId,
@@ -1141,54 +1172,5 @@ export class OperationTraceRegistry {
         }
       },
     );
-  }
-
-  private openManualSpan(
-    traceId: string,
-    snapshot: SnapshotWithSignal,
-    callerId: string | undefined,
-    labels: { className: string; methodKey: string },
-    name: string,
-    newNodeId: string,
-  ): OngoingTraceEventNode {
-    // Book the span in the same ledger auto spans use. Completion goes through
-    // internalEndTraceStep, which increments refsMarkedAsComplete - without
-    // the matching increment here, every completed manual span pushed the
-    // completed count one ahead, and a trace holding one leaked auto span plus
-    // one manual span read as complete: pluckSnapshot then shipped a
-    // half-built tree whose ongoing node still held its circular `parent`
-    // reference, and JSON.stringify threw away the whole flush window.
-    snapshot.refsCounter += 1;
-
-    const startTime = performance.now();
-
-    // Same as internalStartTraceStep: without an enter, the exit issued on
-    // completion no-ops and the span's execution time is silently attributed
-    // to its parent - profile correlation for manual spans found nothing.
-    activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
-    const manualSpan: OngoingTraceEventNode = {
-      // Same identity rule as auto spans: the span id *is* the caller id it is
-      // registered under, so a log line written inside this span carries an id
-      // that resolves back to this node.
-      spanId: newNodeId,
-      name,
-      origin: "manual",
-      type: "start",
-      className: labels.className,
-      methodKey: labels.methodKey,
-      startTime,
-      startOffset: this.toStartOffset(snapshot, startTime),
-      children: [],
-    };
-    let refsByCaller = this.callerIdsByTraceId.get(traceId);
-    this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);
-
-    if (!refsByCaller) {
-      refsByCaller = new Map<string, OngoingTraceEventNode>();
-      this.callerIdsByTraceId.set(traceId, refsByCaller);
-    }
-    refsByCaller.set(newNodeId, manualSpan);
-
-    return manualSpan;
   }
 }
