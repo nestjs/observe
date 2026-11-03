@@ -1177,6 +1177,146 @@ describe("OperationTraceRegistry", () => {
     });
   });
 
+  describe("root spans", () => {
+    const labels = { className: "kafka", methodKey: "orders.created" };
+
+    const startJob = (traceId: string) =>
+      registry.startTrace(traceId, {
+        id: "run-1",
+        traceId,
+        queueName: "kafka",
+        name: "orders.created",
+        traces: [],
+      });
+
+    it("opens the span at the trace root, labelled with the job", async () => {
+      startJob("r1");
+
+      const result = await registry.createRootSpan(
+        "r1",
+        labels,
+        "orders.created",
+        (span) => {
+          span.setTag("partition", 3);
+          return "handled";
+        },
+      );
+      registry.endTrace("r1", { status: "completed" });
+
+      expect(result).toBe("handled");
+      const snapshot = await registry.pluckSnapshot("r1");
+      expect(snapshot!.traces).toEqual([
+        expect.objectContaining({
+          name: "orders.created",
+          origin: "manual",
+          className: "kafka",
+          methodKey: "orders.created",
+          tags: { partition: 3 },
+        }),
+      ]);
+    });
+
+    it("nests the spans opened inside it", async () => {
+      startJob("r2");
+
+      await registry.createRootSpan("r2", labels, "orders.created", () => {
+        const callerId = als.getStore()?.get(CALLER_METADATA_KEY) as string;
+        const stepId = registry.internalStartTraceStep(
+          "r2",
+          "OrdersService",
+          "save",
+          callerId,
+        );
+        registry.internalEndTraceStep(
+          "r2",
+          stepId,
+          "OrdersService",
+          "save",
+          stepId,
+        );
+        return registry.createManualSpan("r2", callerId, "publish", () => 1);
+      });
+      registry.endTrace("r2", { status: "completed" });
+
+      const snapshot = await registry.pluckSnapshot("r2");
+      expect(snapshot!.traces).toHaveLength(1);
+      expect(snapshot!.traces[0].children).toEqual([
+        expect.objectContaining({
+          className: "OrdersService",
+          methodKey: "save",
+        }),
+        expect.objectContaining({ name: "publish", origin: "manual" }),
+      ]);
+    });
+
+    it("balances the span ledger whether the callback returns or throws", async () => {
+      startJob("r3");
+      await registry.createRootSpan("r3", labels, "ok", async () => "done");
+      expect(registry.hasOpenSpans("r3")).toBe(false);
+
+      startJob("r4");
+      const failure = new Error("consumer boom");
+      await expect(
+        registry.createRootSpan("r4", labels, "failing", async () => {
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+      expect(registry.hasOpenSpans("r4")).toBe(false);
+
+      registry.endTrace("r4", { status: "failed" });
+      const snapshot = await registry.pluckSnapshot("r4");
+      expect(snapshot!.error).toMatchObject({ message: "consumer boom" });
+    });
+
+    it("runs the callback with a detached span when the trace is not open", async () => {
+      const result = await registry.createRootSpan(
+        "never-started",
+        labels,
+        "orders.created",
+        (span) => span.id,
+      );
+
+      expect(result).toBe("");
+    });
+
+    it("keeps a failure to open the span from reaching the callback's caller", async () => {
+      startJob("r5");
+      const recorder = new SpanSliceRecorder();
+      vi.spyOn(recorder, "enter").mockImplementation(() => {
+        throw new Error("bookkeeping");
+      });
+      setActiveSliceRecorder(recorder);
+      const callback = vi.fn(() => "still ran");
+      try {
+        await expect(
+          registry.createRootSpan("r5", labels, "orders.created", callback),
+        ).resolves.toBe("still ran");
+      } finally {
+        setActiveSliceRecorder(null);
+      }
+
+      expect(callback).toHaveBeenCalledOnce();
+    });
+
+    it("keeps a failure to close the span from replacing the callback's outcome", async () => {
+      startJob("r6");
+      vi.spyOn(registry, "internalEndTraceStep").mockImplementation(() => {
+        throw new Error("bookkeeping");
+      });
+
+      await expect(
+        registry.createRootSpan("r6", labels, "ok", () => "value"),
+      ).resolves.toBe("value");
+
+      const failure = new Error("consumer boom");
+      await expect(
+        registry.createRootSpan("r6", labels, "failing", () => {
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+    });
+  });
+
   describe("repeated siblings", () => {
     /** Opens and closes `count` calls of one frame under `callerId`. */
     const repeat = (

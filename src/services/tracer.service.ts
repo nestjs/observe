@@ -3,14 +3,20 @@ import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { Gauge, GaugeKind, Summary } from "../custom-metrics/index.js";
 import { Counter } from "../custom-metrics/counter.js";
-import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
+import {
+  ObserveModuleOptionsWithDefaults,
+  RunJobOptions,
+} from "../interfaces/index.js";
+import { JobTraceRunner } from "../protocols/job-trace-runner.js";
 import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { Path, PathValue } from "../types/path-value.type.js";
 import {
   CALLER_METADATA_KEY,
+  JOB_TRACE_OPTION_KEY,
   OBSERVE_OPTIONS,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
+import { uuidv7 } from "../utils/uuid-v7.util.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 
 /**
@@ -19,6 +25,22 @@ import { OperationTraceRegistry } from "./operation-trace.registry.js";
  * request body cannot grow the batch it rides in without bound.
  */
 const MAX_OPERATION_ID_LENGTH = 255;
+
+/** Trimmed and cut to `MAX_OPERATION_ID_LENGTH`; blank for a non-string. */
+function toBoundedName(value: unknown): string {
+  const name = typeof value === "string" ? value.trim() : "";
+  return name.length > MAX_OPERATION_ID_LENGTH
+    ? Array.from(name).slice(0, MAX_OPERATION_ID_LENGTH).join("")
+    : name;
+}
+
+function describeUnusableName(value: unknown): string {
+  return value === null || value === undefined
+    ? String(value)
+    : typeof value === "string"
+      ? "a blank string"
+      : `a value of type ${typeof value}`;
+}
 
 @Injectable()
 export class TracerService<
@@ -33,6 +55,8 @@ export class TracerService<
   private readonly summaries = new Map<string, Summary<any>>();
   private readonly logger = new Logger(TracerService.name);
   private hasReportedUnusableOperationId = false;
+  private hasReportedUnusableJobName = false;
+  private jobTraceRunner?: JobTraceRunner<Record<string, unknown>>;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -65,6 +89,57 @@ export class TracerService<
       callerId,
       name,
       callback,
+    );
+  }
+
+  /**
+   * Runs `callback` under a trace of its own, reported as a job - for work no
+   * Nest hook sees: a Kafka consumer, a cron registered at runtime, a script on
+   * a standalone application context. Providers it calls nest under its root
+   * span, and its result or error is passed through unchanged; an error also
+   * marks the run failed.
+   *
+   * Inside an operation that is already traced, it opens a child span there
+   * instead, as `createSpan` does. Outside one, every call is a job of its own,
+   * so keep `queueName` and `name` stable and bounded - never a per-run value.
+   * A blank or non-string one runs the callback untraced.
+   */
+  async runJob<T>(
+    job: RunJobOptions,
+    callback: (span: TraceSpanDelegate) => T | Promise<T>,
+  ): Promise<Awaited<T>> {
+    const queueName = toBoundedName(job?.queueName);
+    const name = toBoundedName(job?.name);
+    if (!queueName || !name) {
+      this.reportUnusableJobName(queueName ? job?.name : job?.queueName);
+      return await callback(new TraceSpanDelegate("", undefined, {}));
+    }
+    if (this.options.enabled === false) {
+      return await callback(new TraceSpanDelegate("", name, {}));
+    }
+
+    const store = this.als.getStore();
+    const outerTraceId =
+      store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
+    if (typeof outerTraceId === "string") {
+      return this.createSpan(name, callback) as Promise<Awaited<T>>;
+    }
+
+    return this.jobRunner().run(
+      {
+        queueName,
+        name,
+        id: typeof job.id === "string" && job.id ? job.id : uuidv7(),
+        opts: { [JOB_TRACE_OPTION_KEY]: job.traceId },
+        metadata: {},
+      },
+      () =>
+        this.operationTraceRegistry.createRootSpan(
+          this.als.getStore()?.get(TRACE_REGISTRY_KEY),
+          { className: queueName, methodKey: name },
+          name,
+          callback,
+        ),
     );
   }
 
@@ -362,7 +437,7 @@ export class TracerService<
     // Typed, but often read off a request body, which nothing checks at
     // runtime: a number would have the collector refuse the batch it rides in,
     // and a blank name would have the agent drop the request, error and all.
-    const name = typeof operationId === "string" ? operationId.trim() : "";
+    const name = toBoundedName(operationId);
     if (!name) {
       this.reportUnusableOperationId(operationId);
       return;
@@ -371,12 +446,7 @@ export class TracerService<
     const traceId =
       store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
     if (typeof traceId === "string") {
-      this.operationTraceRegistry.setOperationId(
-        traceId,
-        name.length > MAX_OPERATION_ID_LENGTH
-          ? Array.from(name).slice(0, MAX_OPERATION_ID_LENGTH).join("")
-          : name,
-      );
+      this.operationTraceRegistry.setOperationId(traceId, name);
     }
   }
 
@@ -389,15 +459,35 @@ export class TracerService<
       return;
     }
     this.hasReportedUnusableOperationId = true;
-    const given =
-      value === null || value === undefined
-        ? String(value)
-        : typeof value === "string"
-          ? "a blank string"
-          : `a value of type ${typeof value}`;
     this.logger.warn(
-      `setOperationId ignored ${given}: an operation id is a non-blank string. Later ones are not reported.`,
+      `setOperationId ignored ${describeUnusableName(value)}: an operation id is a non-blank string. Later ones are not reported.`,
     );
+  }
+
+  /** Reported once, for the same reason as an unusable operation id. */
+  private reportUnusableJobName(value: unknown): void {
+    if (this.hasReportedUnusableJobName) {
+      return;
+    }
+    this.hasReportedUnusableJobName = true;
+    this.logger.warn(
+      `runJob ran a job untraced, given ${describeUnusableName(value)}: a job's queueName and name are non-blank strings. Later ones are not reported.`,
+    );
+  }
+
+  /**
+   * Built on first use: most applications never call `runJob`, and the queue
+   * agents build their own.
+   */
+  private jobRunner(): JobTraceRunner<Record<string, unknown>> {
+    this.jobTraceRunner ??= new JobTraceRunner(
+      this.observeAgentSharedBuffer,
+      this.options,
+      this.operationTraceRegistry,
+      this.als as never,
+      this.logger,
+    );
+    return this.jobTraceRunner;
   }
 
   /**

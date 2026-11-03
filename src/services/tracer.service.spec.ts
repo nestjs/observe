@@ -1,7 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
-import { CustomMetric } from "../interfaces/index.js";
+import { CustomMetric, JobSnapshot } from "../interfaces/index.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import {
@@ -27,15 +27,19 @@ describe("TracerService", () => {
   let als: AsyncLocalStorage<Map<string, unknown>>;
   let registry: OperationTraceRegistry;
   let upserted: CustomMetric[];
+  let jobSnapshots: JobSnapshot[];
+  let buffer: ObserveAgentSharedBuffer;
   let tracer: TracerService;
 
   beforeEach(() => {
     als = new AsyncLocalStorage();
     registry = new OperationTraceRegistry(als as never, false);
     upserted = [];
+    jobSnapshots = [];
 
-    const buffer = {
+    buffer = {
       upsertCustomMetric: (metric: CustomMetric) => upserted.push(metric),
+      insertJobSnapshot: (snapshot: JobSnapshot) => jobSnapshots.push(snapshot),
     } as unknown as ObserveAgentSharedBuffer;
 
     tracer = new TracerService(registry, als as never, buffer, {
@@ -142,6 +146,167 @@ describe("TracerService", () => {
       await expect(tracer.createSpan("orphan", () => "x")).rejects.toThrow(
         /AsyncLocalStorage is not initialized/,
       );
+    });
+  });
+
+  describe("runJob", () => {
+    const job = { queueName: "kafka", name: "orders.created" };
+
+    const nextJobSnapshot = async () => {
+      await vi.waitFor(() => expect(jobSnapshots).toHaveLength(1));
+      return jobSnapshots[0];
+    };
+
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+    it("reports the run as a completed job, rooted in a span named after it", async () => {
+      const result = await tracer.runJob(job, (span) => {
+        span.setTag("partition", 3);
+        return "handled";
+      });
+
+      expect(result).toBe("handled");
+      const snapshot = await nextJobSnapshot();
+      expect(snapshot).toMatchObject({
+        queueName: "kafka",
+        name: "orders.created",
+        status: "completed",
+        id: expect.any(String),
+        traceId: expect.any(String),
+      });
+      expect(snapshot.traces).toEqual([
+        expect.objectContaining({
+          name: "orders.created",
+          origin: "manual",
+          className: "kafka",
+          methodKey: "orders.created",
+          tags: { partition: 3 },
+        }),
+      ]);
+    });
+
+    it("makes its trace id current inside the callback, a fresh one per run", async () => {
+      const first = await tracer.runJob(job, () => tracer.currentTraceId());
+      const second = await tracer.runJob(job, () => tracer.currentTraceId());
+
+      expect(first).toEqual(expect.any(String));
+      expect(second).not.toBe(first);
+      await vi.waitFor(() => expect(jobSnapshots).toHaveLength(2));
+      expect(new Set(jobSnapshots.map((s) => s.traceId))).toEqual(
+        new Set([first, second]),
+      );
+    });
+
+    it("reports under the trace id and run id it is given", async () => {
+      const current = await tracer.runJob(
+        { ...job, id: "offset-42", traceId: "inbound-trace.1" },
+        () => tracer.currentTraceId(),
+      );
+
+      expect(current).toBe("inbound-trace.1");
+      expect(await nextJobSnapshot()).toMatchObject({
+        id: "offset-42",
+        traceId: "inbound-trace.1",
+      });
+    });
+
+    it("mints its own trace id in place of a malformed one", async () => {
+      await tracer.runJob({ ...job, traceId: "not a trace id" }, () => null);
+
+      const snapshot = await nextJobSnapshot();
+      expect(snapshot.traceId).not.toBe("not a trace id");
+      expect(snapshot.traceId).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+    });
+
+    it("re-throws the callback's error unchanged and reports the run failed", async () => {
+      const failure = new Error("consumer boom");
+
+      await expect(
+        tracer.runJob(job, async () => {
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+
+      const snapshot = await nextJobSnapshot();
+      expect(snapshot.status).toBe("failed");
+      expect(snapshot.error).toMatchObject({ message: "consumer boom" });
+    });
+
+    it("opens a child span, not a job, inside a traced operation", async () => {
+      await inTrace("nested", async (spanId) => {
+        await tracer.runJob(job, () => "ok");
+        registry.internalEndTraceStep(
+          "nested",
+          spanId,
+          "OrdersController",
+          "findAll",
+          spanId,
+        );
+      });
+      registry.endTrace("nested");
+
+      const snapshot = await registry.pluckSnapshot("nested");
+      expect(snapshot!.traces[0].children).toEqual([
+        expect.objectContaining({ name: "orders.created", origin: "manual" }),
+      ]);
+      await settle();
+      expect(jobSnapshots).toEqual([]);
+    });
+
+    it("cuts a long name to 255 characters, counted as the collector counts them", async () => {
+      await tracer.runJob({ ...job, name: "😀".repeat(300) }, () => null);
+
+      const snapshot = await nextJobSnapshot();
+      expect(Array.from(snapshot.name)).toHaveLength(255);
+      expect(Array.from(snapshot.traces[0].methodKey)).toHaveLength(255);
+    });
+
+    it("runs the callback with a detached span when the agent is disabled", async () => {
+      const disabled = new TracerService(registry, als as never, buffer, {
+        traceIdKey: TRACE_ID_KEY,
+        enabled: false,
+      } as ObserveModuleOptionsWithDefaults);
+
+      const spanId = await disabled.runJob(job, (span) => span.id);
+
+      expect(spanId).toBe("");
+      await settle();
+      expect(jobSnapshots).toEqual([]);
+    });
+
+    describe("given an unusable queue name or name", () => {
+      let warn: ReturnType<typeof vi.spyOn>;
+
+      beforeEach(() => {
+        warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+      });
+
+      afterEach(() => {
+        warn.mockRestore();
+      });
+
+      it.each([
+        ["a blank name", { ...job, name: "  " }],
+        ["a non-string name", { ...job, name: 42 as never }],
+        ["a missing queue name", { name: "orders" } as never],
+      ])("runs the callback untraced given %s", async (_, given) => {
+        await expect(tracer.runJob(given, () => "ran")).resolves.toBe("ran");
+
+        await settle();
+        expect(jobSnapshots).toEqual([]);
+      });
+
+      it("says so once, not on every run", async () => {
+        await tracer.runJob({ ...job, name: 42 as never }, () => null);
+        await tracer.runJob({ ...job, queueName: "" }, () => null);
+
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            "runJob ran a job untraced, given a value of type number",
+          ),
+        );
+      });
     });
   });
 

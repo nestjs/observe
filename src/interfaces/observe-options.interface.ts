@@ -862,6 +862,28 @@ export interface JobContext {
   id: string | undefined;
 }
 
+/** The run `TracerService.runJob` opens a trace for. */
+export interface RunJobOptions {
+  /**
+   * Groups runs the way a queue does - `"kafka"`, `"cron"`. Keep it to a
+   * small, fixed set: it is the `queueName` every `jobs` hook sees.
+   */
+  queueName: string;
+  /**
+   * What the run does - a topic, a cron name. A stable, bounded name, never a
+   * per-run value, so runs aggregate together. Cut to 255 characters.
+   */
+  name: string;
+  /** Identifies this particular run. A fresh one is minted when absent. */
+  id?: string;
+  /**
+   * The trace id to report under - one read off an inbound message, say.
+   * Ignored unless it is 1-128 characters of letters, digits and `._:-`, the
+   * shape an inbound `x-request-id` is held to; the run mints its own then.
+   */
+  traceId?: string;
+}
+
 /** What a `skipSpans` function is told about the operation that finished. */
 export interface SkipSpansContext {
   /**

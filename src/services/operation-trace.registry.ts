@@ -76,6 +76,18 @@ const UNHANDLED_ERROR_STATUS_CODE = 500;
  */
 const HANDLED_ERROR_STATUS_CODE = 400;
 
+/**
+ * Runs manual span bookkeeping whose failure must not reach the code being
+ * traced: the span is a side effect of the call, not part of its outcome.
+ */
+function guardBookkeeping<T>(fn: () => T): T | undefined {
+  try {
+    return fn();
+  } catch {
+    return undefined;
+  }
+}
+
 /** A node and everything below it. */
 function countNodes(node: {
   children?: Array<CompleteTraceEventNode | OngoingTraceEventNode>;
@@ -1033,60 +1045,80 @@ export class OperationTraceRegistry {
     if (!activeSpan || !snapshot) {
       return spanFunction(new TraceSpanDelegate("", name, {}));
     }
-
-    // Book the span in the same ledger auto spans use. Completion goes through
-    // internalEndTraceStep, which increments refsMarkedAsComplete - without
-    // the matching increment here, every completed manual span pushed the
-    // completed count one ahead, and a trace holding one leaked auto span plus
-    // one manual span read as complete: pluckSnapshot then shipped a
-    // half-built tree whose ongoing node still held its circular `parent`
-    // reference, and JSON.stringify threw away the whole flush window.
-    snapshot.refsCounter += 1;
-
-    const newNodeId = uuidv7();
-    const startTime = performance.now();
-
-    // Same as internalStartTraceStep: without an enter, the exit issued on
-    // completion no-ops and the span's execution time is silently attributed
-    // to its parent - profile correlation for manual spans found nothing.
-    activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
-    const manualSpan: OngoingTraceEventNode = {
-      // Same identity rule as auto spans: the span id *is* the caller id it is
-      // registered under, so a log line written inside this span carries an id
-      // that resolves back to this node.
-      spanId: newNodeId,
+    return this.runManualSpan(
+      traceId,
+      snapshot,
+      callerId,
+      { className: activeSpan.className, methodKey: activeSpan.methodKey },
       name,
-      origin: "manual",
-      type: "start",
-      className: activeSpan.className,
-      methodKey: activeSpan.methodKey,
-      startTime,
-      startOffset: this.toStartOffset(snapshot, startTime),
-      children: [],
-    };
-    const refsByCaller = this.callerIdsByTraceId.get(traceId);
-    this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);
+      spanFunction,
+    );
+  }
 
-    refsByCaller?.set(newNodeId, manualSpan);
+  /**
+   * Opens a manual span at the root of a trace that no instrumented call has
+   * opened a span in - a run started by `TracerService.runJob`, whose trace
+   * would otherwise be dropped as span-less. `labels` stand in for the class
+   * and method an auto span would take them from.
+   */
+  async createRootSpan(
+    traceId: string,
+    labels: { className: string; methodKey: string },
+    name: string,
+    spanFunction: (span: TraceSpanDelegate) => any,
+  ) {
+    const snapshot = this.traceSnapshots.get(traceId);
+    if (!snapshot) {
+      return spanFunction(new TraceSpanDelegate("", name, {}));
+    }
+    return this.runManualSpan(
+      traceId,
+      snapshot,
+      undefined,
+      labels,
+      name,
+      spanFunction,
+    );
+  }
+
+  private runManualSpan(
+    traceId: string,
+    snapshot: SnapshotWithSignal,
+    callerId: string | undefined,
+    labels: { className: string; methodKey: string },
+    name: string,
+    spanFunction: (span: TraceSpanDelegate) => any,
+  ) {
+    const newNodeId = uuidv7();
+    const manualSpan = guardBookkeeping(() =>
+      this.openManualSpan(traceId, snapshot, callerId, labels, name, newNodeId),
+    );
+    if (!manualSpan) {
+      return spanFunction(new TraceSpanDelegate("", name, {}));
+    }
 
     const onResponse = (res: unknown) => {
-      this.internalEndTraceStep(
-        traceId,
-        newNodeId,
-        manualSpan.className,
-        manualSpan.methodKey,
-        newNodeId,
+      guardBookkeeping(() =>
+        this.internalEndTraceStep(
+          traceId,
+          newNodeId,
+          manualSpan.className,
+          manualSpan.methodKey,
+          newNodeId,
+        ),
       );
       return res;
     };
     const onError = (err: unknown) => {
-      this.internalEndTraceStep(
-        traceId,
-        newNodeId,
-        manualSpan.className,
-        manualSpan.methodKey,
-        newNodeId,
-        err as Error | string | object,
+      guardBookkeeping(() =>
+        this.internalEndTraceStep(
+          traceId,
+          newNodeId,
+          manualSpan.className,
+          manualSpan.methodKey,
+          newNodeId,
+          err as Error | string | object,
+        ),
       );
       // Re-throw the error to maintain original behavior
       throw err;
@@ -1113,5 +1145,54 @@ export class OperationTraceRegistry {
         }
       },
     );
+  }
+
+  private openManualSpan(
+    traceId: string,
+    snapshot: SnapshotWithSignal,
+    callerId: string | undefined,
+    labels: { className: string; methodKey: string },
+    name: string,
+    newNodeId: string,
+  ): OngoingTraceEventNode {
+    // Book the span in the same ledger auto spans use. Completion goes through
+    // internalEndTraceStep, which increments refsMarkedAsComplete - without
+    // the matching increment here, every completed manual span pushed the
+    // completed count one ahead, and a trace holding one leaked auto span plus
+    // one manual span read as complete: pluckSnapshot then shipped a
+    // half-built tree whose ongoing node still held its circular `parent`
+    // reference, and JSON.stringify threw away the whole flush window.
+    snapshot.refsCounter += 1;
+
+    const startTime = performance.now();
+
+    // Same as internalStartTraceStep: without an enter, the exit issued on
+    // completion no-ops and the span's execution time is silently attributed
+    // to its parent - profile correlation for manual spans found nothing.
+    activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
+    const manualSpan: OngoingTraceEventNode = {
+      // Same identity rule as auto spans: the span id *is* the caller id it is
+      // registered under, so a log line written inside this span carries an id
+      // that resolves back to this node.
+      spanId: newNodeId,
+      name,
+      origin: "manual",
+      type: "start",
+      className: labels.className,
+      methodKey: labels.methodKey,
+      startTime,
+      startOffset: this.toStartOffset(snapshot, startTime),
+      children: [],
+    };
+    let refsByCaller = this.callerIdsByTraceId.get(traceId);
+    this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);
+
+    if (!refsByCaller) {
+      refsByCaller = new Map<string, OngoingTraceEventNode>();
+      this.callerIdsByTraceId.set(traceId, refsByCaller);
+    }
+    refsByCaller.set(newNodeId, manualSpan);
+
+    return manualSpan;
   }
 }
