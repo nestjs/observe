@@ -6,8 +6,8 @@ const MAX_IDENTIFIER_LENGTH = 64;
  * falls through to the verb alone - a wrong table is worse than none.
  */
 const TABLE_AFTER: Record<string, RegExp> = {
-  SELECT: /\bFROM\s+([\w."`[\]]+)/i,
-  DELETE: /\bFROM\s+([\w."`[\]]+)/i,
+  SELECT: /\bFROM\s+(?:ONLY\s+)?([\w."`[\]]+)/i,
+  DELETE: /\bFROM\s+(?:ONLY\s+)?([\w."`[\]]+)/i,
   INSERT: /\bINTO\s+([\w."`[\]]+)/i,
   REPLACE: /\bINTO\s+([\w."`[\]]+)/i,
   UPDATE: /^\s*UPDATE\s+(?:ONLY\s+)?([\w."`[\]]+)/i,

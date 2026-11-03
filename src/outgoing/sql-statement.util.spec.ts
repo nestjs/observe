@@ -29,6 +29,16 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
       "DELETE sessions",
       "DELETE FROM sessions WHERE token = ?",
     ],
+    [
+      "SELECT * FROM ONLY users WHERE id = 1",
+      "SELECT users",
+      "SELECT * FROM ONLY users WHERE id = ?",
+    ],
+    [
+      "DELETE FROM ONLY sessions WHERE id = 1",
+      "DELETE sessions",
+      "DELETE FROM ONLY sessions WHERE id = ?",
+    ],
     ["BEGIN", "BEGIN", "BEGIN"],
     ["  ", "QUERY", ""],
   ])("%s", (sql, operation, statement) => {
