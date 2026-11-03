@@ -76,10 +76,7 @@ const UNHANDLED_ERROR_STATUS_CODE = 500;
  */
 const HANDLED_ERROR_STATUS_CODE = 400;
 
-/**
- * Runs manual span bookkeeping whose failure must not reach the code being
- * traced: the span is a side effect of the call, not part of its outcome.
- */
+/** Runs manual span bookkeeping whose failure must not reach the caller. */
 function guardBookkeeping<T>(fn: () => T): T | undefined {
   try {
     return fn();
@@ -1056,10 +1053,9 @@ export class OperationTraceRegistry {
   }
 
   /**
-   * Opens a manual span at the root of a trace that no instrumented call has
-   * opened a span in - a run started by `TracerService.runJob`, whose trace
-   * would otherwise be dropped as span-less. `labels` stand in for the class
-   * and method an auto span would take them from.
+   * Opens a manual span at the root of the trace, under `labels` in place of
+   * a caller's class and method. A trace that ends with no span at all is
+   * dropped, so a run no instrumented call opened one for needs this one.
    */
   async createRootSpan(
     traceId: string,

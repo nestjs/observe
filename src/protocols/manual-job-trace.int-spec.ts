@@ -22,7 +22,6 @@ class LedgerService {
   }
 }
 
-/** Stands in for a consumer loop: work that arrives through no Nest hook. */
 @Injectable()
 class OrdersConsumer {
   constructor(
@@ -64,9 +63,8 @@ class OrdersConsumer {
 class ManualJobTestModule {}
 
 /**
- * `TracerService.runJob`, end to end through a standalone application context
- * - the setting it exists for, where no request, queue driver or scheduler
- * opens a trace.
+ * `TracerService.runJob`, end to end through a standalone application
+ * context, where no request, queue driver or scheduler opens a trace for it.
  */
 describe("ObserveModule: TracerService.runJob", () => {
   let app: INestApplicationContext;

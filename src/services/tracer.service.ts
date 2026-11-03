@@ -26,7 +26,6 @@ import { OperationTraceRegistry } from "./operation-trace.registry.js";
  */
 const MAX_OPERATION_ID_LENGTH = 255;
 
-/** Trimmed and cut to `MAX_OPERATION_ID_LENGTH`; blank for a non-string. */
 function toBoundedName(value: unknown): string {
   const name = typeof value === "string" ? value.trim() : "";
   return name.length > MAX_OPERATION_ID_LENGTH
@@ -93,16 +92,16 @@ export class TracerService<
   }
 
   /**
-   * Runs `callback` under a trace of its own, reported as a job - for work no
-   * Nest hook sees: a Kafka consumer, a cron registered at runtime, a script on
-   * a standalone application context. Providers it calls nest under its root
-   * span, and its result or error is passed through unchanged; an error also
-   * marks the run failed.
+   * Runs `callback` under a trace of its own, reported as a job - for work that
+   * arrives through no hook the agent patches: a Kafka consumer, a cron added
+   * at runtime, a script on a standalone application context. Providers it
+   * calls nest under a root span named after the run. Its result is returned
+   * and its error re-thrown unchanged; an error also marks the run failed.
    *
-   * Inside an operation that is already traced, it opens a child span there
-   * instead, as `createSpan` does. Outside one, every call is a job of its own,
-   * so keep `queueName` and `name` stable and bounded - never a per-run value.
-   * A blank or non-string one runs the callback untraced.
+   * Every call outside a trace is a job of its own, so use stable, bounded
+   * names, not per-run values. Both are trimmed and cut to 255 characters, and
+   * a blank or non-string one runs the callback untraced. Inside a traced
+   * operation, it opens a child span there instead, as `createSpan` does.
    */
   async runJob<T>(
     job: RunJobOptions,
@@ -475,10 +474,6 @@ export class TracerService<
     );
   }
 
-  /**
-   * Built on first use: most applications never call `runJob`, and the queue
-   * agents build their own.
-   */
   private jobRunner(): JobTraceRunner<Record<string, unknown>> {
     this.jobTraceRunner ??= new JobTraceRunner(
       this.observeAgentSharedBuffer,
