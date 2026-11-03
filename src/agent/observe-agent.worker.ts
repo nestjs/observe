@@ -21,8 +21,6 @@ import { NodeRuntimeMetricsService } from "../services/node-runtime-metrics.serv
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   IngestMode,
-  NOT_INGESTED_GRACE_MS,
-  NotIngestedReason,
   OveragePauseReason,
   parseDegradedMessage,
   parseNotIngestedMessage,
@@ -706,13 +704,15 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
     const notIngested = parseNotIngestedMessage(msg);
     if (notIngested !== null) {
+      // Only a refusal of the credentials pauses OpenTelemetry interop. A
+      // batch that failed to get in otherwise - the collector down, a 5xx, a
+      // timeout, a 429 pause - is an outage at NestJS Observe, and the
+      // traces running through the services around this one stay whole
+      // through it.
       if (notIngested === "refused") {
         this.observeAgentSharedBuffer.recordRefused();
-      } else {
-        // After the paused line, when the worker pauses: it posts that first.
-        this.observeAgentSharedBuffer.recordFailed(this.sendsPausedUntil);
+        this.reportOpenTelemetryInterop("refused");
       }
-      this.reportOpenTelemetryInterop(notIngested);
       return;
     }
 
@@ -743,13 +743,11 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
   /**
    * Says when OpenTelemetry interop turns on or off, with `openTelemetry` on:
-   * it runs only while the collector takes this app's telemetry (see
+   * it runs only beside reporting to NestJS Observe (see
    * `ObserveAgentSharedBuffer.isIngesting`), and a `traceparent` that stops
    * going out with no word would read as a bug in the agent.
    */
-  private reportOpenTelemetryInterop(
-    why?: NotIngestedReason | "stopped",
-  ): void {
+  private reportOpenTelemetryInterop(why?: "refused" | "stopped"): void {
     if (this.options.openTelemetry !== true) {
       return;
     }
@@ -760,19 +758,18 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     this.reportedOpenTelemetry = on;
     if (on) {
       this.logger.log(
-        "OpenTelemetry interop is on: the collector is taking this app's telemetry, so traceparent is read and sent.",
+        "OpenTelemetry interop is on: the collector accepted this app's telemetry, so traceparent is read and sent. " +
+          "It stays on through collector outages and rate limits, and pauses only if the collector refuses the app's " +
+          "credentials or the telemetry worker stops.",
       );
       return;
     }
     const reason =
       why === "refused"
         ? "the collector refused this app's credentials"
-        : why === "stopped"
-          ? "the telemetry worker stopped"
-          : `no batch has reached the collector for ${NOT_INGESTED_GRACE_MS / 1000} seconds`;
+        : "the telemetry worker stopped";
     this.logger.warn(
-      `OpenTelemetry interop is paused: ${reason}. It runs only while the agent is reporting to NestJS Observe, ` +
-        `and resumes with the next batch the collector accepts.`,
+      `OpenTelemetry interop is paused: ${reason}. It resumes with the next batch the collector accepts.`,
     );
   }
 

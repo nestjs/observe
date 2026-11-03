@@ -68,11 +68,12 @@ speaks `x-request-id` alone and leaves any OpenTelemetry SDK in the process
 alone.
 
 It works only beside reporting to NestJS Observe. It turns on with the first
-batch the collector accepts, and pauses - saying so in the log - while the
-collector refuses the app's credentials, once batches have failed to get in
-for a minute, or while the agent's worker is down, resuming with the next batch
-the collector accepts. With `enabled: false`, or without credentials for the
-hosted collector, it never turns on.
+batch the collector accepts, and stays on through collector outages and rate
+limits, so traces through the services around yours stay whole while NestJS
+Observe is down. It pauses - saying so in the log - only while the collector
+refuses the app's credentials or the agent's worker is down, resuming with the
+next batch the collector accepts. With `enabled: false`, or without credentials
+for the hosted collector, it never turns on.
 
 ```typescript
 ObserveModule.forRoot({
@@ -537,7 +538,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `forwardLogs`            | `false`                             | Sends the application's log lines, each correlated to the trace it was written in - see [Logs](https://www.observe.nestjs.com/documentation/sdk#logs).                                           |
 | `redaction`              | on                                  | How log lines, error messages and captured requests are scrubbed before they leave the process: `enabled`, `useDefaultPatterns`, `patterns`, `keys` and `replacement`.                           |
 | `outgoing`               | on                                  | Query and outbound-HTTP spans. `false` turns both off; `{ database: false }` or `{ http: false }` one of them. `{ http: { propagateTraceId, traceContext } }` tunes the `x-request-id` and `traceparent` headers outbound calls carry - `traceparent` only with `openTelemetry`. |
-| `openTelemetry`          | `false`                             | Continues and sends W3C `traceparent`, names a request after the W3C trace it is in, and follows an OpenTelemetry SDK running in the same process - see [Observe and OpenTelemetry](#observe-and-opentelemetry). Works only while the agent is reporting to NestJS Observe. Off, the agent reads and sends `x-request-id` alone. |
+| `openTelemetry`          | `false`                             | Continues and sends W3C `traceparent`, names a request after the W3C trace it is in, and follows an OpenTelemetry SDK running in the same process - see [Observe and OpenTelemetry](#observe-and-opentelemetry). Works only beside reporting to NestJS Observe, and stays on through collector outages. Off, the agent reads and sends `x-request-id` alone. |
 | `http`                   |                                     | `ignore`, `tags`, `setAttributes`, `getUserId`, `queryParamsObfuscateRegex`, `tracePreflights` and `capture` - see [Capturing failed and slow requests](#capturing-failed-and-slow-requests).    |
 | `rpc`, `grpc`            |                                     | `ignore`, `tags`, `setAttributes` and `getUserId` for microservice and gRPC handlers.                                                                                                             |
 | `graphql`                |                                     | The same four, once per GraphQL operation.                                                                                                                                                        |

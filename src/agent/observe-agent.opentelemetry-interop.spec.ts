@@ -5,7 +5,6 @@ import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.
 import { NodeRuntimeMetricsService } from "../services/node-runtime-metrics.service.js";
 import {
   DEGRADED_MESSAGE_PREFIX,
-  NOT_INGESTED_GRACE_MS,
   NOT_INGESTED_MESSAGE_PREFIX,
   PAUSED_MESSAGE_PREFIX,
 } from "./degraded-ingest.protocol.js";
@@ -15,11 +14,13 @@ import { ObserveAgentWorker } from "./observe-agent.worker.js";
 const ACCEPTED = `${DEGRADED_MESSAGE_PREFIX}false`;
 const REFUSED = `${NOT_INGESTED_MESSAGE_PREFIX}refused`;
 const FAILED = `${NOT_INGESTED_MESSAGE_PREFIX}failed`;
+const HOUR_MS = 60 * 60 * 1000;
 
 /**
- * OpenTelemetry interop runs only while the agent is reporting to NestJS
- * Observe: the worker's lines about each batch open and close it, and the
- * agent says so when it turns on or off.
+ * OpenTelemetry interop runs only beside reporting to NestJS Observe: the
+ * first batch the collector accepts turns it on, and from then on only a
+ * refusal of the credentials or a stopped worker pauses it - an outage at
+ * NestJS Observe does not. The agent says so when it turns on or off.
  *
  * Driven through `handleMessage`, as the worker's own lines arrive.
  */
@@ -80,8 +81,8 @@ describe("ObserveAgentWorker and OpenTelemetry interop", () => {
     ]);
   });
 
-  it("pauses at once when the collector refuses the credentials, and says why", () => {
-    const { agent, buffer, warn } = boot();
+  it("pauses at once when the collector refuses the credentials, says why, and resumes with the next batch it accepts", () => {
+    const { agent, buffer, log, warn } = boot();
     agent.handleMessage(ACCEPTED);
 
     agent.handleMessage(`${PAUSED_MESSAGE_PREFIX}${Date.now() + 1_000}`);
@@ -89,10 +90,17 @@ describe("ObserveAgentWorker and OpenTelemetry interop", () => {
 
     expect(buffer.isIngesting()).toBe(false);
     expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "OpenTelemetry interop is paused: the collector refused this app's credentials",
-      ),
+      "OpenTelemetry interop is paused: the collector refused this app's credentials. " +
+        "It resumes with the next batch the collector accepts.",
     );
+
+    agent.handleMessage(ACCEPTED);
+
+    expect(buffer.isIngesting()).toBe(true);
+    const onLines = log.mock.calls.filter(([line]) =>
+      line.includes("OpenTelemetry interop is on"),
+    );
+    expect(onLines).toHaveLength(2);
   });
 
   it("never turns on for credentials the collector refuses from the start", () => {
@@ -105,40 +113,51 @@ describe("ObserveAgentWorker and OpenTelemetry interop", () => {
     expect(interopLines()).toEqual([]);
   });
 
-  it("rides out a short outage, and pauses once batches have failed for the grace", () => {
+  it("never turns on while no batch gets in, however long that lasts", () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
-    const { agent, buffer, warn } = boot();
-    agent.handleMessage(ACCEPTED);
+    const { agent, buffer, interopLines } = boot();
 
     agent.handleMessage(FAILED);
-    vi.setSystemTime(1_000_000 + NOT_INGESTED_GRACE_MS - 1);
+    vi.setSystemTime(1_000_000 + HOUR_MS);
     agent.handleMessage(FAILED);
-    expect(buffer.isIngesting()).toBe(true);
 
-    vi.setSystemTime(1_000_000 + NOT_INGESTED_GRACE_MS);
-    agent.handleMessage(FAILED);
     expect(buffer.isIngesting()).toBe(false);
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining(
-        `no batch has reached the collector for ${NOT_INGESTED_GRACE_MS / 1000} seconds`,
-      ),
-    );
-
-    agent.handleMessage(ACCEPTED);
-    expect(buffer.isIngesting()).toBe(true);
+    expect(interopLines()).toEqual([]);
   });
 
-  it("pauses at once for a rate-limit pause longer than the grace", () => {
-    const { agent, buffer } = boot();
+  it("stays on through an outage at the collector, however long, and says nothing", () => {
+    // A collector that is down, slow or answering 5xx: the worker posts the
+    // same line for each batch it could not get in.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const { agent, buffer, interopLines } = boot();
     agent.handleMessage(ACCEPTED);
 
-    agent.handleMessage(
-      `${PAUSED_MESSAGE_PREFIX}${Date.now() + 5 * NOT_INGESTED_GRACE_MS}`,
-    );
+    agent.handleMessage(FAILED);
+    vi.setSystemTime(1_000_000 + 10 * 60 * 1000);
+    agent.handleMessage(FAILED);
+    vi.setSystemTime(1_000_000 + 24 * HOUR_MS);
     agent.handleMessage(FAILED);
 
-    expect(buffer.isIngesting()).toBe(false);
+    expect(buffer.isIngesting()).toBe(true);
+    expect(interopLines()).toEqual([
+      expect.stringContaining("OpenTelemetry interop is on"),
+    ]);
+  });
+
+  it("stays on through a rate-limit pause, however long", () => {
+    const { agent, buffer, interopLines } = boot();
+    agent.handleMessage(ACCEPTED);
+
+    // A 429: the paused line first, then the failure, as the worker posts them.
+    agent.handleMessage(`${PAUSED_MESSAGE_PREFIX}${Date.now() + HOUR_MS}`);
+    agent.handleMessage(FAILED);
+
+    expect(buffer.isIngesting()).toBe(true);
+    expect(interopLines()).toEqual([
+      expect.stringContaining("OpenTelemetry interop is on"),
+    ]);
   });
 
   it("pauses when the worker stops, until a restarted one gets a batch in", () => {

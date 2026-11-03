@@ -43,8 +43,10 @@ export interface OutgoingHttpOptions {
    * same process: its instrumentations write the header on the calls they
    * cover, and a request takes only one.
    *
-   * Only with `openTelemetry` on, and only while the agent is reporting to
-   * NestJS Observe; otherwise no `traceparent` is sent.
+   * Only with `openTelemetry` on, and only beside reporting to NestJS
+   * Observe - from the first batch the collector accepts, through outages,
+   * until it refuses the app's credentials; otherwise no `traceparent` is
+   * sent.
    * @default true, with `openTelemetry` on
    */
   traceContext?: boolean;
@@ -106,8 +108,8 @@ export function subscribeOutgoingHttp(
   getRedactor: () => LogRedactor | null = () => null,
   /**
    * Whether calls carry W3C Trace Context now: with `openTelemetry` on and
-   * `traceContext` not off, while the collector takes this app's telemetry.
-   * Off unless given.
+   * `traceContext` not off, while the agent reports to NestJS Observe (see
+   * `ObserveAgentSharedBuffer.isIngesting`). Off unless given.
    */
   traceContextOn: () => boolean = () => false,
 ): () => void {
@@ -139,7 +141,7 @@ export function subscribeOutgoingHttp(
   // Only while `traceContextOn` says so, and then left to an OpenTelemetry
   // SDK in this process when it propagates W3C Trace Context - see
   // `openTelemetryWritesTraceparent`. Both asked per call: interop pauses
-  // while the collector is not taking telemetry, and an SDK may be
+  // while the collector refuses the app's credentials, and an SDK may be
   // registered after the application starts.
   const sendsTraceContext = () =>
     traceContextOn() && !openTelemetryWritesTraceparent();

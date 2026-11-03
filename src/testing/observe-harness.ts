@@ -251,7 +251,7 @@ export async function freePort(): Promise<number> {
  * Records that the collector accepted the app's telemetry, as the worker's
  * line for a batch that got in does - for a suite that runs with
  * `openTelemetry` on and sends nothing to a collector: interop runs only
- * while the collector takes the app's telemetry (see
+ * beside reporting to NestJS Observe (see
  * `ObserveAgentSharedBuffer.isIngesting`). The suite that drives that from a
  * real worker and collector is opentelemetry-ingest-gate.int-spec.ts.
  */

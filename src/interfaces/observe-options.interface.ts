@@ -703,12 +703,14 @@ export interface ObserveOptions {
    * A `traceIdGenerator` passed to `createObserveModule()` still names the
    * trace; the W3C one is carried on beside it.
    *
-   * It works only beside reporting to NestJS Observe: from the first batch
-   * the collector accepts, and paused - each time with a line in the log -
-   * while the collector refuses the app's credentials, once batches have
-   * failed to get in for a minute, or while the agent's worker is down. It
-   * resumes with the next batch the collector accepts. With `enabled: false`,
-   * or without credentials for the hosted collector, it never turns on.
+   * It works only beside reporting to NestJS Observe: it turns on with the
+   * first batch the collector accepts, and stays on through collector outages
+   * and rate limits, so traces through the services around this one stay
+   * whole while NestJS Observe is down. It pauses - each time with a line in
+   * the log - only while the collector refuses the app's credentials or the
+   * agent's worker is down, and resumes with the next batch the collector
+   * accepts. With `enabled: false`, or without credentials for the hosted
+   * collector, it never turns on.
    * @default false
    */
   openTelemetry?: boolean;
