@@ -444,6 +444,9 @@ describe("RpcObserveAgentService", () => {
           startTrace: vi.fn(),
           endTrace: vi.fn(),
           pluckSnapshot: vi.fn(),
+          // Asked by the end hook, which runs once the handler settles -
+          // since 12.0.4, when it fails too.
+          hasTrace: vi.fn(() => false),
         } as never,
         {} as never,
         { shouldCapture: () => overrides.capture ?? true } as never,
