@@ -84,9 +84,7 @@ describe("ObserveModule: TracerService.runJob", () => {
     await app?.close();
   });
 
-  afterEach(() => {
-    collected.clear();
-  });
+  beforeEach(() => collected.clear());
 
   it("reports a run as a completed job, with the providers it called nested under it", async () => {
     await expect(consumer.handle({ key: "offset-1" })).resolves.toBe(

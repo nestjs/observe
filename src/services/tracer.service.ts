@@ -55,7 +55,7 @@ export class TracerService<
   private readonly logger = new Logger(TracerService.name);
   private hasReportedUnusableOperationId = false;
   private hasReportedUnusableJobName = false;
-  private jobTraceRunner?: JobTraceRunner<Record<string, unknown>>;
+  private readonly runner: JobTraceRunner<Record<string | symbol, unknown>>;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -65,7 +65,15 @@ export class TracerService<
     private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,
-  ) {}
+  ) {
+    this.runner = new JobTraceRunner(
+      observeAgentSharedBuffer,
+      options,
+      operationTraceRegistry,
+      als,
+      this.logger,
+    );
+  }
 
   /**
    * Creates a new trace span with the given name and executes the provided callback within that span.
@@ -124,7 +132,7 @@ export class TracerService<
       return this.createSpan(name, callback) as Promise<Awaited<T>>;
     }
 
-    return this.jobRunner().run(
+    return this.runner.run(
       {
         queueName,
         name,
@@ -472,17 +480,6 @@ export class TracerService<
     this.logger.warn(
       `runJob ran a job untraced, given ${describeUnusableName(value)}: a job's queueName and name are non-blank strings. Later ones are not reported.`,
     );
-  }
-
-  private jobRunner(): JobTraceRunner<Record<string, unknown>> {
-    this.jobTraceRunner ??= new JobTraceRunner(
-      this.observeAgentSharedBuffer,
-      this.options,
-      this.operationTraceRegistry,
-      this.als as never,
-      this.logger,
-    );
-    return this.jobTraceRunner;
   }
 
   /**

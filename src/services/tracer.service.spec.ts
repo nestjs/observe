@@ -157,8 +157,6 @@ describe("TracerService", () => {
       return jobSnapshots[0];
     };
 
-    const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
-
     it("reports the run as a completed job, rooted in a span named after it", async () => {
       const result = await tracer.runJob(job, (span) => {
         span.setTag("partition", 3);
@@ -249,7 +247,7 @@ describe("TracerService", () => {
       expect(snapshot!.traces[0].children).toEqual([
         expect.objectContaining({ name: "orders.created", origin: "manual" }),
       ]);
-      await settle();
+      await new Promise((resolve) => setTimeout(resolve, 5));
       expect(jobSnapshots).toEqual([]);
     });
 
@@ -270,7 +268,7 @@ describe("TracerService", () => {
       const spanId = await disabled.runJob(job, (span) => span.id);
 
       expect(spanId).toBe("");
-      await settle();
+      await new Promise((resolve) => setTimeout(resolve, 5));
       expect(jobSnapshots).toEqual([]);
     });
 
@@ -292,7 +290,7 @@ describe("TracerService", () => {
       ])("runs the callback untraced given %s", async (_, given) => {
         await expect(tracer.runJob(given, () => "ran")).resolves.toBe("ran");
 
-        await settle();
+        await new Promise((resolve) => setTimeout(resolve, 5));
         expect(jobSnapshots).toEqual([]);
       });
 

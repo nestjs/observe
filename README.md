@@ -493,10 +493,13 @@ job, with every provider it calls nested under a root span named after it:
 ```ts
 import { TracerService } from "@nestjs/observe";
 
+// Inject TracerService in your consumer's constructor:
+constructor(private readonly tracerService: TracerService) {}
+
 // kafkajs: one run per message, under the trace id the producer sent along.
 await consumer.run({
   eachMessage: ({ topic, message }) =>
-    this.tracer.runJob(
+    this.tracerService.runJob(
       {
         queueName: "kafka",
         name: topic,
@@ -507,7 +510,7 @@ await consumer.run({
 });
 
 // The producer, inside a request or another run, forwards its trace id.
-const traceId = this.tracer.currentTraceId();
+const traceId = this.tracerService.currentTraceId();
 await producer.send({
   topic: "orders.created",
   messages: [
@@ -524,7 +527,7 @@ being registered, so wrap its callback the same way:
 
 ```ts
 const job = new CronJob("0 * * * *", () =>
-  this.tracer.runJob({ queueName: "cron", name: "reports.hourly" }, () =>
+  this.tracerService.runJob({ queueName: "cron", name: "reports.hourly" }, () =>
     this.reports.build(),
   ),
 );
