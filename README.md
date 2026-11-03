@@ -81,10 +81,10 @@ ObserveModule.forRoot({
 });
 ```
 
-It does not lock the data in, either. Traces carry W3C `traceparent` in and
-out, so a request through services instrumented with OpenTelemetry stays one
-trace, and the agent can export everything it records as OTLP to a collector,
-Jaeger, Tempo or any vendor, beside what it sends to Observe - see
+With `otlp` set as well, the agent exports the spans it records to the
+OpenTelemetry backend you already run - a collector, Jaeger, Tempo or any
+vendor - on the same trace ids, so the Nest service's spans sit in the same
+waterfall as the rest of the trace. See
 [Exporting to OpenTelemetry](#exporting-to-opentelemetry).
 
 ## Seeing it before installing
@@ -521,17 +521,25 @@ SLOs need a plan that has them - Scale or Enterprise. On any other plan, declara
 
 ## Exporting to OpenTelemetry
 
-`otlp` exports every trace the agent records as OpenTelemetry spans, over OTLP/HTTP, to a receiver of your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb, Datadog's agent, or any vendor that takes OTLP. It runs beside what the agent sends to NestJS Observe, never instead of it: with `enabled: false`, or without the `appKey` and `appSecret` the hosted collector needs, nothing is exported either. A proxy at `endpoint` that adds them on the way to NestJS Observe counts as reporting to it.
+With `openTelemetry: true`, `otlp` exports the traces the agent records as OpenTelemetry spans, over OTLP/HTTP, to a receiver of your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb, Datadog's agent, or any vendor that takes OTLP. A request that arrived with a `traceparent` goes under the caller's span, and each call it makes is the parent of what the service it calls exports, so the Nest service's spans land in the same trace, in the same waterfall, as the rest of your system.
 
 ```typescript
 ObserveModule.forRoot({
   serviceId: "orders-api",
+  openTelemetry: true,
   otlp: {
     endpoint: "https://api.honeycomb.io",
     headers: { "x-honeycomb-team": process.env.HONEYCOMB_API_KEY! },
   },
 });
 ```
+
+Export runs beside what the agent sends to NestJS Observe, never instead of it, and every plan includes it:
+
+- **Paid plans** export every trace the agent records, ahead of anything NestJS Observe does with its own copy: an overage trim or a paused overage changes what the dashboard keeps, not what is exported.
+- **Free** exports what NestJS Observe keeps. Once your apps send 30,000 events in one UTC day, or the month's allowance is used, most waterfalls are paused, and the requests and jobs behind them are exported as their own spans, without the spans under them; server errors, failed jobs and anything over 1 s keep their full traces in both places. While the collector can't be reached, what NestJS Observe keeps can't be known, so Free's export pauses a few minutes into the outage and resumes with the next batch the collector accepts.
+
+Which applies is the collector's to say: its reply to every batch the agent sends carries what the app's plan includes - the plan of the account that pays for the project. Export starts with the first batch the collector accepts and pauses whenever OpenTelemetry interop does, and the log says when it turns on and how. Without `openTelemetry: true`, without the `appKey` and `appSecret` the hosted collector needs, or with `enabled: false`, nothing is exported, and the agent says why at start-up. A proxy at `endpoint` that adds the credentials on the way to NestJS Observe counts as reporting to it.
 
 `otlp: true` takes everything from the standard variables instead, as an OpenTelemetry SDK would: `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`), `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, with their `_TRACES_` forms. Options set in code win over them. The variables never turn export on by themselves: an application that also runs an OpenTelemetry SDK has them set for that SDK, and would export every trace twice.
 
@@ -552,7 +560,7 @@ What a backend receives, for each operation:
 - **The same trace ids `traceparent` carries.** A request that arrived with a `traceparent` goes under the caller's span, and a call this service makes names its CLIENT span as the parent the callee sees - so services instrumented with OpenTelemetry, and other services running the agent, assemble into one trace in the backend.
 - **Errors** as span status and an `exception` event, with the class, message and stack the dashboard shows - redacted the same way.
 
-What is exported is what is recorded: after `tracesSampleRate`, `skipSpans` and `spanCollapse`. What the Observe collector does with its own copy - an account over its allowance, a paused overage - does not reach the export. Spans wait in a queue of at most 10,000 while an export is retried (429, 502, 503 and 504, honouring `Retry-After`); past that, whole operations are dropped and counted. Exports run on the application's thread, outside its traces, and whatever is queued is exported when the application closes, within `shutdownFlushTimeout`. Traces only, for now: runtime metrics, custom metrics and logs are not exported.
+What is exported is what is recorded: after `tracesSampleRate`, `skipSpans` and `spanCollapse`, and on Free after what NestJS Observe holds back. A request whose caller sampled its trace out (`traceparent` flags `00`) is not exported, as an OpenTelemetry SDK sampling by its parent would leave it out. Spans wait in a queue of at most 10,000 while an export is retried (429, 502, 503 and 504, honouring `Retry-After`); past that, whole operations are dropped and counted. Exports run on the application's thread, outside its traces, and whatever is queued is exported when the application closes, within `shutdownFlushTimeout`. Traces only, for now: runtime metrics, custom metrics and logs are not exported.
 
 ## Configuration
 
@@ -567,7 +575,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `serviceId`              | required                            | Names the service in the dashboard, in at most 100 characters - a longer one is cut to fit, with a warning at startup.                                                                           |
 | `serviceVersion`         | inferred                            | The release the process runs, at most 50 characters - see [What it records without any code](#what-it-records-without-any-code). `false` reports none.                                          |
 | `endpoint`               | `https://observe-api.nestjs.com`    | The collector's base URL - NestJS Observe, or a proxy that forwards to it. `OBSERVE_ENDPOINT` in the environment changes the default without touching the config.                                                                                  |
-| `otlp`                   | `false`                             | Exports traces as OpenTelemetry spans to a receiver of your own - see [Exporting to OpenTelemetry](#exporting-to-opentelemetry). `true` reads the `OTEL_EXPORTER_OTLP_*` variables.                     |
+| `otlp`                   | `false`                             | Exports traces as OpenTelemetry spans to a receiver of your own, with `openTelemetry: true` - see [Exporting to OpenTelemetry](#exporting-to-opentelemetry). `true` reads the `OTEL_EXPORTER_OTLP_*` variables. |
 | `flushInterval`          | `5000`                              | Milliseconds between sends of buffered telemetry; at least `1000`.                                                                                                                                |
 | `shutdownFlushTimeout`   | `2000`                              | Milliseconds closing the app waits for buffered telemetry to reach the collector before stopping the agent. `0` skips the final send - for test suites that boot the app with real credentials.   |
 | `maxTracesPerBatch`      | `1000`                              | The most traces one send carries.                                                                                                                                                                 |
