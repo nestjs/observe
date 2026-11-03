@@ -1,3 +1,4 @@
+import { UnauthorizedException } from "@nestjs/common";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, join, relative } from "path";
@@ -159,6 +160,14 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     error.message = "Invalid id";
 
     expect(collect(error)).toBeUndefined();
+  });
+
+  it("reads the frames of an error whose name contains its message", () => {
+    // `UnauthorizedException: Unauthorized` - the message's first match on
+    // the stack is inside the name, not where the frames start.
+    expect(files(collect(new UnauthorizedException()))).toContain(
+      "source-context.util.spec.ts",
+    );
   });
 
   it("reads the frames of an error with no message", () => {
