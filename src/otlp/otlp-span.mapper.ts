@@ -115,10 +115,14 @@ type TraceNode = CompleteTraceEventNode | OngoingTraceEventNode;
  * fans out), and anything derived from it would give them all one span. It
  * goes under the caller's span when the request arrived with a
  * `traceparent`, which is what joins it to the trace upstream.
+ *
+ * Without `withTree`, the SERVER span alone: what NestJS Observe keeps of an
+ * operation whose spans it holds back - see `OtlpExportGrant`.
  */
 export function requestSnapshotSpans(
   snapshot: RequestSnapshot,
   context: TraceContext | undefined,
+  withTree = true,
 ): OtlpSpan[] {
   const traceId = context?.traceId ?? w3cTraceIdOf(snapshot.traceId);
   const startNs = epochNanos(snapshot.calledAt);
@@ -163,7 +167,7 @@ export function requestSnapshotSpans(
   };
 
   const spans = [server];
-  for (const node of snapshot.traces ?? []) {
+  for (const node of withTree ? snapshot.traces ?? [] : []) {
     appendNodeSpans(spans, node, traceId, server.spanId, startNs);
   }
   return spans;
@@ -174,9 +178,12 @@ export function requestSnapshotSpans(
  * - INTERNAL for a scheduled one, which nothing sent - and its tree under
  * it. A job reports under the trace id of the operation that enqueued it,
  * so it lands in that trace; nothing records which span enqueued it, so it
- * has no parent there.
+ * has no parent there. Without `withTree`, the run's span alone.
  */
-export function jobSnapshotSpans(snapshot: JobSnapshot): OtlpSpan[] {
+export function jobSnapshotSpans(
+  snapshot: JobSnapshot,
+  withTree = true,
+): OtlpSpan[] {
   const traceId = w3cTraceIdOf(snapshot.traceId);
   const startNs = epochNanos(snapshot.calledAt);
   const scheduled = SCHEDULER_QUEUES.has(snapshot.queueName);
@@ -213,7 +220,7 @@ export function jobSnapshotSpans(snapshot: JobSnapshot): OtlpSpan[] {
   };
 
   const spans = [run];
-  for (const node of snapshot.traces ?? []) {
+  for (const node of withTree ? snapshot.traces ?? [] : []) {
     appendNodeSpans(spans, node, traceId, run.spanId, startNs);
   }
   return spans;

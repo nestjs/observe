@@ -86,13 +86,15 @@ interface ReceiverReply {
  * whatever receiver `otlp` names - a collector, Jaeger, Tempo, Honeycomb, a
  * vendor's agent - beside what goes to Observe, never instead of it: an agent
  * that sends Observe nothing (see `sendsToObserve`) exports nothing either.
+ * Part of OpenTelemetry interop, so it also takes `openTelemetry: true`: the
+ * `traceparent` the spans nest under is read only with that on.
  *
- * Fed every finished operation at the point all protocols hand theirs to the
- * shared buffer, and before anything the Observe side decides about it: the
- * Observe collector's answers (an account over its allowance, a paused
- * overage) and `maxTracesPerBatch` shape what goes to Observe, not what goes
- * here. What it is fed has already been through `tracesSampleRate`,
- * `skipSpans` and `spanCollapse`, and through redaction.
+ * Fed finished operations by the shared buffer, which decides what to hand
+ * over: nothing until the collector takes the app's telemetry and its reply
+ * grants export for the account's plan, and then - see `OtlpExportGrant` -
+ * either everything, before anything the Observe side decides about it, or
+ * only what NestJS Observe keeps. What it is fed has already been through
+ * `tracesSampleRate`, `skipSpans` and `spanCollapse`, and through redaction.
  *
  * Runs on the application's thread, unlike the Observe worker: an export is
  * a small encode and an asynchronous request, compression runs on libuv's
@@ -133,6 +135,11 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   private droppedSpans = 0;
   private reportedDrop = false;
   private reportedMappingFailure = false;
+  /**
+   * Why `otlp` is set and export still cannot run, said once at start-up;
+   * null when it can, or when `otlp` is not set at all.
+   */
+  private readonly offReason: string | null = null;
 
   constructor(
     @Inject(OBSERVE_OPTIONS)
@@ -140,9 +147,23 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     private readonly operationTraceRegistry: OperationTraceRegistry,
     private readonly asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
   ) {
-    // Off with the agent, and off while it reports to Observe nowhere - which
-    // the worker's start-up notice already says, export included.
+    if (!options.otlp) {
+      return;
+    }
+    // Off with the agent, which says so itself and records nothing.
+    if (options.enabled === false) {
+      return;
+    }
+    if (options.openTelemetry !== true) {
+      this.offReason =
+        "OTLP export is off: `otlp` takes `openTelemetry: true` as well, which reads the `traceparent` " +
+        "the exported spans nest under and sends one on every call out.";
+      return;
+    }
     if (!sendsToObserve(options)) {
+      this.offReason =
+        "OTLP export is off: it runs beside reporting to NestJS Observe, never instead of it, " +
+        "and this agent reports nothing to it - it has no credentials for the hosted collector, or still has `nest new`'s placeholders.";
       return;
     }
     const { settings, warnings } = resolveOtlpSettings(options.otlp, {
@@ -165,12 +186,23 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     });
   }
 
-  /** Whether `otlp` asked for export and it can run. */
+  /**
+   * Whether `otlp` is set up and export can run once the collector grants
+   * it - `openTelemetry` on, reporting to NestJS Observe, a usable endpoint.
+   */
   get enabled(): boolean {
     return this.settings !== undefined;
   }
 
+  /** Where export goes, once it is enabled. */
+  get url(): string | undefined {
+    return this.settings?.url;
+  }
+
   onModuleInit() {
+    if (this.offReason) {
+      this.logger.warn(this.offReason);
+    }
     if (!this.settings) {
       return;
     }
@@ -181,34 +213,45 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     this.flushTimer = setInterval(() => this.flush(), interval);
     this.flushTimer.unref();
     this.logger.log(
-      `Exporting traces over OTLP (${this.settings.protocol}) to ${this.settings.url}.`,
+      `OTLP export to ${this.settings.url} (${this.settings.protocol}) starts once NestJS Observe ` +
+        "accepts this app's first batch and says what its plan includes.",
     );
   }
 
-  /** Queues a finished request's spans. Never throws into the caller. */
-  exportRequestSnapshot(snapshot: RequestSnapshot): void {
+  /**
+   * Queues a finished request's spans - its own span, and with `withTree` the
+   * spans under it. Never throws into the caller.
+   *
+   * Left out when the request arrived in a trace its caller sampled out
+   * (`traceparent` flags 00), as an OpenTelemetry SDK sampling by its parent
+   * would leave it out: the caller exports none of that trace, so these
+   * spans would only hang in the backend under a parent it never gets.
+   */
+  exportRequestSnapshot(snapshot: RequestSnapshot, withTree = true): void {
     if (!this.settings) {
       return;
     }
     try {
-      this.enqueue(
-        requestSnapshotSpans(
-          snapshot,
-          this.operationTraceRegistry.traceContextOf(snapshot),
-        ),
-      );
+      const context = this.operationTraceRegistry.traceContextOf(snapshot);
+      if (context && !context.sampled) {
+        return;
+      }
+      this.enqueue(requestSnapshotSpans(snapshot, context, withTree));
     } catch (error) {
       this.reportMappingFailure(error);
     }
   }
 
-  /** Queues a finished job's spans. Never throws into the caller. */
-  exportJobSnapshot(snapshot: JobSnapshot): void {
+  /**
+   * Queues a finished job's spans - its own span, and with `withTree` the
+   * spans under it. Never throws into the caller.
+   */
+  exportJobSnapshot(snapshot: JobSnapshot, withTree = true): void {
     if (!this.settings) {
       return;
     }
     try {
-      this.enqueue(jobSnapshotSpans(snapshot));
+      this.enqueue(jobSnapshotSpans(snapshot, withTree));
     } catch (error) {
       this.reportMappingFailure(error);
     }

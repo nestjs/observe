@@ -17,6 +17,10 @@ import {
   detachedWorkerSource,
 } from "./detached-observe-worker.assembly.js";
 import {
+  OTLP_EXPORT_INGEST_MODE,
+  OTLP_EXPORT_MESSAGE_PREFIX,
+} from "../otlp/otlp-export-grant.js";
+import {
   readSdkVersion,
   UNKNOWN_SDK_VERSION,
 } from "../utils/sdk-version.util.js";
@@ -277,6 +281,103 @@ describe("what the detached worker makes of an accepted batch's reply", () => {
         Object.keys(readableModes).join(", "),
       );
       expect(received?.["x-api-key"]).toBe(credentials.appKey);
+    },
+    20_000,
+  );
+
+  /**
+   * Every line the worker posts for one accepted batch, up to and including
+   * its verdict - built from the real assembly, as `verdictFor` is.
+   */
+  const linesFor = async (asksForOtlpExport: boolean) => {
+    const worker = new Worker(detachedWorkerSource(), {
+      eval: true,
+      workerData: detachedWorkerData({
+        sharedBuffer: bufferWithBatch(JSON.stringify({ traces: [] })),
+        endpoint,
+        appKey: "k",
+        appSecret: "s",
+        flushInterval: 5000,
+        asksForOtlpExport,
+      }),
+    });
+    try {
+      return await new Promise<string[]>((resolve, reject) => {
+        const lines: string[] = [];
+        const timer = setTimeout(
+          () => reject(new Error("worker posted no verdict")),
+          5_000,
+        );
+        worker.on("message", (msg: string) => {
+          lines.push(msg);
+          if (msg.startsWith(DEGRADED_MESSAGE_PREFIX)) {
+            clearTimeout(timer);
+            // A copy: the worker goes on posting until it is terminated.
+            resolve([...lines]);
+          }
+        });
+        worker.once("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+    } finally {
+      await worker.terminate();
+    }
+  };
+
+  it("asks what the plan allows OTLP export only when it is set up to export", async () => {
+    const modes: Array<string | string[] | undefined> = [];
+    respond = (req, res) => {
+      modes.push(req.headers["x-observe-ingest-modes"]);
+      acceptWith({ degraded: false, otlpExport: "full" })(req, res);
+    };
+
+    const exporting = await linesFor(true);
+    const plain = await linesFor(false);
+
+    expect(modes).toEqual([
+      `${Object.keys(readableModes).join(", ")}, ${OTLP_EXPORT_INGEST_MODE}`,
+      Object.keys(readableModes).join(", "),
+    ]);
+    // Without it, the lines for a batch are what they always were.
+    expect(plain).not.toContainEqual(
+      expect.stringContaining(OTLP_EXPORT_MESSAGE_PREFIX),
+    );
+    expect(exporting).toContain(`${OTLP_EXPORT_MESSAGE_PREFIX}full`);
+  }, 20_000);
+
+  // The grant posted, the reply it is posted for, and that reply's body.
+  it.each([
+    ["full", "a paid plan's reply", { degraded: false, otlpExport: "full" }],
+    ["capped", "Free's reply", { degraded: false, otlpExport: "capped" }],
+    // Every reply says it again, the degraded ones too.
+    [
+      "capped",
+      "a paced Free day's reply",
+      { degraded: true, paced: true, otlpExport: "capped" },
+    ],
+    [
+      "full",
+      "a paused overage's reply",
+      { degraded: true, errorsOnly: true, otlpExport: "full" },
+    ],
+    // A collector that predates export says nothing, which grants nothing.
+    ["off", "a reply without a grant", { degraded: false }],
+    ["off", "a reply with no body", undefined],
+    ["off", "a grant this agent cannot read", { otlpExport: true }],
+    ["off", "an unknown grant", { otlpExport: "unlimited" }],
+  ])(
+    "posts `%s` for %s, ahead of the verdict",
+    async (grant, _reply, body) => {
+      respond = acceptWith(body);
+
+      const lines = await linesFor(true);
+
+      expect(lines.slice(-2)).toEqual([
+        `${OTLP_EXPORT_MESSAGE_PREFIX}${grant}`,
+        expect.stringMatching(new RegExp(`^${DEGRADED_MESSAGE_PREFIX}`)),
+      ]);
     },
     20_000,
   );

@@ -42,26 +42,6 @@ export function describeMissingCredentials(input: {
   scaffold: boolean;
   unset?: "both" | "appKey" | "appSecret";
   production: boolean;
-  /**
-   * `otlp` is set, and is off as well: it exports beside what goes to
-   * Observe, never instead of it. Said, or the missing export would read as
-   * a fault of the receiver's.
-   */
-  exportsOtlp?: boolean;
-}): CredentialsNotice {
-  const notice = describeForObserve(input);
-  return input.exportsOtlp
-    ? {
-        ...notice,
-        message: `${notice.message} OTLP export is off too: it runs beside reporting to NestJS Observe, not instead of it.`,
-      }
-    : notice;
-}
-
-function describeForObserve(input: {
-  scaffold: boolean;
-  unset?: "both" | "appKey" | "appSecret";
-  production: boolean;
 }): CredentialsNotice {
   if (input.production) {
     const state = input.scaffold

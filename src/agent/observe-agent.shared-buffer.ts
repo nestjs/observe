@@ -35,6 +35,7 @@ import { NodeRuntimeMetrics } from "../interfaces/node-runtime-metrics.interface
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import type { OtlpExportGrant } from "../otlp/otlp-export-grant.js";
 import { OtlpTraceExporter } from "../otlp/otlp-trace-exporter.service.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
 
@@ -251,11 +252,15 @@ export class ObserveAgentSharedBuffer {
     snapshot.operationId ??= fallbackOperationId(
       snapshot.attributes?.originalUrl,
     );
-    // Ahead of everything below that can leave the snapshot out: the
-    // collector's limits and its answers about this account decide what
-    // reaches Observe, not what an OTLP receiver of the application's own
-    // is sent. The raw snapshot, which the encoder below only copies.
-    this.otlpTraceExporter?.exportRequestSnapshot(snapshot);
+    // A full grant exports ahead of everything below that can leave the
+    // snapshot out: the collector's limits and its answers about this
+    // account decide what reaches Observe, not what an OTLP receiver of the
+    // application's own is sent. The raw snapshot, which the encoder below
+    // only copies. A capped grant exports what the batch keeps, further down.
+    const otlpExport = this.otlpExportGrant();
+    if (otlpExport === "full") {
+      this.otlpTraceExporter?.exportRequestSnapshot(snapshot);
+    }
     if (!snapshot.operationId) {
       if (this.options.debug) {
         this.logger.debug(
@@ -291,10 +296,15 @@ export class ObserveAgentSharedBuffer {
       // further down - they are not telemetry.
       if (this.sendsWhileErrorsOnly(encodedSnapshot)) {
         this._mainThreadBuffer.snapshots.push(encodedSnapshot);
+        if (otlpExport === "capped") {
+          // Sent, and never with its tree.
+          this.otlpTraceExporter?.exportRequestSnapshot(snapshot, false);
+        }
       } else {
         this.withheldSnapshots += 1;
       }
     } else {
+      let keepsTree = true;
       if (this.isDegraded() && !isNotableSnapshot(encodedSnapshot)) {
         // The collector is discarding these on arrival; shipping them costs
         // the application its own CPU and bandwidth for nothing. The snapshot
@@ -303,8 +313,12 @@ export class ObserveAgentSharedBuffer {
         // count goes with it, because it is the only record these existed.
         this.countTruncated(encodedSnapshot.t);
         encodedSnapshot.t = [];
+        keepsTree = false;
       }
       this._mainThreadBuffer.snapshots.push(encodedSnapshot);
+      if (otlpExport === "capped") {
+        this.otlpTraceExporter?.exportRequestSnapshot(snapshot, keepsTree);
+      }
     }
 
     // Read off the raw snapshot: the handler's span carries `Class.method`,
@@ -325,8 +339,12 @@ export class ObserveAgentSharedBuffer {
   }
 
   insertJobSnapshot(jobSnapshot: JobSnapshot) {
-    // Before the cap below, as for a request.
-    this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot);
+    // A full grant exports before the cap below, as for a request; a capped
+    // one what the batch keeps.
+    const otlpExport = this.otlpExportGrant();
+    if (otlpExport === "full") {
+      this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot);
+    }
     if (!this._mainThreadBuffer) {
       this._mainThreadBuffer = this.createEmptyPayload();
     }
@@ -355,18 +373,26 @@ export class ObserveAgentSharedBuffer {
       // makes it a server error - which is what the collector keeps of it too.
       if (this.sendsWhileErrorsOnly(encodedJobSnapshot)) {
         this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
+        if (otlpExport === "capped") {
+          this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot, false);
+        }
       } else {
         this.withheldJobs += 1;
       }
     } else {
+      let keepsTree = true;
       if (this.isDegraded() && !isNotableSnapshot(encodedJobSnapshot)) {
         // A job carries no status code, so the same rule grades it on its
         // error and its duration - which is what the collector does with it
         // too.
         this.countTruncated(encodedJobSnapshot.t);
         encodedJobSnapshot.t = [];
+        keepsTree = false;
       }
       this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
+      if (otlpExport === "capped") {
+        this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot, keepsTree);
+      }
     }
   }
 
@@ -491,6 +517,49 @@ export class ObserveAgentSharedBuffer {
   recordStopped(): void {
     this.ingesting = false;
     this.failingSince = 0;
+  }
+
+  /**
+   * What the collector's last accepted reply granted `otlp` - see
+   * `OtlpExportGrant`. Nothing until one says otherwise: what this agent may
+   * export is the collector's to say, for the plan the app's account is on.
+   */
+  private otlpExport: OtlpExportGrant = "off";
+
+  /**
+   * Until when a `capped` grant holds (epoch ms), refreshed by every reply
+   * that repeats it.
+   *
+   * A capped export is what NestJS Observe keeps, and the agent learns what
+   * that is only from replies. With none coming - an account the collector
+   * refuses at its limit, an outage - it would fall back on exporting every
+   * span once `isDegraded` lapsed. So the grant lapses first: it is set just
+   * before the verdict for the same reply, on the same TTL. A `full` grant
+   * holds until a reply says otherwise, and export then runs for as long as
+   * `isIngesting` does.
+   */
+  private otlpExportCappedUntil = 0;
+
+  /** Records what the collector's last accepted reply granted `otlp`. */
+  setOtlpExport(grant: OtlpExportGrant, now = Date.now()): void {
+    this.otlpExport = grant;
+    this.otlpExportCappedUntil = grant === "capped" ? now + DEGRADED_TTL_MS : 0;
+  }
+
+  /**
+   * What `otlp` may export right now: the collector's grant, while the
+   * collector takes this app's telemetry (`isIngesting`) - export runs beside
+   * reporting to NestJS Observe, never instead of it - and `off` otherwise.
+   * Asked once per operation, as it is handed over.
+   */
+  otlpExportGrant(now = Date.now()): OtlpExportGrant {
+    if (!this.otlpTraceExporter?.enabled || !this.isIngesting()) {
+      return "off";
+    }
+    if (this.otlpExport === "capped" && now >= this.otlpExportCappedUntil) {
+      return "off";
+    }
+    return this.otlpExport;
   }
 
   /**

@@ -12,6 +12,7 @@ import {
   createTelemetrySanitizer,
   SECTION_SHAPES,
 } from "./telemetry-wire-contract.js";
+import { OTLP_EXPORT_MESSAGE_PREFIX } from "../otlp/otlp-export-grant.js";
 import { describeIngestRefusal } from "../utils/ingest-refusal.util.js";
 import { readSdkVersion } from "../utils/sdk-version.util.js";
 
@@ -35,6 +36,8 @@ export function detachedWorkerData(input: {
   appKey?: string;
   appSecret?: string;
   flushInterval: number;
+  /** Whether `otlp` is set up to export - see `asksForOtlpExport`. */
+  asksForOtlpExport?: boolean;
 }): DetachedWorkerData {
   // Spelled out against the interface rather than spread, so a key the worker
   // starts reading is a compile error here until it is supplied.
@@ -47,6 +50,8 @@ export function detachedWorkerData(input: {
     degradedPrefix: DEGRADED_MESSAGE_PREFIX,
     pausedPrefix: PAUSED_MESSAGE_PREFIX,
     notIngestedPrefix: NOT_INGESTED_MESSAGE_PREFIX,
+    otlpExportPrefix: OTLP_EXPORT_MESSAGE_PREFIX,
+    asksForOtlpExport: input.asksForOtlpExport === true,
     sdkVersion: readSdkVersion(),
   };
   return { sharedBuffer: input.sharedBuffer, config };

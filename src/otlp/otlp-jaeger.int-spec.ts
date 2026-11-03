@@ -11,9 +11,14 @@ import { ObserveOptions } from "../interfaces/observe-options.interface.js";
 import { createObserveModule } from "../observe.module.js";
 import { TracerService } from "../services/tracer.service.js";
 import {
+  FakeCollector,
+  startFakeCollector,
+} from "../testing/fake-collector.js";
+import {
   listenOnLoopback,
   testObserveOptions,
 } from "../testing/observe-harness.js";
+import { untilIngesting } from "../testing/opentelemetry-e2e.js";
 import { w3cTraceIdOf } from "../utils/trace-context.util.js";
 import { SpanKind } from "./otlp-span.mapper.js";
 
@@ -147,6 +152,15 @@ class FrontController {
   }
 }
 
+/** Where `untilIngesting` sends its warm-up traffic. */
+@Controller()
+class HealthController {
+  @Get("health")
+  health() {
+    return "ok";
+  }
+}
+
 @Controller()
 class BackController {
   @Get("stock/:id")
@@ -163,7 +177,7 @@ async function boot(
 
   @Module({
     imports: [ObserveModule.forRoot(testObserveOptions(overrides))],
-    controllers: [controller],
+    controllers: [controller, HealthController],
   })
   class AppModule {}
 
@@ -185,14 +199,25 @@ describe.skipIf(!jaegerReachable)(
   "ObserveModule: OTLP export into Jaeger",
   () => {
     const run = Date.now().toString(36);
+    let collector: FakeCollector;
     let front: INestApplication;
     let frontUrl = "";
     let back: INestApplication;
 
     beforeAll(async () => {
-      back = await boot(BackController, {
-        serviceId: "back",
+      // Export starts once the collector takes a batch and grants it for
+      // the app's plan; this one grants every span.
+      collector = await startFakeCollector();
+      collector.answerWith({ degraded: false, otlpExport: "full" });
+      const reporting = {
+        endpoint: collector.url,
         flushInterval: 1000,
+        openTelemetry: true,
+      };
+
+      back = await boot(BackController, {
+        ...reporting,
+        serviceId: "back",
         otlp: {
           endpoint: JAEGER_OTLP,
           protocol: "http/json",
@@ -202,16 +227,20 @@ describe.skipIf(!jaegerReachable)(
       backUrl = await listenOnLoopback(back);
 
       front = await boot(FrontController, {
+        ...reporting,
         serviceId: "front",
-        flushInterval: 1000,
         otlp: { endpoint: JAEGER_OTLP, serviceName: `observe-front-${run}` },
       });
       frontUrl = await listenOnLoopback(front);
-    });
+
+      await untilIngesting(back, backUrl);
+      await untilIngesting(front, frontUrl);
+    }, 30_000);
 
     afterAll(async () => {
       await front?.close();
       await back?.close();
+      await collector?.close();
     });
 
     it("stores two services' spans as one trace, the far server span under the near client span", async () => {

@@ -39,6 +39,11 @@ import {
 } from "./credentials-notice.js";
 import { ObserveAgentSharedBuffer } from "./observe-agent.shared-buffer.js";
 import {
+  OtlpExportGrant,
+  parseOtlpExportMessage,
+} from "../otlp/otlp-export-grant.js";
+import { OtlpTraceExporter } from "../otlp/otlp-trace-exporter.service.js";
+import {
   collectorEndpointOf,
   hasScaffoldCredentials,
   isHostedCollector,
@@ -124,6 +129,9 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     // the module always provides it.
     @Optional()
     private readonly operationTraceRegistry?: OperationTraceRegistry,
+    // Optional for the same reason.
+    @Optional()
+    private readonly otlpTraceExporter?: OtlpTraceExporter,
   ) {}
 
   onModuleInit() {
@@ -164,7 +172,6 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
               ? "appKey"
               : "appSecret",
         production: process.env.NODE_ENV === "production",
-        exportsOtlp: Boolean(this.options.otlp),
       });
       if (notice.level === "warn") {
         this.logger.warn(notice.message);
@@ -609,6 +616,9 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
         appSecret: this.options.appSecret,
         // Clamped by `onModuleInit` before the first worker starts.
         flushInterval: this.options.flushInterval ?? DEFAULT_FLUSH_INTERVAL,
+        // Batches ask what the app's plan allows `otlp` to export only when
+        // it is set up to export at all.
+        asksForOtlpExport: this.otlpTraceExporter?.enabled === true,
       }),
     });
     this.watchWorker(this.worker);
@@ -656,6 +666,15 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
         this.observeAgentSharedBuffer.recordFailed(this.sendsPausedUntil);
       }
       this.reportOpenTelemetryInterop(notIngested);
+      return;
+    }
+
+    // Ahead of the verdict for the same batch, which the worker posts after
+    // it - see `OtlpExportGrant`.
+    const otlpExport = parseOtlpExportMessage(msg);
+    if (otlpExport !== null) {
+      this.observeAgentSharedBuffer.setOtlpExport(otlpExport);
+      this.reportOtlpExport(otlpExport);
       return;
     }
 
@@ -717,6 +736,40 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       `OpenTelemetry interop is paused: ${reason}. It runs only while the agent is reporting to NestJS Observe, ` +
         `and resumes with the next batch the collector accepts.`,
     );
+  }
+
+  /**
+   * The OTLP export grant last said, or null before the first. Kept beside
+   * the log so each change is said once: every accepted batch repeats it.
+   */
+  private reportedOtlpExport: OtlpExportGrant | null = null;
+
+  /**
+   * Says what the collector granted `otlp` when it changes, the first answer
+   * included - an export that stays silent would read as a broken receiver.
+   * Only the plan's answer: a pause while the collector is not taking the
+   * app's telemetry is said by the interop line above.
+   */
+  private reportOtlpExport(grant: OtlpExportGrant): void {
+    if (grant === this.reportedOtlpExport) {
+      return;
+    }
+    this.reportedOtlpExport = grant;
+    const url = this.otlpTraceExporter?.url ?? "the OTLP receiver";
+    if (grant === "full") {
+      this.logger.log(
+        `OTLP export is on: every trace this app records goes to ${url}.`,
+      );
+    } else if (grant === "capped") {
+      this.logger.log(
+        `OTLP export is on, capped by this app's plan: traces go to ${url} as NestJS Observe keeps them, ` +
+          "so an operation it keeps without its spans - past the plan's daily pacing or monthly allowance - is exported without them too.",
+      );
+    } else {
+      this.logger.warn(
+        `OTLP export is off: the collector did not grant it for this app's plan, so nothing goes to ${url}.`,
+      );
+    }
   }
 
   /** Whether this process has said the collector accepted its first batch. */

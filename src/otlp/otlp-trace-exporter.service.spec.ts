@@ -1,7 +1,6 @@
 import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { createServer, Server, Socket } from "net";
-import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import type { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import type { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
@@ -22,6 +21,7 @@ const options = (
     traceIdKey: "traceId",
     flushInterval: 60_000,
     shutdownFlushTimeout: 1_000,
+    openTelemetry: true,
     ...overrides,
   }) as ObserveModuleOptionsWithDefaults;
 
@@ -138,6 +138,141 @@ describe("OtlpTraceExporter", () => {
     await behindProxy.onApplicationShutdown();
   });
 
+  it("stays off without openTelemetry, and says why once at start-up", async () => {
+    const exporter = new OtlpTraceExporter(
+      options({
+        openTelemetry: false,
+        otlp: { endpoint: receiver.url, protocol: "http/json" },
+      }),
+      new OperationTraceRegistry(new AsyncLocalStorage()),
+      new AsyncLocalStorage(),
+    );
+    exporter.onModuleInit();
+    exporter.exportRequestSnapshot(snapshot());
+    await exporter.onApplicationShutdown();
+
+    expect(exporter.enabled).toBe(false);
+    expect(receiver.requests).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(
+      "OTLP export is off: `otlp` takes `openTelemetry: true`",
+    );
+  });
+
+  it("says once at start-up why it cannot run beside an agent that reports nothing", async () => {
+    const exporter = new OtlpTraceExporter(
+      options({
+        appKey: "YOUR_APP_KEY",
+        appSecret: "YOUR_APP_SECRET",
+        otlp: { endpoint: receiver.url },
+      }),
+      new OperationTraceRegistry(new AsyncLocalStorage()),
+      new AsyncLocalStorage(),
+    );
+    exporter.onModuleInit();
+    await exporter.onApplicationShutdown();
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain(
+      "OTLP export is off: it runs beside reporting to NestJS Observe",
+    );
+  });
+
+  it("says nothing at all when otlp is not set, or the agent is switched off", async () => {
+    for (const overrides of [
+      {},
+      { enabled: false, otlp: { endpoint: receiver.url } },
+    ]) {
+      const exporter = new OtlpTraceExporter(
+        options(overrides),
+        new OperationTraceRegistry(new AsyncLocalStorage()),
+        new AsyncLocalStorage(),
+      );
+      exporter.onModuleInit();
+      await exporter.onApplicationShutdown();
+    }
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("says at start-up that export waits for the collector's word on the plan", async () => {
+    const exporter = exporterFor(receiver.url);
+    await exporter.onApplicationShutdown();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(String(log.mock.calls[0][0])).toContain(
+      `OTLP export to ${receiver.url}/v1/traces (http/json) starts once NestJS Observe accepts`,
+    );
+  });
+
+  it("exports an operation without its tree when told to, as its own span alone", async () => {
+    const exporter = exporterFor(receiver.url);
+    exporter.exportRequestSnapshot(snapshot(3), false);
+    exporter.exportJobSnapshot(
+      {
+        id: "1",
+        traceId: "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        name: "send",
+        queueName: "emails",
+        calledAt: new Date().toISOString(),
+        duration: 3,
+        traces: [
+          {
+            origin: "auto",
+            className: "EmailsProcessor",
+            methodKey: "process",
+            duration: 2,
+            startOffset: 0,
+          },
+        ],
+      } as never,
+      false,
+    );
+    await exporter.onApplicationShutdown();
+
+    expect(receiver.spans().map((span) => span.name)).toEqual([
+      "GET /orders",
+      "emails send",
+    ]);
+  });
+
+  it("leaves out a request whose caller sampled its trace out, as a parent-based sampler would", async () => {
+    const registry = new OperationTraceRegistry(new AsyncLocalStorage());
+    const sampledOut = snapshot(1);
+    const sampledIn = snapshot(1, { operationId: "/sampled" });
+    vi.spyOn(registry, "traceContextOf").mockImplementation((of) =>
+      of === sampledOut
+        ? {
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+            parentSpanId: "00f067aa0ba902b7",
+            sampled: false,
+          }
+        : {
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4737",
+            parentSpanId: "00f067aa0ba902b8",
+            sampled: true,
+          },
+    );
+    const exporter = new OtlpTraceExporter(
+      options({ otlp: { endpoint: receiver.url, protocol: "http/json" } }),
+      registry,
+      new AsyncLocalStorage(),
+    );
+    exporter.onModuleInit();
+
+    exporter.exportRequestSnapshot(sampledOut);
+    exporter.exportRequestSnapshot(sampledIn);
+    await exporter.onApplicationShutdown();
+
+    expect(receiver.spans().map((span) => span.traceId)).toEqual([
+      "4bf92f3577b34da6a3ce929d0e0e4737",
+      "4bf92f3577b34da6a3ce929d0e0e4737",
+      "4bf92f3577b34da6a3ce929d0e0e4737",
+    ]);
+    expect(receiver.spans()[0].parentSpanId).toBe("00f067aa0ba902b8");
+  });
+
   it("sends a full batch at once, without waiting for the interval", async () => {
     const exporter = exporterFor(receiver.url);
     exporter.exportRequestSnapshot(snapshot(1_200));
@@ -241,63 +376,5 @@ describe("OtlpTraceExporter", () => {
 
       expect(Date.now() - started).toBeLessThan(2_000);
     });
-  });
-});
-
-describe("ObserveAgentSharedBuffer: the hand-off to OTLP export", () => {
-  const exporter = () => ({
-    exportRequestSnapshot: vi.fn(),
-    exportJobSnapshot: vi.fn(),
-  });
-  const bufferWith = (
-    otlp: ReturnType<typeof exporter>,
-    overrides: Partial<ObserveModuleOptionsWithDefaults> = {},
-  ) =>
-    new ObserveAgentSharedBuffer(
-      options(overrides),
-      undefined,
-      otlp as unknown as OtlpTraceExporter,
-    );
-
-  it("hands over every request, whole, whatever the Observe collector said about the account", () => {
-    const otlp = exporter();
-    const buffer = bufferWith(otlp);
-    buffer.setIngestMode("errors-only");
-    const request = snapshot(3);
-
-    buffer.insertRequestSnapshot(request);
-
-    expect(otlp.exportRequestSnapshot).toHaveBeenCalledWith(request);
-    expect(
-      (request.traces[0] as { children?: unknown[] }).children,
-    ).toHaveLength(3);
-  });
-
-  it("hands over what Observe's own batch leaves out: past maxTracesPerBatch, or with no operation id", () => {
-    const otlp = exporter();
-    const buffer = bufferWith(otlp, { maxTracesPerBatch: 1 });
-
-    buffer.insertRequestSnapshot(snapshot());
-    buffer.insertRequestSnapshot(snapshot());
-    buffer.insertRequestSnapshot(
-      snapshot(0, { operationId: undefined, attributes: undefined }),
-    );
-    buffer.insertJobSnapshot({
-      id: "1",
-      traceId: "t",
-      name: "job",
-      queueName: "emails",
-      traces: [],
-    });
-    buffer.insertJobSnapshot({
-      id: "2",
-      traceId: "t",
-      name: "job",
-      queueName: "emails",
-      traces: [],
-    });
-
-    expect(otlp.exportRequestSnapshot).toHaveBeenCalledTimes(3);
-    expect(otlp.exportJobSnapshot).toHaveBeenCalledTimes(2);
   });
 });
