@@ -1,4 +1,5 @@
 import { createServer, Server } from "node:http";
+import { gunzipSync } from "node:zlib";
 import { listenOnLoopback } from "./observe-harness.js";
 
 /** A span as an OpenTelemetry backend sees it, whichever process sent it. */
@@ -60,9 +61,11 @@ const attributesOf = (attributes: OtlpAttribute[] = []) =>
 /**
  * An OpenTelemetry backend on a free local port, as far as the services in a
  * suite can tell: it takes OTLP/HTTP in JSON - what
- * `@opentelemetry/exporter-trace-otlp-http` sends, and what
- * `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` selects - and keeps every span, so
- * a suite can ask which trace each service put its part of a request in.
+ * `@opentelemetry/exporter-trace-otlp-http` sends, what
+ * `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` selects, and what the agent's own
+ * `otlp` export sends with `protocol: "http/json"`, gzipped or not - and
+ * keeps every span, so a suite can ask which trace each service put its part
+ * of a request in.
  */
 export async function startOtlpReceiver(): Promise<OtlpReceiver> {
   const spans: ExportedSpan[] = [];
@@ -72,8 +75,12 @@ export async function startOtlpReceiver(): Promise<OtlpReceiver> {
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       try {
+        const raw = Buffer.concat(chunks);
         const body = JSON.parse(
-          Buffer.concat(chunks).toString(),
+          (req.headers["content-encoding"] === "gzip"
+            ? gunzipSync(raw)
+            : raw
+          ).toString(),
         ) as OtlpRequest;
         for (const resourceSpans of body.resourceSpans ?? []) {
           const service = String(
