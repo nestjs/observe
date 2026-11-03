@@ -24,8 +24,12 @@ export function defaultTraceIdGenerator(req: unknown) {
     }
   }
   // A microservice context, on a transport whose packets carry metadata: the
-  // id the calling service's client attached. Held to the same shape as the
-  // header - a packet is no more trustworthy than a request.
+  // id the calling service's client attached. TCP and Redis carry it inside
+  // the packet, from @nestjs/microservices 12.0.4. NATS, Kafka, RabbitMQ,
+  // MQTT 5 and gRPC carry it as a header, from the release that ships
+  // nestjs/nest#18386, which gave their contexts - and the context gRPC hands
+  // the processing hooks - the same `getMetadata()`. Held to the same shape as
+  // the header - a packet is no more trustworthy than a request.
   const getMetadata = (req as { getMetadata?: unknown } | null)?.getMetadata;
   if (typeof getMetadata === "function") {
     const metadata: unknown = getMetadata.call(req);

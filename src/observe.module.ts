@@ -460,6 +460,11 @@ export function createObserveModule<Store extends Record<string, unknown>>(
  * carry packet metadata - so this is a feature test, and a no-op on every
  * version before. The id goes out under the same name an HTTP hop uses, and
  * `defaultTraceIdGenerator` reads it back from the receiving context.
+ *
+ * TCP and Redis clients carry it from 12.0.4. The other clients have the
+ * method from 12.0.4 too, but call the hook - and carry the id as a header -
+ * only from the release that ships nestjs/nest#18386, so until then
+ * registering it there changes nothing.
  */
 function propagateTraceIdThrough(
   instance: unknown,

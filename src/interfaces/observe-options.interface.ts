@@ -72,7 +72,8 @@ export interface CreateObserveModuleOptions {
    * If not provided, a default trace ID generator will be used.
    * For HTTP protocols, the request object is passed to the function.
    * For non-HTTP protocols, the request object will be contextual and may not be available.
-   * The default implementation uses the 'x-request-id' header if available,
+   * The default implementation uses the 'x-request-id' header if available
+   * (for a microservice message, the 'x-request-id' in its packet metadata),
    * or mints a time-ordered UUID (version 7) if not - an id the collector can
    * locate in time without a scan.
    *

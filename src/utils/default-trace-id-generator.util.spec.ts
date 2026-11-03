@@ -1,4 +1,10 @@
 import {
+  KafkaContext,
+  MqttContext,
+  NatsContext,
+  RmqContext,
+} from "@nestjs/microservices";
+import {
   defaultTraceIdGenerator,
   openTelemetryTraceIdGenerator,
 } from "./default-trace-id-generator.util.js";
@@ -73,6 +79,93 @@ describe("defaultTraceIdGenerator", () => {
       );
     }
   });
+});
+
+/**
+ * Whether the installed `@nestjs/microservices` carries packet metadata over
+ * the header transports. Their contexts gained `getMetadata()` in one
+ * release, after TCP's and Redis's, so one of them stands for all four.
+ */
+const frameworkCarriesHeaderMetadata =
+  typeof (NatsContext.prototype as { getMetadata?: unknown }).getMetadata ===
+  "function";
+
+/**
+ * The contexts of the transports that carry packet metadata as headers, built
+ * the way their servers build them. The generator's feature test is the only
+ * thing that decides: the id the caller sent where the framework has
+ * `getMetadata()`, a minted one where it does not.
+ */
+describe("defaultTraceIdGenerator: header-carried packet metadata", () => {
+  const msgHdrs = (headers: Record<string, string>) => ({
+    keys: () => Object.keys(headers),
+    values: (key: string) => (key in headers ? [headers[key]] : []),
+  });
+  const contexts: [string, unknown][] = [
+    [
+      "NATS",
+      new NatsContext([
+        "orders.report",
+        msgHdrs({ "x-request-id": "carried-1" }),
+      ]),
+    ],
+    [
+      "Kafka",
+      new (KafkaContext as new (args: unknown[]) => KafkaContext)([
+        { headers: { "x-request-id": Buffer.from("carried-1") } },
+        0,
+        "orders.report",
+        {},
+        async () => undefined,
+        {},
+        // What the server read off the raw headers
+        { "x-request-id": "carried-1" },
+      ]),
+    ],
+    [
+      "RabbitMQ",
+      new RmqContext([
+        { properties: { headers: { "x-request-id": "carried-1" } } },
+        {},
+        "orders.report",
+      ]),
+    ],
+    [
+      "MQTT 5",
+      new MqttContext([
+        "orders/report",
+        { properties: { userProperties: { "x-request-id": "carried-1" } } },
+      ]),
+    ],
+  ];
+  it.runIf(frameworkCarriesHeaderMetadata).each(contexts)(
+    "adopts the id a %s client attached, where the framework carries it",
+    (_transport, context) => {
+      expect(defaultTraceIdGenerator(context)).toBe("carried-1");
+      expect(openTelemetryTraceIdGenerator(context)).toBe("carried-1");
+    },
+  );
+
+  it.runIf(!frameworkCarriesHeaderMetadata).each(contexts)(
+    "mints an id of its own for %s, where the framework has no packet metadata",
+    (_transport, context) => {
+      expect(defaultTraceIdGenerator(context)).toMatch(UUID);
+      expect(defaultTraceIdGenerator(context)).not.toBe("carried-1");
+    },
+  );
+
+  it.runIf(frameworkCarriesHeaderMetadata)(
+    "holds a header-carried id to the shape of an x-request-id header",
+    () => {
+      const context = new RmqContext([
+        { properties: { headers: { "x-request-id": "not an id\n" } } },
+        {},
+        "orders.report",
+      ]);
+
+      expect(defaultTraceIdGenerator(context)).toMatch(UUID);
+    },
+  );
 });
 
 describe("openTelemetryTraceIdGenerator", () => {
