@@ -324,16 +324,11 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
       this.validateLabels(labelOrValue);
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
-      if (!(stringifiedLabel in this.value)) {
-        throw new Error(
-          `Label "${stringifiedLabel}" does not exist in the gauge. Available labels: ${Object.keys(
-            this.value,
-          ).join(", ")}.`,
-        );
-      }
-
       const newValue = value ?? this._initialValue;
-      if (!admitsFinite(this.name, newValue, this.nonFinite)) {
+      if (
+        !admitsFinite(this.name, newValue, this.nonFinite) ||
+        !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
+      ) {
         return;
       }
       this.value[stringifiedLabel] = newValue;

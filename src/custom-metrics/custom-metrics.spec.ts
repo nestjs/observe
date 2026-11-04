@@ -232,6 +232,14 @@ describe("Gauge", () => {
   });
 
   describe("labels", () => {
+    it("sets a value on a label that was never recorded", () => {
+      const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
+
+      gauge.setValue({ pool: "main" }, 5);
+
+      expect(gauge.getValue({ pool: "main" })).toBe(5);
+    });
+
     it("keeps a separate level per label", () => {
       const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
 
