@@ -65,8 +65,8 @@ export interface OrdersService {
   /** Waits for the snapshot of a request to `path` at the collector. */
   snapshotFor(path: string): Promise<WireSnapshot>;
   /**
-   * Sends requests until the collector has taken a batch - OpenTelemetry
-   * interop runs only from then on.
+   * Sends requests until the collector has taken a batch - see
+   * `untilIngesting` in opentelemetry-e2e.ts.
    */
   untilIngesting(): Promise<void>;
   close(): Promise<void>;

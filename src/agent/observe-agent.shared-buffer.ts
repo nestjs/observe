@@ -413,11 +413,14 @@ export class ObserveAgentSharedBuffer {
   private errorsOnly = false;
 
   /**
-   * Whether this app reports to NestJS Observe - see `isIngesting`. False
-   * until the collector accepts a first batch: what has not been shown to
-   * reach NestJS Observe does not count as reaching it.
+   * How far this app's reporting to NestJS Observe has got - see
+   * `isReporting` and `isIngesting`. `off` until the worker starts with the
+   * application, `started` from then until the collector accepts a batch,
+   * and `ingesting` from that batch on. Refused credentials and a stopped
+   * worker set it back to `off`, and only an accepted batch moves it on
+   * from there.
    */
-  private ingesting = false;
+  private reporting: "off" | "started" | "ingesting" = "off";
 
   /**
    * Requests and jobs that errors-only ingest withheld from the batch being
@@ -462,9 +465,16 @@ export class ObserveAgentSharedBuffer {
   }
 
   /**
-   * Whether this app reports to NestJS Observe: from the first batch the
-   * collector accepts, until the collector refuses the app's credentials or
-   * the worker stops - and again from the next batch it accepts.
+   * Whether this app reports to NestJS Observe, as far as the agent can tell:
+   * from start-up, once its worker is running, until the collector refuses
+   * the app's credentials or the worker stops - and again from the next batch
+   * the collector accepts.
+   *
+   * Nothing has to get in first. A service's first requests are when a new
+   * instance joins the traces around it, and an agent set up to report -
+   * enabled, with credentials - almost always does. Credentials the collector
+   * refuses are learned from the first batch the worker sends, a flush
+   * interval into the app's traffic; until then they count as reporting.
    *
    * A batch that fails to get in for any other reason - a collector that is
    * down or slow to answer, a 5xx, a 429 pause, however long - leaves it as
@@ -476,26 +486,46 @@ export class ObserveAgentSharedBuffer {
    * OpenTelemetry interop runs on it (see `openTelemetry`): the agent reads
    * and sends `traceparent`, and follows an OpenTelemetry SDK in the process,
    * only beside reporting to NestJS Observe. So an agent that sends Observe
-   * nothing - `enabled: false`, no credentials, credentials the collector
-   * refuses - never turns it on.
+   * nothing - `enabled: false`, no credentials - never turns it on.
+   */
+  isReporting(): boolean {
+    return this.reporting !== "off";
+  }
+
+  /**
+   * Whether the collector takes this app's telemetry: from the first batch
+   * it accepts, until it refuses the app's credentials or the worker stops -
+   * and again from the next batch it accepts. What its replies grant, an
+   * OTLP export say, holds only while it does.
    */
   isIngesting(): boolean {
-    return this.ingesting;
+    return this.reporting === "ingesting";
+  }
+
+  /**
+   * The worker started with the application, set up to report: see
+   * `isReporting`. A worker restarted after a stop is not this - it has to
+   * get a batch in first - and a batch already taken stays taken.
+   */
+  recordStarted(): void {
+    if (this.reporting === "off") {
+      this.reporting = "started";
+    }
   }
 
   /** The collector accepted a batch, whatever it then kept of it. */
   recordAccepted(): void {
-    this.ingesting = true;
+    this.reporting = "ingesting";
   }
 
   /** The collector refused the app's credentials. */
   recordRefused(): void {
-    this.ingesting = false;
+    this.reporting = "off";
   }
 
   /** The worker stopped; a restarted one has to get a batch in again. */
   recordStopped(): void {
-    this.ingesting = false;
+    this.reporting = "off";
   }
 
   /**

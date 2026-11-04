@@ -314,7 +314,7 @@ describe("JobTraceRunner: W3C trace context, with openTelemetry on", () => {
     new JobTraceRunner(
       {
         insertJobSnapshot: vi.fn(),
-        isIngesting: () => reporting,
+        isReporting: () => reporting,
       } as unknown as ObserveAgentSharedBuffer,
       {
         traceIdKey: TRACE_ID_KEY,

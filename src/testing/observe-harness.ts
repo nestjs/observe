@@ -249,11 +249,12 @@ export async function freePort(): Promise<number> {
 
 /**
  * Records that the collector accepted the app's telemetry, as the worker's
- * line for a batch that got in does - for a suite that runs with
- * `openTelemetry` on and sends nothing to a collector: interop runs only
- * beside reporting to NestJS Observe (see
- * `ObserveAgentSharedBuffer.isIngesting`). The suite that drives that from a
- * real worker and collector is opentelemetry-ingest-gate.int-spec.ts.
+ * line for a batch that got in does - for a suite with no collector to
+ * answer. What a reply grants, an OTLP export, holds only once one has come
+ * (see `ObserveAgentSharedBuffer.isIngesting`), and an app that sends
+ * nothing runs OpenTelemetry interop only with it (see `isReporting`). The
+ * suite that drives interop from a real worker and collector is
+ * opentelemetry-ingest-gate.int-spec.ts.
  */
 export function markIngesting(app: INestApplication | INestMicroservice): void {
   app.get(ObserveAgentSharedBuffer, { strict: false }).recordAccepted();

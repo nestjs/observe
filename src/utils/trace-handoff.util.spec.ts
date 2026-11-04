@@ -232,7 +232,7 @@ describe("W3C trace context handed on to a job or a message", () => {
 });
 
 describe("OpenTelemetryInteropGate", () => {
-  const ingesting = (on: boolean) => ({ isIngesting: () => on });
+  const ingesting = (on: boolean) => ({ isReporting: () => on });
 
   it("is off until the module configures it", () => {
     expect(new OpenTelemetryInteropGate().isOn()).toBe(false);

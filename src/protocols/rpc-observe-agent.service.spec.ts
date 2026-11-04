@@ -550,7 +550,7 @@ describe("RpcObserveAgentService", () => {
             pluckSnapshot: vi.fn(),
             hasTrace: vi.fn(() => false),
           } as never,
-          { isIngesting: () => reporting } as never,
+          { isReporting: () => reporting } as never,
           { shouldCapture: () => overrides.capture ?? true } as never,
         );
         agent.onModuleInit();

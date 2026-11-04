@@ -159,7 +159,7 @@ export function parsePausedMessage(msg: string): number | null {
  * says so with its degraded verdict instead.
  *
  * Read for OpenTelemetry interop, which a refusal pauses and any other failure
- * leaves as it is - see `ObserveAgentSharedBuffer.isIngesting`.
+ * leaves as it is - see `ObserveAgentSharedBuffer.isReporting`.
  */
 export const NOT_INGESTED_MESSAGE_PREFIX = "observe:not-ingested=";
 

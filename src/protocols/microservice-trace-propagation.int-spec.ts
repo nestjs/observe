@@ -24,7 +24,6 @@ import {
   CollectedSnapshots,
   collectSnapshots,
   freePort,
-  markIngesting,
   testObserveOptions,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
@@ -359,7 +358,6 @@ describe("ObserveModule: the microservice dispatch hook, with openTelemetry on",
       logger: false,
     });
     await app.init();
-    markIngesting(app);
   });
 
   afterAll(async () => {

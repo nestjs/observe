@@ -164,11 +164,11 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
         () => operationTraceRegistry.getRedactor(),
         // W3C Trace Context goes out only with `openTelemetry` on, and only
         // while the agent reports to NestJS Observe - see
-        // `ObserveAgentSharedBuffer.isIngesting`.
+        // `ObserveAgentSharedBuffer.isReporting`.
         () =>
           this.options.openTelemetry === true &&
           http.traceContext !== false &&
-          this.observeAgentSharedBuffer?.isIngesting() === true,
+          this.observeAgentSharedBuffer?.isReporting() === true,
       );
       // Model calls are read off the spans above, so they go with them.
       if (outgoing?.llm !== false) {

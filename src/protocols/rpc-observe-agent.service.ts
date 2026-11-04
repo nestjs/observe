@@ -244,12 +244,12 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
 
   /**
    * Whether OpenTelemetry interop runs now: `openTelemetry` on, beside
-   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isIngesting`.
+   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isReporting`.
    */
   private openTelemetryInteropOn(): boolean {
     return (
       this.options.openTelemetry === true &&
-      this.observeAgentSharedBuffer.isIngesting()
+      this.observeAgentSharedBuffer.isReporting()
     );
   }
 

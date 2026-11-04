@@ -167,11 +167,11 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     const store = new Map<KeyOf<Store>, any>();
     this.asyncLocalStorage.run(store, () => {
       // OpenTelemetry interop runs only beside reporting to NestJS Observe -
-      // see `ObserveAgentSharedBuffer.isIngesting`. Asked once per request,
+      // see `ObserveAgentSharedBuffer.isReporting`. Asked once per request,
       // so a request is named and carried on one way throughout.
       const openTelemetry =
         this.options.openTelemetry === true &&
-        this.observeAgentSharedBuffer.isIngesting();
+        this.observeAgentSharedBuffer.isReporting();
       const traceId = generateTraceIdSafely(
         openTelemetry && usesDefaultTraceIdGenerator(this.options)
           ? openTelemetryTraceIdGenerator

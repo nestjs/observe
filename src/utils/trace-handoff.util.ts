@@ -109,18 +109,18 @@ export function continueHandedOnTrace<T>(
 
 /**
  * Whether OpenTelemetry interop runs now - `openTelemetry` on, beside
- * reporting to NestJS Observe (see `ObserveAgentSharedBuffer.isIngesting`) -
+ * reporting to NestJS Observe (see `ObserveAgentSharedBuffer.isReporting`) -
  * for what is set up before the module's options resolve: the microservice
  * dispatch hook, which a client is handed as it is instantiated. Off until
  * the module configures it.
  */
 export class OpenTelemetryInteropGate {
   private options?: { openTelemetry?: boolean };
-  private buffer?: { isIngesting(): boolean };
+  private buffer?: { isReporting(): boolean };
 
   configure(
     options: { openTelemetry?: boolean } | undefined,
-    buffer: { isIngesting(): boolean } | undefined,
+    buffer: { isReporting(): boolean } | undefined,
   ): this {
     this.options = options;
     this.buffer = buffer;
@@ -130,7 +130,7 @@ export class OpenTelemetryInteropGate {
   isOn(): boolean {
     return (
       this.options?.openTelemetry === true &&
-      this.buffer?.isIngesting() === true
+      this.buffer?.isReporting() === true
     );
   }
 }
