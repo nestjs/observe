@@ -33,8 +33,9 @@ jobs:
     # The queue suites need a real Redis, the query-span suites a real
     # Postgres, MySQL and MongoDB, and the Jaeger export suite a Jaeger. Each
     # skips itself when its server does not answer - which, without these,
-    # would be every CI run.
-    services:
+    # would be every CI run. Anchored for the older-Nest job below, which
+    # needs the same servers.
+    services: &services
       mysql:
         image: mysql:8
         env:
@@ -186,3 +187,47 @@ jobs:
             }
             console.log("require(esm) OK on node " + process.version);
           '
+
+  # The job above runs the suites on the Nest the devDependencies pin, the
+  # newest. This runs them on older ones the peer ranges promise: the first
+  # Nest 12, and the newest Nest 11. There the framework hooks the SDK
+  # feature-tests for are missing, so the code paths that must work without
+  # them run - the ones the newest Nest never takes. Cases that need a newer
+  # framework gate themselves on the installed major (src/testing/nest-version.ts).
+  #
+  # 12.0.1, not 12.0.0: 12.0.0 went out with Nest 11's peer ranges and was
+  # replaced within the half hour, so no install that reads peers can have it.
+  #
+  # Next to the "backward compatibility with Nest 11" step, not instead of it:
+  # that one installs the packed tarball as a consumer would, peers read
+  # strictly. This one runs the repository's suites from source.
+  #
+  # No lint, type-check or build: they check the source against the pinned
+  # Nest, which the job above does.
+  test-older-nest:
+    name: test (node ${{ matrix.node }}, nest ${{ matrix.nest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22"]
+        nest: ["12.0.1", "11.2.8"]
+    services: *services
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci --legacy-peer-deps
+
+      # The framework packages move as one set and the script fails on a mixed
+      # one: microservices 12.3.3 beside core 12.0.1 installs cleanly and then
+      # crashes at runtime.
+      - run: node scripts/use-nest.cjs ${{ matrix.nest }}
+
+      - run: npm test
+
+      - run: npm run test:int

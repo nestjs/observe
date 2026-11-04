@@ -659,6 +659,14 @@ $ docker run -d -p 4318:4318 -p 16686:16686 jaegertracing/jaeger:2.22.0
 
 To point them elsewhere, set `REDIS_HOST`/`REDIS_PORT`, `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE`, `MONGO_HOST`/`MONGO_PORT`, or `JAEGER_OTLP_ENDPOINT`/`JAEGER_QUERY_URL` for the suite that exports traces into Jaeger.
 
+The suites run on the Nest the devDependencies pin. CI also runs them on Nest 12.0.1 and 11.2.8; to do the same locally, swap the dev tree first. The script rewrites `package.json` and the lockfile, so restore both afterwards:
+
+```bash
+$ node scripts/use-nest.cjs 11.2.8
+$ npm test && npm run test:int
+$ git checkout -- package.json package-lock.json && npm ci --legacy-peer-deps
+```
+
 ## Module format
 
 The package ships as ESM only. CommonJS consumers can still `require()` it
