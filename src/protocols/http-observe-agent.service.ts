@@ -166,9 +166,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     // identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
     this.asyncLocalStorage.run(store, () => {
-      // OpenTelemetry interop runs only while the collector takes this app's
-      // telemetry - see `ObserveAgentSharedBuffer.isIngesting`. Asked once
-      // per request, so a request is named and carried on one way throughout.
+      // OpenTelemetry interop runs only beside reporting to NestJS Observe -
+      // see `ObserveAgentSharedBuffer.isIngesting`. Asked once per request,
+      // so a request is named and carried on one way throughout.
       const openTelemetry =
         this.options.openTelemetry === true &&
         this.observeAgentSharedBuffer.isIngesting();

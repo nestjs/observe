@@ -105,7 +105,7 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     operationTraceRegistry: OperationTraceRegistry,
     asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
     /**
-     * Says whether the collector takes this app's telemetry, which W3C Trace
+     * Says whether the agent reports to NestJS Observe, which W3C Trace
      * Context waits on. Absent only where a test builds the service by hand,
      * and interop then stays off.
      */
@@ -163,7 +163,7 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
         http,
         () => operationTraceRegistry.getRedactor(),
         // W3C Trace Context goes out only with `openTelemetry` on, and only
-        // while the collector takes this app's telemetry - see
+        // while the agent reports to NestJS Observe - see
         // `ObserveAgentSharedBuffer.isIngesting`.
         () =>
           this.options.openTelemetry === true &&

@@ -50,9 +50,11 @@ class CallerController {
 }
 
 /**
- * OpenTelemetry interop works only while the agent's worker reports to NestJS
- * Observe and the collector takes what it sends - driven end to end, through
- * the real worker and a collector whose answers change under it.
+ * OpenTelemetry interop works only beside reporting to NestJS Observe: it
+ * turns on once the collector accepts a batch, stays on through an outage at
+ * the collector - 5xx answers, a rate-limit pause - and pauses only while the
+ * collector refuses the app's credentials. Driven end to end, through the
+ * real worker and a collector whose answers change under it.
  *
  * Each request arrives in the caller's W3C trace. With interop on, it is
  * reported under that trace's id and its outbound call carries `traceparent`.
@@ -183,6 +185,26 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
     expect(output.lines.join("")).toContain("OpenTelemetry interop is on");
   });
 
+  /** How many times the agent has said interop paused. */
+  const pauses = () =>
+    output.lines.join("").split("OpenTelemetry interop is paused").length - 1;
+
+  it("stays on while the collector answers with errors", async () => {
+    collector.answerWith({ message: "Service Unavailable" }, 503);
+    const before = collector.requests.length;
+    // By the third failed batch, the worker's word on the first two has long
+    // reached the agent.
+    await withTraffic(
+      () => collector.requests.length >= before + 3,
+      10_000,
+      "three batches to fail against the collector",
+    );
+
+    expect(buffer.isIngesting()).toBe(true);
+    expectOn(await call("collector-erroring"));
+    expect(pauses()).toBe(0);
+  });
+
   it("turns off as soon as the collector refuses the credentials", async () => {
     collector.answerWith(
       { statusCode: 401, message: "Invalid API key or secret" },
@@ -210,6 +232,25 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
     );
 
     expectOn(await call("accepted-again"));
+  });
+
+  // Last: a paused worker sends nothing until the pause lapses.
+  it("stays on through a rate-limit pause, however long", async () => {
+    const pausesBefore = pauses();
+    collector.answerWith({ message: "Too Many Requests" }, 429, {
+      "Retry-After": "300",
+    });
+    // The worker says so after its paused and not-ingested lines, so by the
+    // time this one reaches the agent, those have too.
+    await withTraffic(
+      () => output.lines.join("").includes("Telemetry rate-limited (429)"),
+      10_000,
+      "the rate limit to reach the agent",
+    );
+
+    expect(buffer.isIngesting()).toBe(true);
+    expectOn(await call("rate-limited"));
+    expect(pauses()).toBe(pausesBefore);
   });
 });
 

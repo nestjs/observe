@@ -4,7 +4,6 @@ import {
   IngestMode,
   isNotableSnapshot,
   isServerErrorSnapshot,
-  NOT_INGESTED_GRACE_MS,
 } from "./degraded-ingest.protocol.js";
 import { MAX_BATCH_ITEMS } from "./telemetry-wire-contract.js";
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
@@ -377,17 +376,11 @@ export class ObserveAgentSharedBuffer {
   private errorsOnly = false;
 
   /**
-   * Whether the collector is taking this app's telemetry - see `isIngesting`.
-   * False until it accepts a first batch: what has not been shown to reach
-   * NestJS Observe does not count as reaching it.
+   * Whether this app reports to NestJS Observe - see `isIngesting`. False
+   * until the collector accepts a first batch: what has not been shown to
+   * reach NestJS Observe does not count as reaching it.
    */
   private ingesting = false;
-
-  /**
-   * When batches began failing to get in, since the last one that did; zero
-   * while they get in.
-   */
-  private failingSince = 0;
 
   /**
    * Requests and jobs that errors-only ingest withheld from the batch being
@@ -432,16 +425,22 @@ export class ObserveAgentSharedBuffer {
   }
 
   /**
-   * Whether the collector is taking this app's telemetry: from the first
-   * batch it accepts, until it refuses the app's credentials, the worker
-   * stops, or batches have kept failing to get in for
-   * `NOT_INGESTED_GRACE_MS` - and again from the next batch it accepts.
+   * Whether this app reports to NestJS Observe: from the first batch the
+   * collector accepts, until the collector refuses the app's credentials or
+   * the worker stops - and again from the next batch it accepts.
+   *
+   * A batch that fails to get in for any other reason - a collector that is
+   * down or slow to answer, a 5xx, a 429 pause, however long - leaves it as
+   * it is: that is an outage at NestJS Observe, and the traces running through
+   * the services around this one must not break over it. Refused credentials
+   * are a verdict on this app, and a stopped worker sends nothing until a new
+   * one gets a batch in.
    *
    * OpenTelemetry interop runs on it (see `openTelemetry`): the agent reads
    * and sends `traceparent`, and follows an OpenTelemetry SDK in the process,
-   * only while it is also reporting to NestJS Observe. So an agent that sends
-   * Observe nothing - `enabled: false`, no credentials, credentials the
-   * collector refuses - never turns it on.
+   * only beside reporting to NestJS Observe. So an agent that sends Observe
+   * nothing - `enabled: false`, no credentials, credentials the collector
+   * refuses - never turns it on.
    */
   isIngesting(): boolean {
     return this.ingesting;
@@ -450,36 +449,16 @@ export class ObserveAgentSharedBuffer {
   /** The collector accepted a batch, whatever it then kept of it. */
   recordAccepted(): void {
     this.ingesting = true;
-    this.failingSince = 0;
   }
 
   /** The collector refused the app's credentials. */
   recordRefused(): void {
     this.ingesting = false;
-    this.failingSince = 0;
-  }
-
-  /**
-   * A batch did not get in - see `NotIngestedReason`. `pausedUntil` is when a
-   * paused worker sends again: nothing gets in before then, so a pause longer
-   * than the grace ends ingesting at once rather than after it.
-   */
-  recordFailed(pausedUntil = 0, now = Date.now()): void {
-    if (this.failingSince === 0) {
-      this.failingSince = now;
-    }
-    if (
-      Math.max(now, pausedUntil) - this.failingSince >=
-      NOT_INGESTED_GRACE_MS
-    ) {
-      this.ingesting = false;
-    }
   }
 
   /** The worker stopped; a restarted one has to get a batch in again. */
   recordStopped(): void {
     this.ingesting = false;
-    this.failingSince = 0;
   }
 
   /**
