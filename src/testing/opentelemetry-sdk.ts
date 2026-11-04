@@ -13,13 +13,18 @@ import { createRequire } from "node:module";
  * instrumentations only patch modules loaded after `start()`.
  *
  * Spans are kept in memory rather than exported, to be read back with
- * `getFinishedSpans()`.
+ * `getFinishedSpans()`. Metrics and logs are not kept at all: left to its
+ * environment, the SDK exports both over OTLP to localhost:4318, and its
+ * shutdown waits out the retries of a metric export nothing answers - some
+ * nine seconds of a suite's teardown where no collector listens there.
  */
 export const openTelemetrySpans = new InMemorySpanExporter();
 
 const sdk = new NodeSDK({
   serviceName: "orders-api",
   spanProcessors: [new SimpleSpanProcessor(openTelemetrySpans)],
+  metricReaders: [],
+  logRecordProcessors: [],
   instrumentations: [getNodeAutoInstrumentations()],
 });
 sdk.start();
