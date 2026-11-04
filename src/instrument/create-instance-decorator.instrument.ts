@@ -725,11 +725,52 @@ function declaresPrivateMembers(ctor: Function): boolean {
 /**
  * The class name that labels an instance's spans. A null-prototype object or
  * an ES module namespace has no `constructor`, and some objects hold a
- * non-function there. Both fall back to `Object`.
+ * non-function there. Both fall back to `Object`. An `ioredis` client is
+ * named for what it is - see `ioredisClassNameOf`.
  */
 function classNameOf(instance: object): string {
   const ctor: unknown = Reflect.get(instance, "constructor");
-  return typeof ctor === "function" ? ctor.name : FALLBACK_CLASS_NAME;
+  if (typeof ctor !== "function") {
+    return FALLBACK_CLASS_NAME;
+  }
+  return (
+    (ctor.name === "EventEmitter" && ioredisClassNameOf(instance)) || ctor.name
+  );
+}
+
+/**
+ * `Redis` or `Cluster` for an `ioredis` client, null for anything else.
+ *
+ * Both classes take `EventEmitter`'s methods by copying the own properties of
+ * its prototype onto theirs, `constructor` included, so a client's
+ * `constructor` is `EventEmitter` and every command would be labelled
+ * `EventEmitter.get`. Both extend ioredis's `Commander`, whose prototype keeps
+ * its own `constructor`, and a client has `sendCommand`.
+ *
+ * Matched by name and shape only, as `isMongoDriverHandle` is: ioredis is an
+ * application's dependency, never imported here, and an application may carry
+ * more than one copy of it - BullMQ and Bull bring their own.
+ */
+function ioredisClassNameOf(instance: object): string | null {
+  try {
+    const candidate = instance as {
+      sendCommand?: unknown;
+      isCluster?: unknown;
+    };
+    const base = Object.getPrototypeOf(Object.getPrototypeOf(instance)) as {
+      constructor?: { name?: unknown };
+    } | null;
+    if (
+      base?.constructor?.name !== "Commander" ||
+      typeof candidate.sendCommand !== "function"
+    ) {
+      return null;
+    }
+    return candidate.isCluster === true ? "Cluster" : "Redis";
+  } catch {
+    // A prototype or a property that cannot be read names nothing.
+    return null;
+  }
 }
 
 function generateSpanId(instance: object, methodKey: string): string {

@@ -155,16 +155,10 @@ describe.skipIf(!redisReachable)(
       const [cache] = spansOf(traces, "CartCache");
 
       // The client's own calls, each its own span, where they were made.
-      // ioredis's are labelled `EventEmitter`: spans are named after an
-      // instance's `constructor`, which ioredis's EventEmitter mixin copies
-      // over `Redis.prototype.constructor`.
-      expect(namesOf(cache.children ?? [])).toEqual([
-        "EventEmitter.set",
-        "EventEmitter.get",
-      ]);
+      expect(namesOf(cache.children ?? [])).toEqual(["Redis.set", "Redis.get"]);
       expect(namesOf(handler.children ?? [])).toEqual([
         "CartCache.read",
-        "EventEmitter.expire",
+        "Redis.expire",
         "ClientRedis.emit",
       ]);
     });
