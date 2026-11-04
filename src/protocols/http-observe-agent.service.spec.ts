@@ -18,6 +18,8 @@ describe("HttpObserveAgentService", () => {
     data: { attributes?: { originalUrl?: string } };
     reportedTraceId?: string;
   }>;
+  /** The traces the agent told the registry to keep without a span. */
+  let keptWithoutSpans: string[];
 
   const createService = (
     http: ObserveModuleOptionsWithDefaults["http"] = {},
@@ -28,8 +30,12 @@ describe("HttpObserveAgentService", () => {
     },
   ) => {
     startedTraces = [];
+    keptWithoutSpans = [];
     const registry = {
       getRedactor: () => null,
+      keepWithoutSpans: (traceId: string) => {
+        keptWithoutSpans.push(traceId);
+      },
       hasTrace: (traceId: string) =>
         startedTraces.some((started) => started.traceId === traceId),
       startTrace: (
@@ -169,12 +175,15 @@ describe("HttpObserveAgentService", () => {
       expect(startedTraces).toHaveLength(0);
     });
 
-    it("traces a preflight when tracePreflights is on", () => {
+    it("traces a preflight when tracePreflights is on, kept without a span", () => {
       const service = createService({ tracePreflights: true });
 
       preflight(service);
 
       expect(startedTraces).toHaveLength(1);
+      // The CORS layer answers it before any handler or middleware could
+      // record a span, and a trace with none is otherwise dropped.
+      expect(keptWithoutSpans).toEqual([startedTraces[0].traceId]);
     });
 
     it("traces an OPTIONS request that is not a preflight", () => {
@@ -184,6 +193,8 @@ describe("HttpObserveAgentService", () => {
       preflight(service, { origin: "https://app.example.com" });
 
       expect(startedTraces).toHaveLength(1);
+      // A handler ran for it, or the request reached none and is dropped.
+      expect(keptWithoutSpans).toEqual([]);
     });
   });
 

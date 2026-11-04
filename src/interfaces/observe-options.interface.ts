@@ -530,11 +530,13 @@ export interface ObserveOptions {
      * sends ahead of a cross-origin call.
      *
      * Off by default. A preflight is answered by the CORS middleware before
-     * any route matches, so it has no route to be grouped under. Whenever
-     * middleware registered ahead of CORS (helmet, compression) records a
-     * span for it, it is reported under its URL instead - one "route" per
-     * distinct URL, ids included, for every call a browser client makes. An
-     * `OPTIONS` request without that header is traced either way.
+     * any route matches, so it has no route to be grouped under: on, each one
+     * is reported under its URL - one "route" per distinct URL, ids included,
+     * for every call a browser client makes. That holds whether or not
+     * middleware registered ahead of CORS (helmet, compression) ran for it,
+     * and on Fastify from `@nestjs/platform-fastify` 12.1.3 none does: Nest
+     * answers a preflight there before its middleware. An `OPTIONS` request
+     * without that header is traced either way.
      * @default false
      */
     tracePreflights?: boolean;
