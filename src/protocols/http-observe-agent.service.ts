@@ -252,6 +252,11 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         traceId,
         traceContext,
       );
+      // Answered by the CORS layer before any route, and on Fastify before
+      // any middleware too: a preflight asked for has no span to keep it.
+      if (isPreflight(req)) {
+        this.operationTraceRegistry.keepWithoutSpans(registryKey);
+      }
       this.evictTraceOnClientAbort(res, registryKey);
       done();
     });
@@ -371,20 +376,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     return false;
   }
 
-  /**
-   * A CORS preflight, when `http.tracePreflights` has not asked for them.
-   *
-   * Recognised by what the CORS spec defines a preflight to be - `OPTIONS`
-   * with an `Access-Control-Request-Method` header - rather than by the
-   * method alone, so an application's own `OPTIONS` handler is still traced.
-   * Every adapter lower-cases header names.
-   */
+  /** A CORS preflight, when `http.tracePreflights` has not asked for them. */
   private isUntracedPreflight(req: IncomingHttpRequest): boolean {
-    return (
-      !this.options.http?.tracePreflights &&
-      req.method === "OPTIONS" &&
-      req.headers?.["access-control-request-method"] !== undefined
-    );
+    return !this.options.http?.tracePreflights && isPreflight(req);
   }
 
   private shouldIgnoreRequest(req: { url: string; method: string }): boolean {
@@ -444,4 +438,17 @@ function toGlobalRegExp(pattern: RegExp | undefined): RegExp | undefined {
     return pattern;
   }
   return new RegExp(pattern.source, pattern.flags + "g");
+}
+
+/**
+ * A CORS preflight: what the CORS spec defines one to be - `OPTIONS` with an
+ * `Access-Control-Request-Method` header - rather than the method alone, so
+ * an application's own `OPTIONS` handler is still traced as a request. Every
+ * adapter lower-cases header names.
+ */
+function isPreflight(req: IncomingHttpRequest): boolean {
+  return (
+    req.method === "OPTIONS" &&
+    req.headers?.["access-control-request-method"] !== undefined
+  );
 }

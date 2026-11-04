@@ -63,6 +63,12 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    * is applied.
    */
   customOperationId?: string;
+  /**
+   * Set by `keepWithoutSpans`: the operation is reported even if no span was
+   * recorded under it, which `endTrace` otherwise takes to mean no handler
+   * ran.
+   */
+  keptWithoutSpans?: true;
 };
 
 /**
@@ -393,9 +399,12 @@ export class OperationTraceRegistry {
       }
 
       // Ignore snapshots that have no traces as that means
-      // the request didnt even have a handler in the first place
-      this.traceSnapshots.delete(traceId);
-      return;
+      // the request didnt even have a handler in the first place - unless
+      // the transport said the operation is complete without one.
+      if (!snapshot.keptWithoutSpans) {
+        this.traceSnapshots.delete(traceId);
+        return;
+      }
     }
     // Set by `startTrace` and deleted a few lines below, so it is always there
     // for a snapshot still in the registry. The fallback keeps a duration of 0
@@ -834,6 +843,22 @@ export class OperationTraceRegistry {
   }
 
   /**
+   * Reports the trace even if it ends with no span recorded under it.
+   *
+   * `endTrace` drops such a trace, as a request no handler ran for. A CORS
+   * preflight that `http.tracePreflights` asked for is the one operation that
+   * is complete without a handler: the CORS layer answers it before any
+   * route, and - on Fastify from `@nestjs/platform-fastify` 12.1.3 - before
+   * any middleware that could record a span for it.
+   */
+  keepWithoutSpans(traceId: TraceId): void {
+    const snapshot = this.traceSnapshots.get(traceId);
+    if (snapshot) {
+      snapshot.keptWithoutSpans = true;
+    }
+  }
+
+  /**
    * Drops a trace that will never be plucked, freeing both maps.
    *
    * The HTTP agent calls this when a client aborts: the adapter's response
@@ -889,7 +914,7 @@ export class OperationTraceRegistry {
       }
       cleanup();
 
-      // These four are what distinguish the registry's working copy from the
+      // These five are what distinguish the registry's working copy from the
       // snapshot the API receives, so removing them is the hand-off.
       const bookkeeping = snapshot as Partial<SnapshotWithSignal>;
       const customOperationId = bookkeeping.customOperationId;
@@ -897,6 +922,7 @@ export class OperationTraceRegistry {
       delete bookkeeping.refsMarkedAsComplete;
       delete bookkeeping.errorStatusCode;
       delete bookkeeping.customOperationId;
+      delete bookkeeping.keptWithoutSpans;
 
       // Before `skipSpans`, which judges the operation by the name it is
       // reported under.

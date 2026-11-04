@@ -124,6 +124,38 @@ describe("OperationTraceRegistry", () => {
       await expect(registry.pluckSnapshot("t2")).resolves.toBeUndefined();
     });
 
+    /** A CORS preflight as the HTTP agent starts it: no route matched it. */
+    const startPreflight = (traceId: string) =>
+      registry.startTrace(traceId, {
+        protocol: "http",
+        attributes: { method: "OPTIONS", originalUrl: "/orders/7" },
+        tags: {},
+      });
+
+    it("keeps a trace marked as complete without spans, and ships it unmarked", async () => {
+      // A traced CORS preflight: the CORS layer answered it before any
+      // handler, or any middleware, could record a span.
+      startPreflight("t2b");
+      registry.keepWithoutSpans("t2b");
+      registry.endTrace("t2b", { statusCode: 204 });
+
+      const snapshot = await registry.pluckSnapshot("t2b");
+      expect(snapshot).toBeDefined();
+      expect(snapshot?.traces).toEqual([]);
+      expect(snapshot).not.toHaveProperty("keptWithoutSpans");
+    });
+
+    it("still discards an unmarked trace beside a marked one", async () => {
+      startPreflight("t2c");
+      startPreflight("t2d");
+      registry.keepWithoutSpans("t2c");
+      registry.endTrace("t2c", { statusCode: 204 });
+      registry.endTrace("t2d", { statusCode: 204 });
+
+      await expect(registry.pluckSnapshot("t2c")).resolves.toBeDefined();
+      await expect(registry.pluckSnapshot("t2d")).resolves.toBeUndefined();
+    });
+
     it("replaces a trace started twice under the same id", async () => {
       startRequest("t3");
       const first = registry.internalStartTraceStep(

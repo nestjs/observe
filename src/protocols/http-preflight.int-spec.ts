@@ -33,10 +33,14 @@ class OrdersController {
 
 type Platform = "express" | "fastify" | "node";
 
-/** One CORS-enabled application per set of options, on any adapter. */
+/**
+ * One CORS-enabled application per set of options, on any adapter, with a
+ * middleware ahead of CORS unless `middleware` is false.
+ */
 async function bootApp(
   platform: Platform,
   overrides: Partial<ObserveOptions>,
+  { middleware = true }: { middleware?: boolean } = {},
 ): Promise<{ app: INestApplication; collected: CollectedSnapshots }> {
   const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -63,17 +67,18 @@ async function bootApp(
             new FastifyAdapter(),
             { instrument: ObserveInstrument, logger: false },
           );
-  // Ahead of CORS, the way helmet or compression usually are. A preflight
-  // with no span is dropped as a request no handler ran for, so without a
-  // middleware the agent records as one, there would be nothing to report
-  // and both cases below would pass for the wrong reason.
-  app.use(function securityHeaders(
-    _req: unknown,
-    _res: unknown,
-    next: () => void,
-  ) {
-    next();
-  });
+  // Ahead of CORS, the way helmet or compression usually are, so the
+  // preflight has a span when the adapter runs middleware for it - Express
+  // does, Fastify from @nestjs/platform-fastify 12.1.3 answers it first.
+  if (middleware) {
+    app.use(function securityHeaders(
+      _req: unknown,
+      _res: unknown,
+      next: () => void,
+    ) {
+      next();
+    });
+  }
   app.enableCors();
   const collected = collectSnapshots(app);
   await app.init();
@@ -158,6 +163,37 @@ describe.each<Platform>(["express", "fastify", "node"])(
           (item) => item.attributes?.method === "OPTIONS",
         );
         expect(snapshot.attributes?.statusCode).toBe(204);
+      });
+    });
+
+    describe("with tracePreflights and nothing ahead of CORS", () => {
+      let app: INestApplication;
+      let collected: CollectedSnapshots;
+
+      beforeAll(async () => {
+        ({ app, collected } = await bootApp(
+          platform,
+          { http: { tracePreflights: true } },
+          { middleware: false },
+        ));
+      });
+
+      afterAll(async () => {
+        await app?.close();
+      });
+
+      // No span to keep it: before, it was dropped as a request no handler
+      // ran for - on every adapter here, and on Fastify from 12.1.3 even with
+      // a middleware, since Nest answers the preflight there before any.
+      it("reports the preflight without spans", async () => {
+        await preflight(app);
+
+        const snapshot = await waitForSnapshot(
+          collected,
+          (item) => item.attributes?.method === "OPTIONS",
+        );
+        expect(snapshot.attributes?.statusCode).toBe(204);
+        expect(snapshot.traces).toEqual([]);
       });
     });
   },
