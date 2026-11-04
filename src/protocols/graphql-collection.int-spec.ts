@@ -1,7 +1,6 @@
 import { INestApplication, Injectable, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
 import {
   Args,
@@ -17,6 +16,7 @@ import {
 } from "@nestjs/graphql";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -126,7 +126,7 @@ type Platform = "express" | "node";
  * `Query.orders` rather than `/graphql`, and a failing resolver is recorded as
  * an error even though GraphQL answered the request with a 200.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: GraphQL collection (%s)",
   (platform) => {
     let app: INestApplication;
@@ -138,7 +138,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         GraphqlTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         {
           instrument: ObserveInstrument,
           logger: false,

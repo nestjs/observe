@@ -13,6 +13,7 @@ import {
   ClientNats,
   ClientRMQ,
   ClientsModule,
+  NatsContext,
   Transport,
 } from "@nestjs/microservices";
 import { createObserveModule } from "../observe.module.js";
@@ -25,6 +26,16 @@ import {
   waitForSnapshot,
 } from "../testing/observe-harness.js";
 import { readTraceContext, w3cTraceIdOf } from "../utils/trace-context.util.js";
+
+/**
+ * Whether the installed `@nestjs/microservices` sends packet metadata as the
+ * header transports' own headers (12.3.3 and later). Their contexts gained
+ * `getMetadata()` in the same release, so `NatsContext` stands in - as in the
+ * gRPC trace propagation suite. Before it there are no such headers to read.
+ */
+const frameworkCarriesMetadata =
+  typeof (NatsContext.prototype as { getMetadata?: unknown }).getMetadata ===
+  "function";
 
 /** Packet metadata, as the dispatch hook leaves it. */
 type Metadata = Record<string, string> | undefined;
@@ -139,80 +150,85 @@ interface Packets {
  * on connect and this repository does not install, so it stops at the
  * packet.
  */
-describe("OpenTelemetry interop on the NATS, Kafka, RabbitMQ and MQTT clients", () => {
-  let app: INestApplication;
-  let url = "";
-  let snapshots: CollectedSnapshots;
+describe.runIf(frameworkCarriesMetadata)(
+  "OpenTelemetry interop on the NATS, Kafka, RabbitMQ and MQTT clients",
+  () => {
+    let app: INestApplication;
+    let url = "";
+    let snapshots: CollectedSnapshots;
 
-  beforeAll(async () => {
-    const { ObserveModule, ObserveInstrument } = createObserveModule();
+    beforeAll(async () => {
+      const { ObserveModule, ObserveInstrument } = createObserveModule();
 
-    @Module({
-      imports: [
-        ObserveModule.forRoot(testObserveOptions({ openTelemetry: true })),
-        ClientsModule.register([
-          { name: "NATS", transport: Transport.NATS },
-          { name: "KAFKA", transport: Transport.KAFKA },
-          {
-            name: "RMQ",
-            transport: Transport.RMQ,
-            options: { queue: "orders" },
-          },
-          {
-            name: "MQTT",
-            transport: Transport.MQTT,
-            // User properties, and so packet metadata, are MQTT 5's.
-            options: { protocolVersion: 5 },
-          },
-        ]),
-      ],
-      controllers: [OrdersController],
-    })
-    class OrdersModule {}
+      @Module({
+        imports: [
+          ObserveModule.forRoot(testObserveOptions({ openTelemetry: true })),
+          ClientsModule.register([
+            { name: "NATS", transport: Transport.NATS },
+            { name: "KAFKA", transport: Transport.KAFKA },
+            {
+              name: "RMQ",
+              transport: Transport.RMQ,
+              options: { queue: "orders" },
+            },
+            {
+              name: "MQTT",
+              transport: Transport.MQTT,
+              // User properties, and so packet metadata, are MQTT 5's.
+              options: { protocolVersion: 5 },
+            },
+          ]),
+        ],
+        controllers: [OrdersController],
+      })
+      class OrdersModule {}
 
-    app = await NestFactory.create(OrdersModule, {
-      instrument: ObserveInstrument,
-      logger: false,
+      app = await NestFactory.create(OrdersModule, {
+        instrument: ObserveInstrument,
+        logger: false,
+      });
+      snapshots = collectSnapshots(app);
+      markIngesting(app);
+      url = await listenOnLoopback(app);
     });
-    snapshots = collectSnapshots(app);
-    markIngesting(app);
-    url = await listenOnLoopback(app);
-  });
 
-  afterAll(async () => {
-    await app?.close();
-  });
+    afterAll(async () => {
+      await app?.close();
+    });
 
-  it("puts a traceparent in the trace Observe reports the request under in every client's packet, beside x-request-id, and Kafka, RabbitMQ and MQTT carry both as headers", async () => {
-    const response = await fetch(`${url}/orders/1/packets`);
-    expect(response.status).toBe(200);
-    const packets = (await response.json()) as Packets;
-    const { traceId } = await waitForSnapshot(
-      snapshots,
-      (snapshot) => snapshot.protocol === "http",
-    );
+    it("puts a traceparent in the trace Observe reports the request under in every client's packet, beside x-request-id, and Kafka, RabbitMQ and MQTT carry both as headers", async () => {
+      const response = await fetch(`${url}/orders/1/packets`);
+      expect(response.status).toBe(200);
+      const packets = (await response.json()) as Packets;
+      const { traceId } = await waitForSnapshot(
+        snapshots,
+        (snapshot) => snapshot.protocol === "http",
+      );
 
-    expect(Object.keys(packets).sort()).toEqual([
-      "kafka",
-      "mqtt",
-      "nats",
-      "rmq",
-    ]);
-    for (const [transport, { metadata, headers }] of Object.entries(packets)) {
-      // The packet: Observe's id for the trace, and a traceparent the spec
-      // accepts, for the same trace in its W3C form.
-      expect(metadata?.["x-request-id"], transport).toBe(traceId);
-      expect(
-        readTraceContext({ traceparent: metadata?.["traceparent"] })?.traceId,
-        transport,
-      ).toBe(w3cTraceIdOf(traceId));
-      // What the transport sends: both, as they are.
-      if (transport !== "nats") {
-        expect(headers?.["x-request-id"], transport).toBe(traceId);
-        expect(headers?.["traceparent"], transport).toBe(
-          metadata?.["traceparent"],
-        );
+      expect(Object.keys(packets).sort()).toEqual([
+        "kafka",
+        "mqtt",
+        "nats",
+        "rmq",
+      ]);
+      for (const [transport, { metadata, headers }] of Object.entries(
+        packets,
+      )) {
+        // The packet: Observe's id for the trace, and a traceparent the spec
+        // accepts, for the same trace in its W3C form.
+        expect(metadata?.["x-request-id"], transport).toBe(traceId);
+        expect(
+          readTraceContext({ traceparent: metadata?.["traceparent"] })?.traceId,
+          transport,
+        ).toBe(w3cTraceIdOf(traceId));
+        // What the transport sends: both, as they are.
+        if (transport !== "nats") {
+          expect(headers?.["x-request-id"], transport).toBe(traceId);
+          expect(headers?.["traceparent"], transport).toBe(
+            metadata?.["traceparent"],
+          );
+        }
       }
-    }
-  });
-});
+    });
+  },
+);

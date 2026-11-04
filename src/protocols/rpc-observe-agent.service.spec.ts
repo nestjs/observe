@@ -2,6 +2,7 @@ import { ServerKafka, Transport } from "@nestjs/microservices";
 import { context as otelContext, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
+import { createRequire } from "node:module";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createInstanceDecorator } from "../instrument/create-instance-decorator.instrument.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
@@ -10,6 +11,7 @@ import { TRACE_CONTEXT_KEY, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { TracerService } from "../services/tracer.service.js";
+import { nestMajor } from "../testing/nest-version.js";
 import { waitFor } from "../testing/observe-harness.js";
 import { RpcObserveAgentService } from "./rpc-observe-agent.service.js";
 
@@ -683,27 +685,45 @@ describe("RpcObserveAgentService", () => {
       });
     });
 
-    it("lets a Kafka consumer see an event handler's failure", async () => {
-      const server = new ServerKafka({});
-      createHookedAgent().registerRpcHooks(server as never);
-      const error = new Error("handler failed");
-      server.addHandler(
-        "orders",
-        async () => {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          throw error;
-        },
-        true,
-      );
+    // Nest 11's ServerKafka loads kafkajs as it is constructed, Nest 12's only
+    // once it listens - so before 12 this needs kafkajs installed.
+    const itWithServerKafka = it.runIf(
+      nestMajor >= 12 || isInstalled("kafkajs"),
+    );
 
-      await expect(
-        server.getMessageHandler()({
-          topic: "orders",
-          partition: 0,
-          message: { value: Buffer.from("{}"), headers: {} },
-          heartbeat: async () => undefined,
-        } as never),
-      ).rejects.toBe(error);
-    });
+    itWithServerKafka(
+      "lets a Kafka consumer see an event handler's failure",
+      async () => {
+        const server = new ServerKafka({});
+        createHookedAgent().registerRpcHooks(server as never);
+        const error = new Error("handler failed");
+        server.addHandler(
+          "orders",
+          async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            throw error;
+          },
+          true,
+        );
+
+        await expect(
+          server.getMessageHandler()({
+            topic: "orders",
+            partition: 0,
+            message: { value: Buffer.from("{}"), headers: {} },
+            heartbeat: async () => undefined,
+          } as never),
+        ).rejects.toBe(error);
+      },
+    );
   });
 });
+
+function isInstalled(name: string): boolean {
+  try {
+    createRequire(import.meta.url).resolve(name);
+    return true;
+  } catch {
+    return false;
+  }
+}

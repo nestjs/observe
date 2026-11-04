@@ -8,9 +8,9 @@ import {
 } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -69,7 +69,7 @@ type Platform = "express" | "node";
  * mistake ships a customer's payload: the body, the slow threshold, and an
  * application naming a header it should not have.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: request capture (%s)",
   (platform) => {
     let app: INestApplication;
@@ -78,7 +78,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         CaptureTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         {
           instrument: ObserveInstrument,
           logger: false,

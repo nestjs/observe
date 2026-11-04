@@ -10,7 +10,12 @@ import {
   Param,
 } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
-import { ClientGrpc, ClientsModule, Transport } from "@nestjs/microservices";
+import {
+  ClientGrpc,
+  ClientsModule,
+  NatsContext,
+  Transport,
+} from "@nestjs/microservices";
 import { join } from "node:path";
 import { firstValueFrom, Observable } from "rxjs";
 import { createObserveModule } from "../observe.module.js";
@@ -36,6 +41,15 @@ const PROTO_PATH = join(
   "testing",
   "orders.test.proto",
 );
+
+/**
+ * Whether the installed `@nestjs/microservices` carries packet metadata over
+ * gRPC (12.3.3 and later) - see the gRPC trace propagation suite, which also
+ * covers a call made without it.
+ */
+const frameworkCarriesMetadata =
+  typeof (NatsContext.prototype as { getMetadata?: unknown }).getMetadata ===
+  "function";
 
 /** A version-00 `traceparent`, as the spec writes one. */
 const TRACEPARENT = /^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/;
@@ -144,156 +158,163 @@ class OrdersController implements OnModuleInit {
  * trace id compared is the one Observe reports the request under, and
  * interop runs as it does in a deployed service - once a first batch got in.
  */
-describe("OpenTelemetry interop on a gRPC call to a service that runs neither Nest nor Observe", () => {
-  let grpcServer: PlainGrpcServer;
-  let collector: FakeCollector;
+describe.runIf(frameworkCarriesMetadata)(
+  "OpenTelemetry interop on a gRPC call to a service that runs neither Nest nor Observe",
+  () => {
+    let grpcServer: PlainGrpcServer;
+    let collector: FakeCollector;
 
-  beforeAll(async () => {
-    grpcServer = await startPlainGrpcServer();
-    collector = await startFakeCollector();
-  });
+    beforeAll(async () => {
+      grpcServer = await startPlainGrpcServer();
+      collector = await startFakeCollector();
+    });
 
-  afterAll(async () => {
-    await collector?.close();
-    await grpcServer?.close();
-  });
+    afterAll(async () => {
+      await collector?.close();
+      await grpcServer?.close();
+    });
 
-  /** Starts the Nest service, and waits for its first batch to get in. */
-  const startApi = async (openTelemetry: boolean) => {
-    const { ObserveModule, ObserveInstrument } = createObserveModule();
+    /** Starts the Nest service, and waits for its first batch to get in. */
+    const startApi = async (openTelemetry: boolean) => {
+      const { ObserveModule, ObserveInstrument } = createObserveModule();
 
-    @Module({
-      imports: [
-        ObserveModule.forRoot({
-          appKey: "e2e-key",
-          appSecret: "e2e-secret",
-          serviceId: `api-${openTelemetry ? "on" : "off"}`,
-          endpoint: collector.url,
-          flushInterval: 1000,
-          runtimeMetrics: false,
-          forwardLogs: false,
-          openTelemetry,
-        }),
-        ClientsModule.register([
-          {
-            name: "ORDERS",
-            transport: Transport.GRPC,
-            options: {
-              package: "orderstest",
-              protoPath: PROTO_PATH,
-              url: grpcServer.url,
+      @Module({
+        imports: [
+          ObserveModule.forRoot({
+            appKey: "e2e-key",
+            appSecret: "e2e-secret",
+            serviceId: `api-${openTelemetry ? "on" : "off"}`,
+            endpoint: collector.url,
+            flushInterval: 1000,
+            runtimeMetrics: false,
+            forwardLogs: false,
+            openTelemetry,
+          }),
+          ClientsModule.register([
+            {
+              name: "ORDERS",
+              transport: Transport.GRPC,
+              options: {
+                package: "orderstest",
+                protoPath: PROTO_PATH,
+                url: grpcServer.url,
+              },
             },
-          },
-        ]),
-      ],
-      controllers: [OrdersController],
-    })
-    class ApiModule {}
+          ]),
+        ],
+        controllers: [OrdersController],
+      })
+      class ApiModule {}
 
-    const app = await NestFactory.create(ApiModule, {
-      instrument: ObserveInstrument,
-      logger: false,
-    });
-    const url = await listenOnLoopback(app);
-    await untilIngesting(app, url);
-    return { app, url };
-  };
-
-  /**
-   * Makes the request, and returns the metadata the gRPC call arrived with
-   * and the snapshot Observe reported the request in.
-   */
-  const call = async (url: string, path: string, orderId: string) => {
-    const response = await fetch(`${url}${path}`);
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      id: orderId,
-      name: `order-${orderId}`,
-    });
-    const snapshot = await snapshotAt(
-      collector,
-      (candidate) => candidate.a?.ou === path,
-      `the snapshot for ${path} at the collector`,
-    );
-    return { metadata: grpcServer.received.get(orderId)!, snapshot };
-  };
-
-  describe("with openTelemetry on", () => {
-    let app: INestApplication;
-    let url = "";
-
-    beforeAll(async () => {
-      ({ app, url } = await startApi(true));
-    }, 60_000);
-
-    afterAll(async () => {
-      await app?.close();
-    });
-
-    it("sends a traceparent in the trace Observe reports the request under, and x-request-id beside it", async () => {
-      const { metadata, snapshot } = await call(url, "/orders/on-1", "on-1");
-
-      // One traceparent, which the spec accepts...
-      expect(metadata["traceparent"]).toHaveLength(1);
-      const [traceparent] = metadata["traceparent"];
-      expect(traceparent).toMatch(TRACEPARENT);
-      const traceContext = readTraceContext({ traceparent });
-      expect(traceContext).toBeDefined();
-      // ...naming the trace Observe reports the request under, in its W3C
-      // form, and as the parent the agent's span for the handler that made
-      // the call - sampled, as the agent records the request.
-      expect(traceContext!.traceId).toBe(w3cTraceIdOf(snapshot.ti));
-      const [handler] = wireSpansOf(snapshot.t, "OrdersController");
-      expect(handler?.m).toBe("order");
-      expect(traceContext!.parentSpanId).toBe(w3cSpanIdOf(String(handler.s)));
-      expect(traceContext!.sampled).toBe(true);
-      // And Observe's own id for the trace beside it, as it is.
-      expect(metadata["x-request-id"]).toEqual([snapshot.ti]);
-      expect(collector.violations).toEqual([]);
-    });
-
-    // Pins current behaviour. The dispatch hook adds `traceparent` only
-    // beside the `x-request-id` it adds itself, so as not to send one beside
-    // an id the application chose - but gRPC runs it on a packet of its own,
-    // before the caller's `Metadata` is merged in, and the caller's id wins
-    // that merge. So the call carries the caller's id and a `traceparent`
-    // for the request's trace: a service that reads `traceparent` continues
-    // the request's trace, one that reads `x-request-id` the caller's.
-    it("sends a traceparent for the request's trace beside an x-request-id the caller put in the call's metadata itself", async () => {
-      const { metadata, snapshot } = await call(
-        url,
-        "/orders/on-2/own-request-id",
-        "on-2",
-      );
-
-      expect(metadata["x-request-id"]).toEqual(["chosen-on-2"]);
-      expect(metadata["traceparent"]).toHaveLength(1);
-      const traceContext = readTraceContext({
-        traceparent: metadata["traceparent"][0],
+      const app = await NestFactory.create(ApiModule, {
+        instrument: ObserveInstrument,
+        logger: false,
       });
-      expect(traceContext?.traceId).toBe(w3cTraceIdOf(snapshot.ti));
-      expect(traceContext?.traceId).not.toBe(w3cTraceIdOf("chosen-on-2"));
+      const url = await listenOnLoopback(app);
+      await untilIngesting(app, url);
+      return { app, url };
+    };
+
+    /**
+     * Makes the request, and returns the metadata the gRPC call arrived with
+     * and the snapshot Observe reported the request in.
+     */
+    const call = async (url: string, path: string, orderId: string) => {
+      const response = await fetch(`${url}${path}`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        id: orderId,
+        name: `order-${orderId}`,
+      });
+      const snapshot = await snapshotAt(
+        collector,
+        (candidate) => candidate.a?.ou === path,
+        `the snapshot for ${path} at the collector`,
+      );
+      return { metadata: grpcServer.received.get(orderId)!, snapshot };
+    };
+
+    describe("with openTelemetry on", () => {
+      let app: INestApplication;
+      let url = "";
+
+      beforeAll(async () => {
+        ({ app, url } = await startApi(true));
+      }, 60_000);
+
+      afterAll(async () => {
+        await app?.close();
+      });
+
+      it("sends a traceparent in the trace Observe reports the request under, and x-request-id beside it", async () => {
+        const { metadata, snapshot } = await call(url, "/orders/on-1", "on-1");
+
+        // One traceparent, which the spec accepts...
+        expect(metadata["traceparent"]).toHaveLength(1);
+        const [traceparent] = metadata["traceparent"];
+        expect(traceparent).toMatch(TRACEPARENT);
+        const traceContext = readTraceContext({ traceparent });
+        expect(traceContext).toBeDefined();
+        // ...naming the trace Observe reports the request under, in its W3C
+        // form, and as the parent the agent's span for the handler that made
+        // the call - sampled, as the agent records the request.
+        expect(traceContext!.traceId).toBe(w3cTraceIdOf(snapshot.ti));
+        const [handler] = wireSpansOf(snapshot.t, "OrdersController");
+        expect(handler?.m).toBe("order");
+        expect(traceContext!.parentSpanId).toBe(w3cSpanIdOf(String(handler.s)));
+        expect(traceContext!.sampled).toBe(true);
+        // And Observe's own id for the trace beside it, as it is.
+        expect(metadata["x-request-id"]).toEqual([snapshot.ti]);
+        expect(collector.violations).toEqual([]);
+      });
+
+      // Pins current behaviour. The dispatch hook adds `traceparent` only
+      // beside the `x-request-id` it adds itself, so as not to send one beside
+      // an id the application chose - but gRPC runs it on a packet of its own,
+      // before the caller's `Metadata` is merged in, and the caller's id wins
+      // that merge. So the call carries the caller's id and a `traceparent`
+      // for the request's trace: a service that reads `traceparent` continues
+      // the request's trace, one that reads `x-request-id` the caller's.
+      it("sends a traceparent for the request's trace beside an x-request-id the caller put in the call's metadata itself", async () => {
+        const { metadata, snapshot } = await call(
+          url,
+          "/orders/on-2/own-request-id",
+          "on-2",
+        );
+
+        expect(metadata["x-request-id"]).toEqual(["chosen-on-2"]);
+        expect(metadata["traceparent"]).toHaveLength(1);
+        const traceContext = readTraceContext({
+          traceparent: metadata["traceparent"][0],
+        });
+        expect(traceContext?.traceId).toBe(w3cTraceIdOf(snapshot.ti));
+        expect(traceContext?.traceId).not.toBe(w3cTraceIdOf("chosen-on-2"));
+      });
     });
-  });
 
-  describe("with openTelemetry off", () => {
-    let app: INestApplication;
-    let url = "";
+    describe("with openTelemetry off", () => {
+      let app: INestApplication;
+      let url = "";
 
-    beforeAll(async () => {
-      ({ app, url } = await startApi(false));
-    }, 60_000);
+      beforeAll(async () => {
+        ({ app, url } = await startApi(false));
+      }, 60_000);
 
-    afterAll(async () => {
-      await app?.close();
+      afterAll(async () => {
+        await app?.close();
+      });
+
+      it("sends x-request-id alone", async () => {
+        const { metadata, snapshot } = await call(
+          url,
+          "/orders/off-1",
+          "off-1",
+        );
+
+        expect(metadata["traceparent"]).toBeUndefined();
+        expect(metadata["x-request-id"]).toEqual([snapshot.ti]);
+        expect(collector.violations).toEqual([]);
+      });
     });
-
-    it("sends x-request-id alone", async () => {
-      const { metadata, snapshot } = await call(url, "/orders/off-1", "off-1");
-
-      expect(metadata["traceparent"]).toBeUndefined();
-      expect(metadata["x-request-id"]).toEqual([snapshot.ti]);
-      expect(collector.violations).toEqual([]);
-    });
-  });
-});
+  },
+);

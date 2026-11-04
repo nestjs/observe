@@ -1,9 +1,9 @@
 import { Controller, Get, INestApplication, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -45,7 +45,7 @@ type Platform = "express" | "node";
  * end the process; vitest fails the run on one, so without the guard these
  * tests fail even before their assertions do.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: deferred trace completion (%s)",
   (platform) => {
     let app: INestApplication;
@@ -54,7 +54,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         DeferredCompletionTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         {
           instrument: ObserveInstrument,
           logger: false,
