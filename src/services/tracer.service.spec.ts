@@ -582,6 +582,31 @@ describe("TracerService", () => {
       expect(reused.getValue()).toBe(7);
     });
 
+    it("seeds a metric still at zero and keeps counting from there", () => {
+      tracer.counter("visits");
+      tracer.gauge("queued");
+
+      const counter = tracer.counter("visits", { initialValue: 5 });
+      const gauge = tracer.gauge("queued", { initialValue: 5 });
+      counter.increment();
+      gauge.increment();
+
+      expect(counter.getValue()).toBe(6);
+      expect(gauge.getValue()).toBe(6);
+    });
+
+    it("returns a labelled metric again when given an initial value", () => {
+      const options = { labels: ["route" as const], initialValue: 0 };
+      tracer.counter("hits", options).increment({ route: "/a" });
+      tracer.gauge("open", options).increment({ route: "/a" });
+
+      tracer.counter("hits", options).increment({ route: "/a" });
+      tracer.gauge("open", options).increment({ route: "/a" });
+
+      expect(tracer.counter("hits", options).getValue({ route: "/a" })).toBe(2);
+      expect(tracer.gauge("open", options).getValue({ route: "/a" })).toBe(2);
+    });
+
     it("updates a gauge's kind on a later call", () => {
       tracer.gauge("cpu");
 
