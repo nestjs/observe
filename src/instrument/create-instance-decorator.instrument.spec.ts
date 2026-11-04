@@ -1,6 +1,7 @@
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
+import { Cluster, Redis } from "ioredis";
 import { MongoClient } from "mongodb";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
@@ -900,6 +901,62 @@ describe("createInstanceDecorator", () => {
       // point is traced, nested self-calls are the documented trade-off.
       expect(startedSteps).toEqual([
         { className: "TenantCache", methodName: "lookup" },
+      ]);
+    });
+  });
+
+  // ioredis copies EventEmitter's prototype onto its clients', `constructor`
+  // included, so a client's `constructor` is `EventEmitter`.
+  describe("when decorating an ioredis client", () => {
+    it.each([
+      [
+        "Redis",
+        () => new Redis({ lazyConnect: true }),
+        "Redis#getBuiltinCommands",
+      ],
+      [
+        "Cluster",
+        () =>
+          new Cluster([{ host: "127.0.0.1", port: 1 }], { lazyConnect: true }),
+        "Cluster#getBuiltinCommands",
+      ],
+    ] as const)(
+      "labels a %s client's spans after it, not EventEmitter",
+      (className, connect, spanId) => {
+        // Never connected: lazy, and no command is sent.
+        const client = connect();
+        expect(client.constructor).toBe(EventEmitter);
+        try {
+          const decorated = decorate(client) as typeof client;
+
+          withTrace(() => decorated.getBuiltinCommands());
+
+          expect(startedSteps).toEqual([
+            { className, methodName: "getBuiltinCommands" },
+          ]);
+          expect(endedSteps).toEqual([{ spanId }]);
+        } finally {
+          client.disconnect();
+        }
+      },
+    );
+
+    it("keeps the EventEmitter label on anything else whose constructor reads EventEmitter", () => {
+      // Built as ioredis builds a client, but on no `Commander`.
+      class Mixed {
+        sendCommand() {
+          return "sent";
+        }
+      }
+      Object.defineProperty(Mixed.prototype, "constructor", {
+        value: EventEmitter,
+      });
+      const decorated = decorate(new Mixed()) as Mixed;
+
+      withTrace(() => decorated.sendCommand());
+
+      expect(startedSteps).toEqual([
+        { className: "EventEmitter", methodName: "sendCommand" },
       ]);
     });
   });
