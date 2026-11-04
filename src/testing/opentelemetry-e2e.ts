@@ -1,4 +1,4 @@
-import type { INestApplication } from "@nestjs/common";
+import type { INestApplication, INestMicroservice } from "@nestjs/common";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import type {
@@ -33,13 +33,20 @@ export const asUuid = (hex: string): string =>
  * batch from its worker. OpenTelemetry interop runs only from then on, so a
  * suite that asserts on it waits here first - as a deployed service's first
  * requests do.
+ *
+ * `also` names services the app's `/health` reaches in turn - a microservice,
+ * which has no HTTP route of its own - to wait for as well: each turns
+ * interop on with its own worker's first accepted batch.
  */
 export async function untilIngesting(
   app: INestApplication,
   url: string,
   timeoutMs = 10_000,
+  also: Array<INestApplication | INestMicroservice> = [],
 ): Promise<void> {
-  const buffer = app.get(ObserveAgentSharedBuffer, { strict: false });
+  const buffers = [app, ...also].map((service) =>
+    service.get(ObserveAgentSharedBuffer, { strict: false }),
+  );
   let n = 0;
   const traffic = setInterval(() => {
     fetch(`${url}/health?n=${n++}`)
@@ -48,7 +55,7 @@ export async function untilIngesting(
   }, 200);
   try {
     await waitFor(
-      () => buffer.isIngesting(),
+      () => buffers.every((buffer) => buffer.isIngesting()),
       timeoutMs,
       "the collector to accept a first batch",
     );

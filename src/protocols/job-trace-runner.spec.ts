@@ -1,4 +1,6 @@
 import { Logger } from "@nestjs/common";
+import { context, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
@@ -283,5 +285,150 @@ describe("JobTraceRunner: patchEnqueue", () => {
     inTrace(() => new Queue().add("welcome", {}));
 
     expect(add).toHaveBeenCalledOnce();
+  });
+});
+
+/**
+ * With `openTelemetry` on, a job carries W3C trace context beside the trace id
+ * it inherits, and runs in it for an OpenTelemetry SDK in the worker's
+ * process. With the option off - or the agent not reporting to NestJS
+ * Observe - nothing changes: the options carry the id alone, and the job runs
+ * in no OpenTelemetry trace.
+ */
+describe("JobTraceRunner: W3C trace context, with openTelemetry on", () => {
+  const TRACE_ID_KEY = "traceId";
+  // The W3C spec's own example, and the id Observe writes it as.
+  const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+  const TRACE_ID_AS_UUID = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+  const SPAN_ID = "00f067aa0ba902b7";
+  const TRACEPARENT = `00-${TRACE_ID}-${SPAN_ID}-01`;
+
+  let als: AsyncLocalStorage<Map<string, unknown>>;
+  let registry: OperationTraceRegistry;
+
+  const createRunner = (
+    openTelemetry: boolean | undefined,
+    reporting = true,
+    jobs?: ObserveModuleOptionsWithDefaults["jobs"],
+  ) =>
+    new JobTraceRunner(
+      {
+        insertJobSnapshot: vi.fn(),
+        isIngesting: () => reporting,
+      } as unknown as ObserveAgentSharedBuffer,
+      {
+        traceIdKey: TRACE_ID_KEY,
+        openTelemetry,
+        jobs,
+      } as ObserveModuleOptionsWithDefaults,
+      registry,
+      als as never,
+      { warn: vi.fn(), debug: vi.fn() } as unknown as Logger,
+    );
+
+  beforeEach(() => {
+    als = new AsyncLocalStorage();
+    registry = new OperationTraceRegistry(als as never, false);
+    context.setGlobalContextManager(
+      new AsyncLocalStorageContextManager().enable(),
+    );
+  });
+
+  afterEach(() => {
+    context.disable();
+  });
+
+  /** The options a job enqueued in an operation with `TRACE_ID_AS_UUID` gets. */
+  const enqueued = (runner: JobTraceRunner<Record<string, unknown>>) => {
+    const add = vi.fn();
+    class Queue {
+      add(...args: unknown[]) {
+        return add(...args);
+      }
+    }
+    runner.patchEnqueue(Queue.prototype as never, () => 2);
+    als.run(new Map([[TRACE_ID_KEY, TRACE_ID_AS_UUID]]), () =>
+      new Queue().add("welcome", {}, { attempts: 3 }),
+    );
+    return add.mock.calls[0]?.[2] as Record<string, unknown>;
+  };
+
+  /** The OpenTelemetry span context a job enqueued with `opts` runs in. */
+  const ranIn = (
+    runner: JobTraceRunner<Record<string, unknown>>,
+    opts: Record<string, unknown>,
+  ) =>
+    runner.run(
+      { queueName: "emails", name: "welcome", id: 1, opts, metadata: {} },
+      () => trace.getSpanContext(context.active()),
+    );
+
+  it("stamps a traceparent in the job's trace beside its trace id", () => {
+    expect(enqueued(createRunner(true))).toEqual({
+      attempts: 3,
+      observeTraceId: TRACE_ID_AS_UUID,
+      observeTraceparent: expect.stringMatching(
+        new RegExp(`^00-${TRACE_ID}-[0-9a-f]{16}-0[01]$`),
+      ),
+    });
+  });
+
+  it.each([
+    ["off", undefined, true],
+    ["on while the agent is not reporting", true, false],
+  ])(
+    "stamps the trace id alone with openTelemetry %s",
+    (_, openTelemetry, reporting) => {
+      expect(enqueued(createRunner(openTelemetry, reporting))).toEqual({
+        attempts: 3,
+        observeTraceId: TRACE_ID_AS_UUID,
+      });
+    },
+  );
+
+  it("runs the job in the trace it was enqueued in", () => {
+    expect(
+      ranIn(createRunner(true), {
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: TRACEPARENT,
+      }),
+    ).toEqual({
+      traceId: TRACE_ID,
+      spanId: SPAN_ID,
+      traceFlags: 1,
+      isRemote: true,
+    });
+  });
+
+  it("runs a job jobs.ignore matches in that trace too", () => {
+    const runner = createRunner(true, true, { ignore: () => true });
+
+    expect(
+      ranIn(runner, {
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: TRACEPARENT,
+      })?.traceId,
+    ).toBe(TRACE_ID);
+  });
+
+  it.each([
+    ["off", undefined, true],
+    ["on while the agent is not reporting", true, false],
+  ])(
+    "runs the job in no trace with openTelemetry %s",
+    (_, openTelemetry, reporting) => {
+      expect(
+        ranIn(createRunner(openTelemetry, reporting), {
+          observeTraceId: TRACE_ID_AS_UUID,
+          observeTraceparent: TRACEPARENT,
+        }),
+      ).toBeUndefined();
+    },
+  );
+
+  it("runs a job that inherited no trace id in no trace", () => {
+    expect(
+      ranIn(createRunner(true), { observeTraceparent: TRACEPARENT }),
+    ).toBeUndefined();
   });
 });

@@ -53,6 +53,10 @@ import { assertModuleOptions } from "./utils/assert-module-options.util.js";
 import { defaultTraceIdGenerator } from "./utils/default-trace-id-generator.util.js";
 import { recordTraceIdGeneratorOrigin } from "./utils/trace-id-generator-origin.util.js";
 import {
+  OpenTelemetryInteropGate,
+  traceparentToHandOn,
+} from "./utils/trace-handoff.util.js";
+import {
   fitServiceVersion,
   MAX_SERVICE_VERSION_LENGTH,
 } from "./utils/fit-service-version.util.js";
@@ -197,6 +201,9 @@ export function createObserveModule<Store extends Record<string, unknown>>(
     >,
     options.sourceContext,
   );
+  // Read by the microservice dispatch hook, which a client is handed as it is
+  // instantiated - before the module's options resolve. Configured below.
+  const openTelemetryInterop = new OpenTelemetryInteropGate();
 
   @Module({
     imports: [DiscoveryModule],
@@ -205,6 +212,21 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         provide: "ASSERT_MODULE_OPTIONS",
         useFactory: assertModuleOptions,
         inject: [{ token: OBSERVE_OPTIONS, optional: true }],
+      },
+      {
+        provide: OpenTelemetryInteropGate,
+        useFactory: (
+          observeOptions?: ObserveModuleOptionsWithDefaults,
+          observeAgentSharedBuffer?: ObserveAgentSharedBuffer,
+        ) =>
+          openTelemetryInterop.configure(
+            observeOptions,
+            observeAgentSharedBuffer,
+          ),
+        inject: [
+          { token: OBSERVE_OPTIONS, optional: true },
+          ObserveAgentSharedBuffer,
+        ],
       },
       {
         provide: AsyncLocalStorage,
@@ -382,8 +404,15 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         // inspection throws before the structural checks below ever touch
         // them.
         options.skipInstrumentation!(instance) ||
-        [asyncLocalStorage, operationTraceRegistry].includes(
-          instance as AsyncLocalStorage<any> | OperationTraceRegistry,
+        [
+          asyncLocalStorage,
+          operationTraceRegistry,
+          openTelemetryInterop,
+        ].includes(
+          instance as
+            | AsyncLocalStorage<any>
+            | OperationTraceRegistry
+            | OpenTelemetryInteropGate,
         ) ||
         instance instanceof TraceSamplerService ||
         instance instanceof TracerService ||
@@ -447,8 +476,14 @@ export function createObserveModule<Store extends Record<string, unknown>>(
           },
         );
         return (instance: unknown) => {
-          propagateTraceIdThrough(instance, () =>
-            asyncLocalStorage.getStore()?.get(options.traceIdKey as never),
+          propagateTraceIdThrough(
+            instance,
+            () =>
+              asyncLocalStorage.getStore()?.get(options.traceIdKey as never),
+            (traceId) =>
+              openTelemetryInterop.isOn()
+                ? traceparentToHandOn(asyncLocalStorage.getStore(), traceId)
+                : undefined,
           );
           return decorate(instance as never);
         };
@@ -466,10 +501,15 @@ export function createObserveModule<Store extends Record<string, unknown>>(
  * carry packet metadata - so this is a feature test, and a no-op on every
  * version before. The id goes out under the same name an HTTP hop uses, and
  * `defaultTraceIdGenerator` reads it back from the receiving context.
+ *
+ * With OpenTelemetry interop on, `traceparentFor` names a W3C `traceparent`
+ * to send beside it, which the receiving agent hands to an OpenTelemetry SDK
+ * in its process - see `traceparentToHandOn`.
  */
 function propagateTraceIdThrough(
   instance: unknown,
   currentTraceId: () => unknown,
+  traceparentFor: (traceId: string) => string | undefined,
 ): void {
   const client = instance as {
     setOnDispatchHook?: (
@@ -487,8 +527,22 @@ function propagateTraceIdThrough(
   }
   client.setOnDispatchHook((packet) => {
     const traceId = currentTraceId();
-    if (typeof traceId === "string" && !packet.metadata?.["x-request-id"]) {
+    if (typeof traceId !== "string") {
+      return;
+    }
+    if (!packet.metadata?.["x-request-id"]) {
       packet.metadata = { ...packet.metadata, "x-request-id": traceId };
+    }
+    // Only beside the id this operation sends: an id the application chose
+    // names a trace of its own, and the packet is left as it made it.
+    if (
+      packet.metadata?.["x-request-id"] === traceId &&
+      !packet.metadata["traceparent"]
+    ) {
+      const traceparent = traceparentFor(traceId);
+      if (traceparent) {
+        packet.metadata = { ...packet.metadata, traceparent };
+      }
     }
   });
 }

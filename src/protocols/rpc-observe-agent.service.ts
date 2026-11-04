@@ -16,6 +16,7 @@ import { OperationTraceRegistry } from "../services/operation-trace.registry.js"
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { OBSERVE_OPTIONS, TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { continueHandedOnTrace } from "../utils/trace-handoff.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
   describePeerLoadError,
@@ -188,6 +189,18 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
 
+      // With OpenTelemetry interop on, the handler runs in the W3C trace
+      // context the message was sent in, for an OpenTelemetry SDK in this
+      // process - see `continueHandedOnTrace`. Recorded or not, as an
+      // outbound call carries the trace on for an unrecorded request.
+      const handedOn = this.openTelemetryInteropOn()
+        ? handedOnTraceparent(ctx)
+        : undefined;
+      const handle =
+        handedOn === undefined
+          ? done
+          : () => continueHandedOnTrace(handedOn, traceId, done);
+
       setAttributesSafely(
         this.options.rpc?.setAttributes,
         [transportId, ctx],
@@ -206,7 +219,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
           "rpc",
         )
       ) {
-        return done();
+        return handle();
       }
 
       const shouldCapture = this.traceSamplerService.shouldCapture("rpc", {
@@ -214,7 +227,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         ctx: ctx,
       });
       if (!shouldCapture) {
-        return done();
+        return handle();
       }
       this.operationTraceRegistry.startTrace(
         registryKey,
@@ -225,8 +238,19 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         },
         traceId,
       );
-      return done();
+      return handle();
     });
+  }
+
+  /**
+   * Whether OpenTelemetry interop runs now: `openTelemetry` on, beside
+   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isIngesting`.
+   */
+  private openTelemetryInteropOn(): boolean {
+    return (
+      this.options.openTelemetry === true &&
+      this.observeAgentSharedBuffer.isIngesting()
+    );
   }
 
   startGrpcRequestTracing(
@@ -381,5 +405,26 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         return typeof pattern === "string" ? pattern : "unknown";
       }
     }
+  }
+}
+
+/**
+ * The `traceparent` the sending service's agent put in the packet's metadata
+ * beside `x-request-id` - see `traceparentToHandOn` - on a transport whose
+ * packets carry metadata: TCP and Redis, from `@nestjs/microservices` 12.0.4.
+ * Read as `defaultTraceIdGenerator` reads the id, and held to the spec by
+ * `continueHandedOnTrace`.
+ */
+function handedOnTraceparent(ctx: BaseRpcContext): unknown {
+  try {
+    const getMetadata = (ctx as { getMetadata?: unknown } | null)?.getMetadata;
+    if (typeof getMetadata !== "function") {
+      return undefined;
+    }
+    const metadata: unknown = getMetadata.call(ctx);
+    return (metadata as Record<string, unknown> | undefined)?.["traceparent"];
+  } catch {
+    // A context that cannot be read carries nothing to continue.
+    return undefined;
   }
 }

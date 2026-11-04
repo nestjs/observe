@@ -745,6 +745,10 @@ export interface ObserveOptions {
    *   reported under the trace of the server span the SDK opened for it, the
    *   request that starts a trace included, and `traceparent` on outbound
    *   calls is left to the SDK.
+   * - A BullMQ or Bull job, and a message over the TCP or Redis transport,
+   *   carry a W3C `traceparent` beside their trace id, and run in it for an
+   *   OpenTelemetry SDK in the process that runs them - so its spans there,
+   *   and the calls they make, stay in the trace that handed the work on.
    *
    * A `traceIdGenerator` passed to `createObserveModule()` still names the
    * trace; the W3C one is carried on beside it.

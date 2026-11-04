@@ -7,12 +7,17 @@ import {
   ObserveModuleOptionsWithDefaults,
 } from "../interfaces/index.js";
 import {
+  JOB_TRACE_CONTEXT_OPTION_KEY,
   JOB_TRACE_OPTION_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { REQUEST_ID_PATTERN } from "../utils/default-trace-id-generator.util.js";
+import {
+  continueHandedOnTrace,
+  traceparentToHandOn,
+} from "../utils/trace-handoff.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
   deferTraceCompletion,
@@ -153,11 +158,14 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
    * under the one request that happened to register the schedule, for as long
    * as the schedule lives. Those runs are cron firings, and each mints its own
    * id like any other.
+   *
+   * With OpenTelemetry interop on, a W3C `traceparent` goes beside the id, for
+   * an OpenTelemetry SDK in the worker's process to continue - see
+   * `traceparentToHandOn`.
    */
   private stampTraceId(opts: unknown): Record<string, unknown> | undefined {
-    const traceId = this.asyncLocalStorage
-      .getStore()
-      ?.get(this.options.traceIdKey);
+    const store = this.asyncLocalStorage.getStore();
+    const traceId = store?.get(this.options.traceIdKey);
     if (typeof traceId !== "string") {
       return undefined;
     }
@@ -168,7 +176,33 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
     if (current["repeat"] || current[JOB_TRACE_OPTION_KEY] !== undefined) {
       return undefined;
     }
-    return { ...current, [JOB_TRACE_OPTION_KEY]: traceId };
+    const stamped: Record<string, unknown> = {
+      ...current,
+      [JOB_TRACE_OPTION_KEY]: traceId,
+    };
+    if (
+      this.openTelemetryInteropOn() &&
+      current[JOB_TRACE_CONTEXT_OPTION_KEY] === undefined
+    ) {
+      stamped[JOB_TRACE_CONTEXT_OPTION_KEY] = traceparentToHandOn(
+        store,
+        traceId,
+      );
+    }
+    return stamped;
+  }
+
+  /**
+   * Whether OpenTelemetry interop runs now: `openTelemetry` on, beside
+   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isIngesting`.
+   * Asked as a job is enqueued and again as it starts, by each side for
+   * itself.
+   */
+  private openTelemetryInteropOn(): boolean {
+    return (
+      this.options.openTelemetry === true &&
+      this.observeAgentSharedBuffer.isIngesting()
+    );
   }
 
   /**
@@ -270,9 +304,19 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       // The registry key is always this run's own. The inherited id may belong
       // to a request still open in this process, and a retry reuses it.
       const registryKey = uuidv7();
-      const traceId = this.readInheritedTraceId(job.opts) ?? registryKey;
+      const inheritedTraceId = this.readInheritedTraceId(job.opts);
+      const traceId = inheritedTraceId ?? registryKey;
       store.set(this.options.traceIdKey, traceId);
       store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, registryKey);
+
+      // With OpenTelemetry interop on, the job runs in the W3C trace context
+      // it was enqueued in, for an OpenTelemetry SDK in this process - see
+      // `continueHandedOnTrace`. Recorded or not, as an outbound call carries
+      // the trace on for an unrecorded request.
+      const handedOn =
+        inheritedTraceId !== undefined && this.openTelemetryInteropOn()
+          ? job.opts?.[JOB_TRACE_CONTEXT_OPTION_KEY]
+          : undefined;
 
       const context: JobContext = {
         queueName: job.queueName,
@@ -293,7 +337,11 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         // The trace id stays in the store so logs and jobs enqueued from here
         // still correlate; nothing is registered under the registry key, so
         // its spans have no trace to join.
-        return invoke(() => undefined);
+        return handedOn === undefined
+          ? invoke(() => undefined)
+          : continueHandedOnTrace(handedOn, traceId, () =>
+              invoke(() => undefined),
+            );
       }
 
       this.operationTraceRegistry.startTrace(
@@ -340,7 +388,10 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       };
 
       try {
-        const returnValue = invoke(settle);
+        const returnValue =
+          handedOn === undefined
+            ? invoke(settle)
+            : continueHandedOnTrace(handedOn, traceId, () => invoke(settle));
         if (returnValue instanceof Promise) {
           return returnValue
             .then((ret) => {

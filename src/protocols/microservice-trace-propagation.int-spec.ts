@@ -18,11 +18,13 @@ import {
 } from "@nestjs/microservices";
 import { firstValueFrom } from "rxjs";
 import request from "supertest";
+import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createObserveModule } from "../observe.module.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
   freePort,
+  markIngesting,
   testObserveOptions,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
@@ -323,5 +325,83 @@ describe("ObserveModule: the microservice dispatch hook, where a client offers o
     const client = app.get(HookedClient);
 
     expect(client.dispatch({ pattern: "sum" })).toEqual({ pattern: "sum" });
+  });
+});
+
+const hookedInterop = createObserveModule();
+
+@Module({
+  imports: [
+    hookedInterop.ObserveModule.forRoot(
+      testObserveOptions({ openTelemetry: true }),
+    ),
+  ],
+  controllers: [DispatchController],
+  providers: [HookedClient],
+})
+class HookedInteropModule {}
+
+/**
+ * With `openTelemetry` on, an outgoing packet also carries a W3C
+ * `traceparent` in the trace its id names, for an OpenTelemetry SDK in the
+ * receiving service to continue - see `traceparentToHandOn`.
+ */
+describe("ObserveModule: the microservice dispatch hook, with openTelemetry on", () => {
+  // The W3C spec's own example, and the id Observe writes it as.
+  const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+  const TRACE_ID_AS_UUID = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+  const TRACEPARENT = `00-${TRACE_ID}-00f067aa0ba902b7-01`;
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    app = await NestFactory.create(HookedInteropModule, {
+      instrument: hookedInterop.ObserveInstrument,
+      logger: false,
+    });
+    await app.init();
+    markIngesting(app);
+  });
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  it("sends a traceparent in the request's trace beside its id", async () => {
+    const response = await request(app.getHttpServer())
+      .get("/dispatch")
+      .set("traceparent", TRACEPARENT)
+      .expect(200);
+
+    expect(response.body.metadata).toEqual({
+      "x-request-id": TRACE_ID_AS_UUID,
+      traceparent: expect.stringMatching(
+        new RegExp(`^00-${TRACE_ID}-[0-9a-f]{16}-01$`),
+      ),
+    });
+  });
+
+  it("sends none beside an id the application chose", async () => {
+    const response = await request(app.getHttpServer())
+      .get("/dispatch-own-id")
+      .set("traceparent", TRACEPARENT)
+      .expect(200);
+
+    expect(response.body.metadata).toEqual({
+      "x-request-id": "caller-chose-this",
+      tenant: "acme",
+    });
+  });
+
+  it("sends the id alone once the collector refuses the app's credentials", async () => {
+    app.get(ObserveAgentSharedBuffer, { strict: false }).recordRefused();
+
+    const response = await request(app.getHttpServer())
+      .get("/dispatch")
+      .set("x-request-id", "dispatch-trace-4")
+      .expect(200);
+
+    expect(response.body.metadata).toEqual({
+      "x-request-id": "dispatch-trace-4",
+    });
   });
 });
