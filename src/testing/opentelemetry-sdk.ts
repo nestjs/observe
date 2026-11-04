@@ -45,6 +45,10 @@ for (const name of [
   "@nestjs/platform-express",
   "@nestjs/platform-fastify",
   "pg",
+  // Nest loads kafkajs with `import()` as a Kafka client or server connects.
+  // Not amqplib: its instrumentation patches files amqplib itself loads
+  // with `require`.
+  "kafkajs",
 ]) {
   require(name);
 }
