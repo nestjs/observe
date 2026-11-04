@@ -455,16 +455,17 @@ export function createObserveModule<Store extends Record<string, unknown>>(
 /**
  * Makes a microservice client send the current trace id with every packet.
  *
+ * TCP and Redis clients carry it from `@nestjs/microservices` 12.0.4, and
+ * the NATS, Kafka, RabbitMQ, MQTT 5 and gRPC clients - as a header - from
+ * 12.3.3 (nestjs/nest#18386). Every client has had the method since 12.0.4,
+ * but those others call the hook only from 12.3.3, so on the versions
+ * between, registering it there changes nothing.
+ *
  * `setOnDispatchHook` is the client-side counterpart of the server's
  * processing hooks, and only exists on `@nestjs/microservices` versions that
  * carry packet metadata - so this is a feature test, and a no-op on every
  * version before. The id goes out under the same name an HTTP hop uses, and
  * `defaultTraceIdGenerator` reads it back from the receiving context.
- *
- * TCP and Redis clients carry it from 12.0.4. The other clients have the
- * method from 12.0.4 too, but call the hook - and carry the id as a header -
- * only from the release that ships nestjs/nest#18386, so until then
- * registering it there changes nothing.
  */
 function propagateTraceIdThrough(
   instance: unknown,
