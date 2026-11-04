@@ -165,6 +165,7 @@
     "@vitest/coverage-v8": "4.1.11",
     "bull": "4.16.5",
     "bullmq": "6.2.0",
+    "bullmq-otel": "2.0.1",
     "dd-trace": "6.23.0",
     "drizzle-orm": "0.45.4",
     "express": "5.2.1",
