@@ -27,6 +27,14 @@ export interface DetachedWorkerConfig {
   pausedPrefix: string;
   /** `NOT_INGESTED_MESSAGE_PREFIX`, as data, for the same reason. */
   notIngestedPrefix: string;
+  /** `OTLP_EXPORT_MESSAGE_PREFIX`, as data, for the same reason. */
+  otlpExportPrefix: string;
+  /**
+   * Whether `otlp` is set up to export, so batches ask the collector what
+   * the app's plan allows it (`OTLP_EXPORT_INGEST_MODE`) and the answer is
+   * posted back. False leaves every batch and every line as they were.
+   */
+  asksForOtlpExport: boolean;
   /**
    * This package's version (`readSdkVersion`), read on the main thread: the
    * worker runs as eval'd source and cannot resolve a manifest of its own.
@@ -98,6 +106,9 @@ export const detachedObserveWorker = (
   const degradedPrefix = config.degradedPrefix;
   const pausedPrefix = config.pausedPrefix;
   const notIngestedPrefix = config.notIngestedPrefix;
+  const otlpExportPrefix = config.otlpExportPrefix;
+  // Read as truthy, so a config without it asks nothing and posts no line.
+  const asksForOtlpExport = config.asksForOtlpExport;
 
   /**
    * Built here, used only when the collector answers 400. The shapes travel
@@ -116,8 +127,12 @@ export const detachedObserveWorker = (
     // degraded-ingest.protocol.ts. A literal rather than data from `config`
     // like the prefixes: nothing in the agent reads it back, and a missing
     // config key would put a broken header on every batch. The value is
-    // pinned by worker-degraded-reply.spec.ts.
-    "x-observe-ingest-modes": "reduced, trimmed, paced, errors-only",
+    // pinned by worker-degraded-reply.spec.ts. `otlp-export`
+    // (`OTLP_EXPORT_INGEST_MODE`) asks what the app's plan allows `otlp` to
+    // export, and is listed only by an agent set up to export.
+    "x-observe-ingest-modes":
+      "reduced, trimmed, paced, errors-only" +
+      (asksForOtlpExport ? ", otlp-export" : ""),
     // Which agent sent the batch, so the collector can tell an application
     // still on an old release that a newer one exists.
     "x-observe-sdk-version": config.sdkVersion,
@@ -669,7 +684,22 @@ export const detachedObserveWorker = (
         paced?: unknown;
         errorsOnly?: unknown;
         reason?: unknown;
+        otlpExport?: unknown;
       };
+
+      // What the app's plan allows `otlp` to export - see `OtlpExportGrant`.
+      // Every accepted reply says it again, and a reply that says nothing
+      // grants nothing: a collector that predates export, or a plan without
+      // it. Ahead of the verdict below, which the main thread reads as the
+      // collector taking the app's telemetry - by then it knows what export
+      // may do with it.
+      if (asksForOtlpExport) {
+        const grant =
+          reply.otlpExport === "full" || reply.otlpExport === "capped"
+            ? reply.otlpExport
+            : "off";
+        parentPort.postMessage(`${otlpExportPrefix}${grant}`);
+      }
       // `false`, `true`, `trimmed`, `paced` or `errors-only`. `trimmed`,
       // `paced` and `errorsOnly` say only why or how the spans are discarded,
       // so they count only beside `degraded`; a collector that sends none of

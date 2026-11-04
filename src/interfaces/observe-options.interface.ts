@@ -1,5 +1,6 @@
 import type { OutgoingHttpOptions } from "../outgoing/http.integration.js";
 import type { OutgoingLlmOptions } from "../outgoing/llm/llm-fetch.integration.js";
+import type { OtlpExportOptions } from "../otlp/otlp-options.interface.js";
 import type { HttpCaptureOptions } from "../utils/capture-request.util.js";
 import {
   FactoryProvider,
@@ -218,6 +219,50 @@ export interface ObserveOptions {
    * @default 'https://observe-api.nestjs.com'
    */
   endpoint?: string;
+
+  /**
+   * Exports traces as OpenTelemetry spans, over OTLP/HTTP, to a receiver of
+   * your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb,
+   * or any vendor that takes OTLP - beside what is sent to Observe.
+   *
+   * Every operation becomes a SERVER span (CONSUMER for a queue job) with its
+   * provider method calls as INTERNAL spans and its queries and outbound
+   * calls as CLIENT spans, on the same trace ids the W3C `traceparent`
+   * headers carry - so services instrumented with OpenTelemetry land in the
+   * same traces, the operation's span under the caller's. What is exported
+   * is what is recorded, after `tracesSampleRate`, `skipSpans`,
+   * `spanCollapse` and redaction; a request whose caller sampled its trace
+   * out (`traceparent` flags 00) is not exported.
+   *
+   * Part of OpenTelemetry interop, so it takes `openTelemetry: true` too,
+   * which reads the `traceparent` the spans nest under. Without it, `otlp`
+   * stays off and says so at start-up.
+   *
+   * What the app's plan includes is the collector's to say, in its reply to
+   * the agent's batches: every plan exports, a paid one every trace it
+   * records - whatever the collector then keeps of its own copy - and Free
+   * what NestJS Observe keeps: past Free's daily pacing or its monthly
+   * allowance, an operation it keeps without spans is exported without them
+   * too - and nothing a few minutes into an outage, when no reply says what
+   * that is. Export starts with the first batch the collector accepts, and a
+   * collector that grants nothing - one released before export was - leaves
+   * it off, with a line in the log.
+   *
+   * `true` takes everything from the standard `OTEL_EXPORTER_OTLP_*`,
+   * `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` variables, as an
+   * OpenTelemetry SDK would; an object sets any of it in code. Those
+   * variables never turn export on by themselves - an application that also
+   * runs an OpenTelemetry SDK has them set for that SDK, and would send
+   * every trace twice.
+   *
+   * Runs beside reporting to NestJS Observe, never instead of it, and only
+   * while `openTelemetry` interop is on: off with `enabled: false`, and off
+   * without the credentials the hosted collector needs - a proxy at
+   * `endpoint` that adds them on the way still counts. Traces only: metrics
+   * and logs are not exported.
+   * @default false
+   */
+  otlp?: boolean | OtlpExportOptions;
 
   /**
    * Unique identifier for the service.
@@ -684,7 +729,8 @@ export interface ObserveOptions {
   };
   /**
    * Interoperates with OpenTelemetry. Off by default, and off, the agent
-   * reads and sends `x-request-id` alone, as it always has.
+   * reads and sends `x-request-id` alone, as it always has. To export the
+   * agent's spans over OTLP as well, set `otlp` beside it.
    *
    * On:
    * - A request that arrives in a W3C trace (`traceparent`) is reported under
