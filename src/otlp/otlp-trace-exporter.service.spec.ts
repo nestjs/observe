@@ -237,6 +237,48 @@ describe("OtlpTraceExporter", () => {
     ]);
   });
 
+  it("puts a job under the span that handed it on, and leaves out one handed on in a trace sampled out", async () => {
+    const registry = new OperationTraceRegistry(new AsyncLocalStorage());
+    const job = (id: string) =>
+      ({
+        id,
+        traceId: "4bf92f35-77b3-4da6-a3ce-929d0e0e4736",
+        name: "send",
+        queueName: "emails",
+        calledAt: new Date().toISOString(),
+        duration: 3,
+        traces: [],
+      }) as never;
+    const sampledOut = job("1");
+    const handedOn = job("2");
+    vi.spyOn(registry, "traceContextOf").mockImplementation((of) =>
+      of === sampledOut
+        ? {
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+            parentSpanId: "00f067aa0ba902b7",
+            sampled: false,
+          }
+        : {
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+            parentSpanId: "00f067aa0ba902b8",
+            sampled: true,
+          },
+    );
+    const exporter = new OtlpTraceExporter(
+      options({ otlp: { endpoint: receiver.url, protocol: "http/json" } }),
+      registry,
+      new AsyncLocalStorage(),
+    );
+    exporter.onModuleInit();
+
+    exporter.exportJobSnapshot(sampledOut);
+    exporter.exportJobSnapshot(handedOn);
+    await exporter.onApplicationShutdown();
+
+    expect(receiver.spans()).toHaveLength(1);
+    expect(receiver.spans()[0].parentSpanId).toBe("00f067aa0ba902b8");
+  });
+
   it("leaves out a request whose caller sampled its trace out, as a parent-based sampler would", async () => {
     const registry = new OperationTraceRegistry(new AsyncLocalStorage());
     const sampledOut = snapshot(1);

@@ -15,7 +15,12 @@ import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
-import { OBSERVE_OPTIONS, TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import {
+  OBSERVE_OPTIONS,
+  TRACE_CONTEXT_KEY,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
+import { handedOnTraceContext } from "../utils/trace-context.util.js";
 import { continueHandedOnTrace } from "../utils/trace-handoff.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
@@ -200,6 +205,13 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         handedOn === undefined
           ? done
           : () => continueHandedOnTrace(handedOn, traceId, done);
+      // And the handler's span goes under the span that sent the message, for
+      // `otlp`, while the calls it makes carry the caller's decision on - as
+      // a request's do with the `traceparent` it arrived with.
+      const traceContext = handedOnTraceContext(handedOn, traceId);
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY, traceContext);
+      }
 
       setAttributesSafely(
         this.options.rpc?.setAttributes,
@@ -237,6 +249,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
           tags: this.options.rpc?.tags,
         },
         traceId,
+        traceContext,
       );
       return handle();
     });
@@ -272,6 +285,18 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       // The key must precede callbacks here too, before the deferred startup.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
+
+      // As for a message: the call's span goes under the caller's for `otlp`,
+      // and the calls the handler makes carry its decision on. Read now, while
+      // the span a gRPC instrumentation opened for the call is the active one.
+      // Unlike a message's, the handler is not run in the caller's trace: the
+      // SDK's gRPC instrumentation carries it there.
+      const traceContext = this.openTelemetryInteropOn()
+        ? handedOnTraceContext(grpcTraceparent(call), traceId)
+        : undefined;
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY, traceContext);
+      }
 
       setAttributesSafely(
         this.options.grpc?.setAttributes,
@@ -312,6 +337,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
               tags: this.options.grpc?.tags,
             },
             traceId,
+            traceContext,
           );
           resolve(done());
         }, 0);
@@ -425,6 +451,25 @@ function handedOnTraceparent(ctx: BaseRpcContext): unknown {
     return (metadata as Record<string, unknown> | undefined)?.["traceparent"];
   } catch {
     // A context that cannot be read carries nothing to continue.
+    return undefined;
+  }
+}
+
+/**
+ * The `traceparent` a gRPC call's metadata carries - a caller instrumented
+ * with OpenTelemetry sends one, and so does one running the agent with
+ * `openTelemetry` on - read off grpc-js's `Metadata`, whichever Nest release
+ * handed the call over.
+ */
+function grpcTraceparent(call: GrpcCall): string | undefined {
+  try {
+    const metadata = call.metadata as
+      | { get?: (key: string) => unknown[] }
+      | undefined;
+    const value = metadata?.get?.("traceparent")?.[0];
+    return typeof value === "string" ? value : undefined;
+  } catch {
+    // Metadata that cannot be read carries nothing to continue.
     return undefined;
   }
 }

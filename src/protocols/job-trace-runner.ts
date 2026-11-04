@@ -9,11 +9,13 @@ import {
 import {
   JOB_TRACE_CONTEXT_OPTION_KEY,
   JOB_TRACE_OPTION_KEY,
+  TRACE_CONTEXT_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { REQUEST_ID_PATTERN } from "../utils/default-trace-id-generator.util.js";
+import { handedOnTraceContext } from "../utils/trace-context.util.js";
 import {
   continueHandedOnTrace,
   traceparentToHandOn,
@@ -317,6 +319,13 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         inheritedTraceId !== undefined && this.openTelemetryInteropOn()
           ? job.opts?.[JOB_TRACE_CONTEXT_OPTION_KEY]
           : undefined;
+      // And the job's span goes under the span that handed it on, for `otlp`,
+      // while the calls it makes carry the caller's decision on - as a
+      // request's do with the `traceparent` it arrived with.
+      const traceContext = handedOnTraceContext(handedOn, traceId);
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY, traceContext);
+      }
 
       const context: JobContext = {
         queueName: job.queueName,
@@ -352,6 +361,7 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
           ...job.metadata,
         } as JobSnapshot,
         traceId,
+        traceContext,
       );
 
       let settled = false;

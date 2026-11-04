@@ -417,7 +417,7 @@ describe("jobSnapshotSpans", () => {
     }) as JobSnapshot;
 
   it("is a CONSUMER span for a queue job, in the trace of the request that enqueued it", () => {
-    const [run, processor] = jobSnapshotSpans(job());
+    const [run, processor] = jobSnapshotSpans(job(), undefined);
 
     expect(run).toEqual(
       expect.objectContaining({
@@ -442,9 +442,27 @@ describe("jobSnapshotSpans", () => {
     expect(processor.name).toBe("ReceiptsProcessor.process");
   });
 
+  it("goes under the span that enqueued it when it was handed on with a traceparent", () => {
+    const spans = jobSnapshotSpans(job(), {
+      traceId: "0193a1b2c3d47e5f8a9b0c1d2e3f4a5b",
+      parentSpanId: "00f067aa0ba902b7",
+      sampled: true,
+      traceState: "vendor=abc",
+    });
+    const [run, processor] = spans;
+
+    expect(run.parentSpanId).toBe("00f067aa0ba902b7");
+    expect(run.traceState).toBe("vendor=abc");
+    // Sampled, with a remote parent; everything below has a local one.
+    expect(run.flags).toBe(0x301);
+    expect(processor.flags).toBe(0x101);
+    expect(new Set(spans.map((span) => span.traceId)).size).toBe(1);
+  });
+
   it("is an INTERNAL span for a scheduled run, which nothing sent", () => {
     const [run] = jobSnapshotSpans(
       job({ queueName: "cron", name: "ReportsService.nightly" }),
+      undefined,
     );
 
     expect(run.kind).toBe(SpanKind.INTERNAL);
@@ -454,6 +472,7 @@ describe("jobSnapshotSpans", () => {
   it("fails with the job", () => {
     const [run] = jobSnapshotSpans(
       job({ status: "failed", error: { cls: "Error", message: "SMTP down" } }),
+      undefined,
     );
 
     expect(run.status).toEqual({

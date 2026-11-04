@@ -9,6 +9,7 @@ import {
   TRACE_CONTEXT_KEY,
 } from "../observe.constants.js";
 import {
+  handedOnTraceContext,
   readTraceContext,
   TraceContext,
   w3cSpanIdOf,
@@ -96,6 +97,30 @@ describe("W3C trace context handed on to a job or a message", () => {
         "done",
       );
       expect(run).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("the context the work's own span goes under", () => {
+    it("is the traceparent handed on, when it is sampled and in the work's trace", () => {
+      expect(handedOnTraceContext(TRACEPARENT, TRACE_ID_AS_UUID)).toEqual({
+        traceId: TRACE_ID,
+        parentSpanId: SPAN_ID,
+        sampled: true,
+      });
+    });
+
+    it.each([
+      // What the agent hands on for an operation it was not recording: the
+      // span it names exists nowhere.
+      ["is unsampled", `00-${TRACE_ID}-${SPAN_ID}-00`],
+      ["names another trace", `00-${"a".repeat(32)}-${SPAN_ID}-01`],
+      ["is malformed", "not-a-traceparent"],
+      ["is not a string", 42],
+      ["is absent", undefined],
+    ])("is none when what was handed on %s", (_, traceparent) => {
+      expect(handedOnTraceContext(traceparent, TRACE_ID_AS_UUID)).toBe(
+        undefined,
+      );
     });
   });
 
@@ -217,6 +242,24 @@ describe("W3C trace context handed on to a job or a message", () => {
           traceFlags: 1,
           isRemote: true,
         });
+      });
+    });
+
+    it("puts the work's own span under the span an instrumentation opened for it", () => {
+      insideSpan(TRACE_ID, (consumer) => {
+        expect(handedOnTraceContext(TRACEPARENT, TRACE_ID_AS_UUID)).toEqual({
+          traceId: TRACE_ID,
+          parentSpanId: consumer.spanContext().spanId,
+          sampled: true,
+        });
+      });
+    });
+
+    it("puts it under the span that handed it on when the open span is in another trace", () => {
+      insideSpan("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", () => {
+        expect(
+          handedOnTraceContext(TRACEPARENT, TRACE_ID_AS_UUID)?.parentSpanId,
+        ).toBe(SPAN_ID);
       });
     });
 

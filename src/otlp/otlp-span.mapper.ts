@@ -177,14 +177,16 @@ export function requestSnapshotSpans(
  * A queue job or a scheduled run as OTLP spans: a CONSUMER span for the run
  * - INTERNAL for a scheduled one, which nothing sent - and its tree under
  * it. A job reports under the trace id of the operation that enqueued it,
- * so it lands in that trace; nothing records which span enqueued it, so it
- * has no parent there. Without `withTree`, the run's span alone.
+ * so it lands in that trace, and under the span that enqueued it when it was
+ * handed on with a `traceparent` - see `handedOnTraceContext`. Without
+ * `withTree`, the run's span alone.
  */
 export function jobSnapshotSpans(
   snapshot: JobSnapshot,
+  context: TraceContext | undefined,
   withTree = true,
 ): OtlpSpan[] {
-  const traceId = w3cTraceIdOf(snapshot.traceId);
+  const traceId = context?.traceId ?? w3cTraceIdOf(snapshot.traceId);
   const startNs = epochNanos(snapshot.calledAt);
   const scheduled = SCHEDULER_QUEUES.has(snapshot.queueName);
 
@@ -209,6 +211,9 @@ export function jobSnapshotSpans(
   const run: OtlpSpan = {
     traceId,
     spanId: randomSpanId(),
+    ...(context
+      ? { parentSpanId: context.parentSpanId, traceState: context.traceState }
+      : {}),
     name: `${snapshot.queueName} ${snapshot.name}`,
     kind: scheduled ? SpanKind.INTERNAL : SpanKind.CONSUMER,
     startTimeUnixNano: startNs,
@@ -216,7 +221,7 @@ export function jobSnapshotSpans(
     ...toAttributes(tags),
     events: [],
     ...(failed ? { status: errorStatus(snapshot.error) } : {}),
-    flags: LOCAL_PARENT_FLAGS,
+    flags: context ? REMOTE_PARENT_FLAGS : LOCAL_PARENT_FLAGS,
   };
 
   const spans = [run];

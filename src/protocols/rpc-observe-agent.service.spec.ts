@@ -6,7 +6,7 @@ import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.j
 import { createInstanceDecorator } from "../instrument/create-instance-decorator.instrument.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
-import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { TRACE_CONTEXT_KEY, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { TracerService } from "../services/tracer.service.js";
@@ -525,13 +525,23 @@ describe("RpcObserveAgentService", () => {
         otelContext.disable();
       });
 
+      /** What the agent's trace registry is asked, for the cases that read it. */
+      const registryOf = () => ({
+        startTrace: vi.fn(),
+        endTrace: vi.fn(),
+        pluckSnapshot: vi.fn(),
+        hasTrace: vi.fn(() => false),
+      });
+
       const startHookFor = (
         openTelemetry: boolean | undefined,
         reporting = true,
         overrides: { ignore?: boolean; capture?: boolean } = {},
+        registry = registryOf(),
+        als = new AsyncLocalStorage<Map<string, any>>(),
       ) => {
         const agent = new RpcObserveAgentService(
-          new AsyncLocalStorage<Map<string, any>>(),
+          als,
           {
             traceIdKey: "traceId",
             // What the default makes of the id the sending agent attached.
@@ -544,12 +554,7 @@ describe("RpcObserveAgentService", () => {
               subscribe: () => ({ unsubscribe: vi.fn() }),
             }),
           } as never,
-          {
-            startTrace: vi.fn(),
-            endTrace: vi.fn(),
-            pluckSnapshot: vi.fn(),
-            hasTrace: vi.fn(() => false),
-          } as never,
+          registry as never,
           { isReporting: () => reporting } as never,
           { shouldCapture: () => overrides.capture ?? true } as never,
         );
@@ -614,6 +619,68 @@ describe("RpcObserveAgentService", () => {
           ).resolves.toBeUndefined();
         },
       );
+
+      const SENT_IN = {
+        traceId: TRACE_ID,
+        parentSpanId: SPAN_ID,
+        sampled: true,
+      };
+
+      it("puts the handler's span under the span that sent the message, and carries that context in its store", async () => {
+        const registry = registryOf();
+        const als = new AsyncLocalStorage<Map<string, any>>();
+        const startHook = startHookFor(true, true, {}, registry, als);
+
+        const stored = await Promise.resolve(
+          startHook(
+            Transport.TCP,
+            {
+              getMetadata: () => ({
+                "x-request-id": TRACE_ID_AS_UUID,
+                traceparent: TRACEPARENT,
+              }),
+            },
+            async () => als.getStore()?.get(TRACE_CONTEXT_KEY),
+          ),
+        );
+
+        expect(stored).toEqual(SENT_IN);
+        expect(registry.startTrace.mock.calls[0][3]).toEqual(SENT_IN);
+      });
+
+      it("records no context for a message sent unsampled, by an operation the sender was not recording", async () => {
+        const registry = registryOf();
+        const startHook = startHookFor(true, true, {}, registry);
+
+        await handledIn(startHook, {
+          "x-request-id": TRACE_ID_AS_UUID,
+          traceparent: `00-${TRACE_ID}-${SPAN_ID}-00`,
+        });
+
+        expect(registry.startTrace.mock.calls[0][3]).toBeUndefined();
+      });
+
+      it("puts a gRPC call's span under the caller's, read off the call's metadata", async () => {
+        const registry = registryOf();
+        const als = new AsyncLocalStorage<Map<string, any>>();
+        const startHook = startHookFor(true, true, {}, registry, als);
+        const call = {
+          request: {},
+          operationId: "FindOne",
+          metadata: {
+            get: (key: string) => (key === "traceparent" ? [TRACEPARENT] : []),
+          },
+        };
+
+        const stored = await Promise.resolve(
+          startHook(Transport.GRPC, call, async () =>
+            als.getStore()?.get(TRACE_CONTEXT_KEY),
+          ),
+        );
+
+        expect(stored).toEqual(SENT_IN);
+        expect(registry.startTrace.mock.calls[0][3]).toEqual(SENT_IN);
+      });
     });
 
     it("lets a Kafka consumer see an event handler's failure", async () => {
