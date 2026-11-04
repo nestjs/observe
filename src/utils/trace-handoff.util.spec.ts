@@ -188,6 +188,38 @@ describe("W3C trace context handed on to a job or a message", () => {
       expect(trace.getSpanContext(context.active())).toBeUndefined();
     });
 
+    it("leaves the work in a span an instrumentation opened for it in the same trace", () => {
+      // A consumer span, as bullmq-otel opens for a job and OpenTelemetry's
+      // Kafka and RabbitMQ instrumentations for a message: it already
+      // continues the trace that was handed on.
+      insideSpan(TRACE_ID, (consumer) => {
+        const active = continueHandedOnTrace(
+          TRACEPARENT,
+          TRACE_ID_AS_UUID,
+          () => trace.getSpanContext(context.active()),
+        );
+
+        expect(active?.spanId).toBe(consumer.spanContext().spanId);
+      });
+    });
+
+    it("runs the work in the handed-on trace when the span open is in another", () => {
+      insideSpan("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", () => {
+        const active = continueHandedOnTrace(
+          TRACEPARENT,
+          TRACE_ID_AS_UUID,
+          () => trace.getSpanContext(context.active()),
+        );
+
+        expect(active).toEqual({
+          traceId: TRACE_ID,
+          spanId: SPAN_ID,
+          traceFlags: 1,
+          isRemote: true,
+        });
+      });
+    });
+
     it("carries an unsampled decision on", () => {
       const flags = continueHandedOnTrace(
         `00-${TRACE_ID}-${SPAN_ID}-00`,

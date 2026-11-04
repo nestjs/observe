@@ -84,6 +84,12 @@ export function traceparentToHandOn(
  * packet metadata are writable by anything that reaches Redis or the
  * socket, and a span from another trace would put the work under one it
  * never ran beside. Anything else runs `run` as it is.
+ *
+ * So does work an OpenTelemetry instrumentation has already taken up, with
+ * a span of that trace open for it - BullMQ's `bullmq-otel` opens one for
+ * each job, and OpenTelemetry's Kafka and RabbitMQ instrumentations one for
+ * each message they deliver. The work's spans belong under that span, which
+ * the handed-on parent would put them beside.
  */
 export function continueHandedOnTrace<T>(
   traceparent: unknown,
@@ -94,7 +100,11 @@ export function continueHandedOnTrace<T>(
     typeof traceparent === "string"
       ? readTraceContext({ traceparent })
       : undefined;
-  if (!parent || parent.traceId !== w3cTraceIdOf(traceId)) {
+  if (
+    !parent ||
+    parent.traceId !== w3cTraceIdOf(traceId) ||
+    activeOpenTelemetrySpanContext()?.traceId === parent.traceId
+  ) {
     return run();
   }
   return withRemoteOpenTelemetryParent(

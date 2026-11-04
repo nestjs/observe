@@ -145,19 +145,18 @@ class OrdersController {
  * `observeTraceparent`, `bullmq-otel` in `opts.telemetry.metadata` - and
  * both name the same trace, as the agent follows the SDK's ids. They name
  * different parents, though: the agent the span that was active as the job
- * was added, `bullmq-otel` its producer span. In the job the agent runs the
- * processor in the context it handed on, inside `bullmq-otel`'s consumer
- * span, so the job's own spans nest under the span that added it, beside the
- * producer span, and the consumer span holds only BullMQ's own work. This
- * suite pins that, so a change to it is a deliberate one:
+ * was added, `bullmq-otel` its producer span. `bullmq-otel` runs the
+ * processor in its consumer span, a span of that same trace, and the agent
+ * leaves the job there - see `continueHandedOnTrace` - so the job's own
+ * spans nest under the consumer span, beside BullMQ's own:
  *
  *   server GET /orders/:id/confirm
- *     … the handler that adds the job      ← named by observeTraceparent
+ *     … the handler that adds the job        ← named by observeTraceparent
  *         producer add <queue>.confirm-order ← named by opts.telemetry.metadata
  *           consumer process <queue>
  *             internal complete <queue>
- *         client GET /stock/:id           ← the job's call
- *           server GET /stock/:id (inventory)
+ *             client GET /stock/:id          ← the job's call
+ *               server GET /stock/:id (inventory)
  */
 describe.skipIf(!redisReachable)(
   "OpenTelemetry in a Nest service whose BullMQ queue and worker run bullmq-otel",
@@ -236,7 +235,7 @@ describe.skipIf(!redisReachable)(
         .getFinishedSpans()
         .map((span) => exportedSpanOf(span, "orders"));
 
-    it("keeps the job in the request's trace in both tools, bullmq-otel's spans included, and nests the job's own spans under the span that added it", async () => {
+    it("keeps the job in the request's trace in both tools, and its own spans under bullmq-otel's consumer span", async () => {
       await get("/orders/job-1/confirm");
       await waitFor(
         () => runs.has("job-1"),
@@ -308,27 +307,22 @@ describe.skipIf(!redisReachable)(
       expect(trace.filter(inTrace("consumer"))).toHaveLength(1);
       expect(consumer.parentSpanId).toBe(producer.spanId);
 
-      // Pins current behaviour: the job's own spans nest under the span the
-      // agent handed on, not under bullmq-otel's consumer span, which holds
-      // only what BullMQ itself does once the processor returns.
-      expect(call.parentSpanId).toBe(adding!.spanId);
+      // The job's own spans nest under bullmq-otel's consumer span, which the
+      // processor runs in, and the service it called under them - beside
+      // what BullMQ itself does once the processor returns, which BullMQ
+      // names `<operation> <queue>`: `complete`, here.
+      expect(call.parentSpanId).toBe(consumer.spanId);
       const underConsumer = descendantsOf(consumer.spanId, trace);
-      expect(underConsumer.map((span) => span.spanId)).not.toContain(
-        call.spanId,
+      expect(underConsumer.map((span) => span.spanId)).toContain(
+        inventorySpan.spanId,
       );
-      expect(underConsumer.some((span) => span.service === "inventory")).toBe(
-        false,
-      );
-      // BullMQ names its spans `<operation> <queue>`: `complete`, here.
-      const consumerChildren = trace.filter(
-        (span) => span.parentSpanId === consumer.spanId,
-      );
-      expect(consumerChildren.length).toBeGreaterThan(0);
       expect(
-        consumerChildren.filter(
-          (span) => !span.name.endsWith(` ${QUEUE_NAME}`),
+        trace.filter(
+          (span) =>
+            span.parentSpanId === consumer.spanId &&
+            span.name === `complete ${QUEUE_NAME}`,
         ),
-      ).toEqual([]);
+      ).toHaveLength(1);
 
       // One trace, whole: every span in it but the request's has its parent
       // in it too.
