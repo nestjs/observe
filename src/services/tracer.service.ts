@@ -198,11 +198,14 @@ export class TracerService<
       if (attributes?.labels) {
         overridableRef.labels = attributes.labels;
       }
+      // `value` holds one reading per label, so the seed goes to the default
+      // one; a labelled metric has no unlabelled reading to seed.
       if (
         attributes?.initialValue !== undefined &&
+        !existingRef.labels &&
         existingRef.getValue() === 0
       ) {
-        overridableRef["value"] = attributes.initialValue;
+        overridableRef.value.default = attributes.initialValue;
       }
       return existingRef;
     }
@@ -262,11 +265,14 @@ export class TracerService<
       if (attributes?.labels) {
         overridableRef.labels = attributes.labels;
       }
+      // `value` holds one reading per label, so the seed goes to the default
+      // one; a labelled metric has no unlabelled reading to seed.
       if (
         attributes?.initialValue !== undefined &&
+        !existingRef.labels &&
         existingRef.getValue() === 0
       ) {
-        overridableRef["value"] = attributes.initialValue;
+        overridableRef.value.default = attributes.initialValue;
       }
       if (attributes?.kind) {
         overridableRef.kind = attributes.kind;
