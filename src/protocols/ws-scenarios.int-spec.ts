@@ -27,6 +27,7 @@ import { ObserveOptions } from "../interfaces/observe-options.interface.js";
 import { CompleteTraceEventNode } from "../interfaces/trace-events.interfaces.js";
 import { createObserveModule } from "../observe.module.js";
 import { TracerService } from "../services/tracer.service.js";
+import { nestMajor } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -274,6 +275,12 @@ describe.each<Platform>(["ws", "socket.io"])(
   (platform) => {
     let downstream: Server;
 
+    // Nest 12's exception filter sends a native WebSocket client the
+    // `exception` message; Nest 11's emits it on the server's own socket
+    // object, which a `ws` client never hears. The cases that wait for it run
+    // on socket.io there - what the agent reports is the same on both.
+    const itHearingExceptions = it.skipIf(platform === "ws" && nestMajor < 12);
+
     beforeAll(async () => {
       downstream = createServer((_req, res) => {
         res.setHeader("content-type", "application/json");
@@ -320,24 +327,27 @@ describe.each<Platform>(["ws", "socket.io"])(
           (item) => item.operationId === `DeskGateway:${pattern}`,
         );
 
-      it("reports a WsException with its payload, counted as unhandled: it is not an IntrinsicException, which is the line the agent draws", async () => {
-        const exception = client.next("exception");
-        client.send("refuse");
+      itHearingExceptions(
+        "reports a WsException with its payload, counted as unhandled: it is not an IntrinsicException, which is the line the agent draws",
+        async () => {
+          const exception = client.next("exception");
+          client.send("refuse");
 
-        // Nest's filter still tells the client.
-        expect(await exception).toMatchObject({ message: "not today" });
-        const snapshot = await snapshotOf("refuse");
-        expect(snapshot.protocol).toBe("ws");
-        expect(snapshot.error).toMatchObject({
-          cls: "WsException",
-          message: "not today",
-        });
-        expect(snapshot.traces[0]).toMatchObject({
-          className: "DeskGateway",
-          methodKey: "refuse",
-        });
-        expect(snapshot.attributes?.statusCode).toBe(500);
-      });
+          // Nest's filter still tells the client.
+          expect(await exception).toMatchObject({ message: "not today" });
+          const snapshot = await snapshotOf("refuse");
+          expect(snapshot.protocol).toBe("ws");
+          expect(snapshot.error).toMatchObject({
+            cls: "WsException",
+            message: "not today",
+          });
+          expect(snapshot.traces[0]).toMatchObject({
+            className: "DeskGateway",
+            methodKey: "refuse",
+          });
+          expect(snapshot.attributes?.statusCode).toBe(500);
+        },
+      );
 
       it("reports an intrinsic exception thrown by a handler as handled, under its own 4xx", async () => {
         client.send("decline");
@@ -400,21 +410,24 @@ describe.each<Platform>(["ws", "socket.io"])(
         });
       });
 
-      it("reports a message a guard refused, with the guard as the root span and the handler never run", async () => {
-        const exception = client.next("exception");
-        client.send("vault", "stranger");
+      itHearingExceptions(
+        "reports a message a guard refused, with the guard as the root span and the handler never run",
+        async () => {
+          const exception = client.next("exception");
+          client.send("vault", "stranger");
 
-        expect(await exception).toMatchObject({ message: "members only" });
-        const snapshot = await snapshotOf("vault");
-        expect(snapshot.traces[0]).toMatchObject({
-          className: "MembersOnlyGuard",
-          methodKey: "canActivate",
-        });
-        expect(
-          spansOf(snapshot.traces as CompleteTraceEventNode[], "DeskGateway"),
-        ).toEqual([]);
-        expect((snapshot.error as { cls?: string })?.cls).toBe("WsException");
-      });
+          expect(await exception).toMatchObject({ message: "members only" });
+          const snapshot = await snapshotOf("vault");
+          expect(snapshot.traces[0]).toMatchObject({
+            className: "MembersOnlyGuard",
+            methodKey: "canActivate",
+          });
+          expect(
+            spansOf(snapshot.traces as CompleteTraceEventNode[], "DeskGateway"),
+          ).toEqual([]);
+          expect((snapshot.error as { cls?: string })?.cls).toBe("WsException");
+        },
+      );
 
       it("reports a message a guard let through, guard first and handler after", async () => {
         const reply = client.next("vault-open");
@@ -525,23 +538,26 @@ describe.each<Platform>(["ws", "socket.io"])(
         await app?.close();
       });
 
-      it("switches gateway tracing off: handlers answer, fail and call out as before, and nothing is reported", async () => {
-        const reply = client.next("looked-up");
-        client.send("lookup");
-        expect(await reply).toBe("looked-up");
+      itHearingExceptions(
+        "switches gateway tracing off: handlers answer, fail and call out as before, and nothing is reported",
+        async () => {
+          const reply = client.next("looked-up");
+          client.send("lookup");
+          expect(await reply).toBe("looked-up");
 
-        const exception = client.next("exception");
-        client.send("refuse");
-        expect(await exception).toMatchObject({ message: "not today" });
+          const exception = client.next("exception");
+          client.send("refuse");
+          expect(await exception).toMatchObject({ message: "not today" });
 
-        const whoami = client.next("you-are");
-        client.send("whoami");
-        // Still a trace id of its own, for logs - just no trace.
-        expect(await whoami).toEqual(expect.any(String));
+          const whoami = client.next("you-are");
+          client.send("whoami");
+          // Still a trace id of its own, for logs - just no trace.
+          expect(await whoami).toEqual(expect.any(String));
 
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(collected.items).toEqual([]);
-      });
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          expect(collected.items).toEqual([]);
+        },
+      );
     });
   },
 );

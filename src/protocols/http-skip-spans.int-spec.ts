@@ -9,10 +9,10 @@ import {
 } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import request from "supertest";
 import { RequestSnapshotEncoder } from "../encoders/request-snapshot.encoder.js";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -66,7 +66,7 @@ type Platform = "express" | "node";
  * the span tree it would otherwise pay for, and keeps everything else as it
  * was.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: skipped spans (%s)",
   (platform) => {
     let app: INestApplication;
@@ -75,7 +75,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         SkipSpansTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         { instrument: ObserveInstrument, logger: false },
       );
       collected = collectSnapshots(app);

@@ -3,10 +3,10 @@ import { Controller, Get, INestApplication, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
 import { FastifyAdapter } from "@nestjs/platform-fastify";
-import { NodeAdapter } from "@nestjs/platform-node";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
 import { TracerService } from "../services/tracer.service.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -103,7 +103,7 @@ type Platform = "express" | "node" | "fastify";
  * open at once, and one long after the other. Sequential calls with distinct
  * ids cannot reveal a snapshot overwritten by another execution.
  */
-describe.each<Platform>(["express", "node", "fastify"])(
+describe.each<Platform>(onPlatforms(["express", "node", "fastify"]))(
   "ObserveModule: HTTP execution isolation (%s)",
   (platform) => {
     let app: INestApplication;
@@ -120,7 +120,7 @@ describe.each<Platform>(["express", "node", "fastify"])(
         platform === "fastify"
           ? new FastifyAdapter()
           : platform === "node"
-            ? new NodeAdapter()
+            ? await createNodeAdapter()
             : new ExpressAdapter(),
         { instrument: ObserveInstrument, logger: false },
       );

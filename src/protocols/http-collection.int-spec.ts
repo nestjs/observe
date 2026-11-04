@@ -9,10 +9,10 @@ import {
 } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
 import { TracerService } from "../services/tracer.service.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -71,7 +71,7 @@ type Platform = "express" | "node";
  * nothing here can be exercised without actually booting an app and issuing
  * real requests.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: HTTP collection (%s)",
   (platform) => {
     let app: INestApplication;
@@ -80,7 +80,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         HttpTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         {
           instrument: ObserveInstrument,
           logger: false,

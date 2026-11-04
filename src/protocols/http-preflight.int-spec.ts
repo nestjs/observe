@@ -12,10 +12,11 @@ import {
   FastifyAdapter,
   NestFastifyApplication,
 } from "@nestjs/platform-fastify";
-import { NestNodeApplication, NodeAdapter } from "@nestjs/platform-node";
+import type { NestNodeApplication } from "@nestjs/platform-node";
 import request from "supertest";
 import { ObserveOptions } from "../interfaces/observe-options.interface.js";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -59,7 +60,7 @@ async function bootApp(
       : platform === "node"
         ? await NestFactory.create<NestNodeApplication>(
             PreflightModule as Type<unknown>,
-            new NodeAdapter(),
+            await createNodeAdapter(),
             { instrument: ObserveInstrument, logger: false },
           )
         : await NestFactory.create<NestFastifyApplication>(
@@ -107,7 +108,7 @@ const preflight = (app: INestApplication) =>
  * shows that the request hook sees it at all, and that it is let through
  * untraced unless `http.tracePreflights` asks for it.
  */
-describe.each<Platform>(["express", "fastify", "node"])(
+describe.each<Platform>(onPlatforms(["express", "fastify", "node"]))(
   "ObserveModule: CORS preflights (%s)",
   (platform) => {
     describe("by default", () => {
