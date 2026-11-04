@@ -180,6 +180,40 @@ export function inboundTraceId(
 }
 
 /**
+ * The W3C trace context a queue job or a microservice message runs in -
+ * `inboundTraceContext`'s counterpart for work handed on with a `traceparent`
+ * (see `traceparentToHandOn`), whose span the exporter puts under it. That is
+ * the span an OpenTelemetry SDK in this process has open for the work, when
+ * it is in that trace - an instrumentation that covers the hop opens one:
+ * `bullmq-otel` for a job, the SDK's gRPC, Kafka or RabbitMQ instrumentation
+ * for a message - else the `traceparent` itself.
+ *
+ * Only a `traceparent` in the trace `traceId` - the Observe trace id the work
+ * runs under - maps onto, as `continueHandedOnTrace` takes it: job options and
+ * packet metadata are writable by anything that reaches Redis or the socket.
+ *
+ * And only a sampled one, which a request's `traceparent` need not be. The
+ * agent hands work on unsampled when the operation that sent it was not
+ * recorded, naming a span that exists nowhere; or its caller sampled the
+ * trace out, and nothing upstream exports it. Either way there is no parent
+ * to put the work's span under, so it stays as it was without one.
+ */
+export function handedOnTraceContext(
+  traceparent: unknown,
+  traceId: string,
+): TraceContext | undefined {
+  const handedOn =
+    typeof traceparent === "string"
+      ? readTraceContext({ traceparent })
+      : undefined;
+  if (!handedOn?.sampled || handedOn.traceId !== w3cTraceIdOf(traceId)) {
+    return undefined;
+  }
+  const active = traceContextOfSpan(activeOpenTelemetrySpanContext());
+  return active?.traceId === handedOn.traceId ? active : handedOn;
+}
+
+/**
  * An OpenTelemetry span context as the trace context an operation runs in,
  * the span becoming the operation's parent - or `undefined` for one the spec
  * would not accept, such as the all-zero context of a span never started.

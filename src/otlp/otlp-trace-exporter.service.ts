@@ -245,13 +245,20 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   /**
    * Queues a finished job's spans - its own span, and with `withTree` the
    * spans under it. Never throws into the caller.
+   *
+   * Left out, as a request is, when the trace it was handed on in is one an
+   * OpenTelemetry SDK in this process sampled out.
    */
   exportJobSnapshot(snapshot: JobSnapshot, withTree = true): void {
     if (!this.settings) {
       return;
     }
     try {
-      this.enqueue(jobSnapshotSpans(snapshot, withTree));
+      const context = this.operationTraceRegistry.traceContextOf(snapshot);
+      if (context && !context.sampled) {
+        return;
+      }
+      this.enqueue(jobSnapshotSpans(snapshot, context, withTree));
     } catch (error) {
       this.reportMappingFailure(error);
     }

@@ -4,7 +4,7 @@ import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-ho
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
-import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { TRACE_CONTEXT_KEY, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { JobRunDescriptor, JobTraceRunner } from "./job-trace-runner.js";
 
@@ -430,5 +430,35 @@ describe("JobTraceRunner: W3C trace context, with openTelemetry on", () => {
     expect(
       ranIn(createRunner(true), { observeTraceparent: TRACEPARENT }),
     ).toBeUndefined();
+  });
+
+  /** The context a job's store carries, and the one its trace started with. */
+  const recordedFor = (opts: Record<string, unknown>) => {
+    const startTrace = vi.spyOn(registry, "startTrace");
+    const stored = createRunner(true).run(
+      { queueName: "emails", name: "welcome", id: 1, opts, metadata: {} },
+      () => als.getStore()?.get(TRACE_CONTEXT_KEY),
+    );
+    return { stored, started: startTrace.mock.calls[0]?.[3] };
+  };
+
+  it("puts the job's span under the span that enqueued it, and carries that context in its store", () => {
+    const sentIn = { traceId: TRACE_ID, parentSpanId: SPAN_ID, sampled: true };
+
+    expect(
+      recordedFor({
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: TRACEPARENT,
+      }),
+    ).toEqual({ stored: sentIn, started: sentIn });
+  });
+
+  it("records no context for a job enqueued unsampled, by an operation the agent was not recording", () => {
+    expect(
+      recordedFor({
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: `00-${TRACE_ID}-${SPAN_ID}-00`,
+      }),
+    ).toEqual({ stored: undefined, started: undefined });
   });
 });
