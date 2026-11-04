@@ -125,11 +125,20 @@ function frameLines(stack: string, message: string | undefined): string[] {
   if (message === "") {
     headerEnd = stack.indexOf("\n");
   } else {
-    const at = stack.indexOf(message);
-    if (at === -1 || stack.lastIndexOf("\n", at) !== -1) {
-      return [];
+    // The last match on the first line that runs to the end of a line: an
+    // earlier one can sit inside the name - `UnauthorizedException:
+    // Unauthorized` - and a later one ends past the real message, so whatever
+    // follows it is still what V8 wrote.
+    headerEnd = -1;
+    for (
+      let at = stack.indexOf(message);
+      at !== -1 && stack.lastIndexOf("\n", at) === -1;
+      at = stack.indexOf(message, at + 1)
+    ) {
+      if (stack[at + message.length] === "\n") {
+        headerEnd = at + message.length;
+      }
     }
-    headerEnd = at + message.length;
   }
   if (headerEnd === -1 || stack[headerEnd] !== "\n") {
     return [];
