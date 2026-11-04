@@ -161,8 +161,9 @@ class ReservingOrdersController {
 /**
  * A Nest service that runs the OpenTelemetry Node SDK as well as Observe,
  * with `openTelemetry` on, handing work on to a queue job and to a TCP
- * microservice. OpenTelemetry has no instrumentation for either hop, so
- * inside the job and the message handler it has no span from the request -
+ * microservice. The SDK's auto-instrumentations cover neither hop - BullMQ's
+ * own add-on is the bullmq-otel suite's - so inside the job and the message
+ * handler it has no span from the request -
  * and their calls out would carry a `traceparent` for a trace of their own,
  * which every service downstream then follows, Observe ones included.
  *

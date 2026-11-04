@@ -748,10 +748,14 @@ export interface ObserveOptions {
    *   reported under the trace of the server span the SDK opened for it, the
    *   request that starts a trace included, and `traceparent` on outbound
    *   calls is left to the SDK.
-   * - A BullMQ or Bull job, and a message over the TCP or Redis transport,
-   *   carry a W3C `traceparent` beside their trace id, and run in it for an
-   *   OpenTelemetry SDK in the process that runs them - so its spans there,
-   *   and the calls they make, stay in the trace that handed the work on.
+   * - A BullMQ or Bull job, and a message over a built-in transport - TCP and
+   *   Redis on `@nestjs/microservices` 12.0.4 and later, NATS, Kafka,
+   *   RabbitMQ, MQTT 5 and gRPC on 12.3.3 and later - carry a W3C
+   *   `traceparent` beside their trace id, for whatever runs them to
+   *   continue: an OpenTelemetry SDK in the Nest process that runs one does,
+   *   in the span an instrumentation such as `bullmq-otel` opens for the
+   *   work, else in the trace handed on - so its spans there, and the calls
+   *   they make, stay in the trace that handed the work on.
    *
    * A `traceIdGenerator` passed to `createObserveModule()` still names the
    * trace; the W3C one is carried on beside it.
