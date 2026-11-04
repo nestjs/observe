@@ -44,9 +44,8 @@ export interface OutgoingHttpOptions {
    * cover, and a request takes only one.
    *
    * Only with `openTelemetry` on, and only beside reporting to NestJS
-   * Observe - from the first batch the collector accepts, through outages,
-   * until it refuses the app's credentials; otherwise no `traceparent` is
-   * sent.
+   * Observe - from start-up, through outages, until the collector refuses
+   * the app's credentials; otherwise no `traceparent` is sent.
    * @default true, with `openTelemetry` on
    */
   traceContext?: boolean;
@@ -109,7 +108,7 @@ export function subscribeOutgoingHttp(
   /**
    * Whether calls carry W3C Trace Context now: with `openTelemetry` on and
    * `traceContext` not off, while the agent reports to NestJS Observe (see
-   * `ObserveAgentSharedBuffer.isIngesting`). Off unless given.
+   * `ObserveAgentSharedBuffer.isReporting`). Off unless given.
    */
   traceContextOn: () => boolean = () => false,
 ): () => void {

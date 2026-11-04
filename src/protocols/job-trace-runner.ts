@@ -194,14 +194,14 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
 
   /**
    * Whether OpenTelemetry interop runs now: `openTelemetry` on, beside
-   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isIngesting`.
+   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isReporting`.
    * Asked as a job is enqueued and again as it starts, by each side for
    * itself.
    */
   private openTelemetryInteropOn(): boolean {
     return (
       this.options.openTelemetry === true &&
-      this.observeAgentSharedBuffer.isIngesting()
+      this.observeAgentSharedBuffer.isReporting()
     );
   }
 

@@ -28,6 +28,7 @@ describe("ObserveAgentWorker options", () => {
     acquireLock: vi.fn(() => true),
     encodeAndWrite: vi.fn(),
     releaseLock: vi.fn(),
+    recordStarted: vi.fn(),
   };
   const metrics = { collectNodeRuntimeMetrics: collect };
 

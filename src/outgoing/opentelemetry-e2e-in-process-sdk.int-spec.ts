@@ -15,6 +15,7 @@ import {
 import { NestFactory } from "@nestjs/core";
 import { context } from "@opentelemetry/api";
 import { suppressTracing } from "@opentelemetry/core";
+import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createObserveModule } from "../observe.module.js";
 import {
   FakeCollector,
@@ -168,26 +169,36 @@ describe("OpenTelemetry in a Nest service and the services around it", () => {
       `the snapshot for ${path} at the collector`,
     );
 
-  it("names requests by ids of its own until the collector takes a batch, leaving the SDK's trace as it is", async () => {
-    const received = await get(`${gateway.url}/orders/before`);
+  it("reports a new instance's first request under the gateway's trace, while the collector is down", async () => {
+    const received = await get(`${gateway.url}/orders/first`);
 
-    const { traceId } = await serverSpan("gateway", "/orders/before");
-    const snapshot = await snapshotFor("/orders/before");
+    const { traceId } = await serverSpan("gateway", "/orders/first");
+    const snapshot = await snapshotFor("/orders/first");
 
-    // What the option off does: the agent's own UUIDv7...
-    expect(snapshot.ti[14]).toBe("7");
-    expect(received.headers["x-request-id"]).toBe(snapshot.ti);
-    // ...and the trace goes on as the SDK alone would carry it.
+    // Nothing has got in: the collector has answered nothing but 503.
+    expect(
+      app.get(ObserveAgentSharedBuffer, { strict: false }).isIngesting(),
+    ).toBe(false);
+    expect(snapshot.ti).toBe(asUuid(traceId));
+    expect(received.headers["x-request-id"]).toBe(asUuid(traceId));
+    // One traceparent on the call, the SDK's, in the same trace.
     expect(countHeader(received.rawHeaders, "traceparent")).toBe(1);
     expect(readTraceContext(received.headers)?.traceId).toBe(traceId);
   });
 
-  // The tests after this one run with interop on, so they need it to have
-  // run: filtered to one of them, the suite fails on its first assertion.
-  it("turns on once the collector accepts a batch", async () => {
+  // From here on the collector takes batches, as it does for most of a
+  // service's life.
+  it("stays in the gateway's trace once the collector takes a batch", async () => {
     collector.answerWith({});
-
     await untilIngesting(app, ordersUrl);
+
+    const received = await get(`${gateway.url}/orders/accepted`);
+
+    const { traceId } = await serverSpan("gateway", "/orders/accepted");
+    const snapshot = await snapshotFor("/orders/accepted");
+    expect(snapshot.ti).toBe(asUuid(traceId));
+    expect(received.headers["x-request-id"]).toBe(asUuid(traceId));
+    expect(countHeader(received.rawHeaders, "traceparent")).toBe(1);
   });
 
   it("reports a request under the gateway's trace, which the SDK continues around Observe's spans", async () => {

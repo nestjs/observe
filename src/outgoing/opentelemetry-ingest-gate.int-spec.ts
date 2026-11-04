@@ -50,11 +50,11 @@ class CallerController {
 }
 
 /**
- * OpenTelemetry interop works only beside reporting to NestJS Observe: it
- * turns on once the collector accepts a batch, stays on through an outage at
- * the collector - 5xx answers, a rate-limit pause - and pauses only while the
- * collector refuses the app's credentials. Driven end to end, through the
- * real worker and a collector whose answers change under it.
+ * OpenTelemetry interop works only beside reporting to NestJS Observe: it is
+ * on from start-up, stays on through an outage at the collector - 5xx
+ * answers, a rate-limit pause - and pauses only while the collector refuses
+ * the app's credentials. Driven end to end, through the real worker and a
+ * collector whose answers change under it, down when the app starts.
  *
  * Each request arrives in the caller's W3C trace. With interop on, it is
  * reported under that trace's id and its outbound call carries `traceparent`.
@@ -162,18 +162,34 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
     expect(headers["x-request-id"]).toBe(TRACE_ID_AS_UUID);
   };
 
-  it("stays off while no batch has got in", async () => {
-    await withTraffic(
-      () => collector.requests.length > 0,
-      5000,
-      "a batch to reach the collector",
-    );
+  /** How many times the agent has said `line`. */
+  const said = (line: string) => output.lines.join("").split(line).length - 1;
+  /** How many times the agent has said interop paused. */
+  const pauses = () => said("OpenTelemetry interop is paused");
+
+  it("is on from start-up, before any batch has got in", async () => {
+    // A new instance's first request: the collector has answered nothing
+    // but 503.
+    expectOn(await call("first"));
 
     expect(buffer.isIngesting()).toBe(false);
-    expectOff(await call("collector-down"));
+    expect(said("OpenTelemetry interop is on")).toBe(1);
   });
 
-  it("turns on once the collector accepts a batch", async () => {
+  it("stays on while no batch gets in", async () => {
+    const before = collector.requests.length;
+    await withTraffic(
+      () => collector.requests.length >= before + 2,
+      5000,
+      "two batches to fail against the collector",
+    );
+
+    expect(buffer.isReporting()).toBe(true);
+    expectOn(await call("collector-down"));
+    expect(pauses()).toBe(0);
+  });
+
+  it("stays on, and says no more, once the collector accepts a batch", async () => {
     collector.answerWith({});
     await withTraffic(
       () => buffer.isIngesting(),
@@ -182,12 +198,8 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
     );
 
     expectOn(await call("accepted"));
-    expect(output.lines.join("")).toContain("OpenTelemetry interop is on");
+    expect(said("OpenTelemetry interop is on")).toBe(1);
   });
-
-  /** How many times the agent has said interop paused. */
-  const pauses = () =>
-    output.lines.join("").split("OpenTelemetry interop is paused").length - 1;
 
   it("stays on while the collector answers with errors", async () => {
     collector.answerWith({ message: "Service Unavailable" }, 503);
@@ -200,7 +212,7 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
       "three batches to fail against the collector",
     );
 
-    expect(buffer.isIngesting()).toBe(true);
+    expect(buffer.isReporting()).toBe(true);
     expectOn(await call("collector-erroring"));
     expect(pauses()).toBe(0);
   });
@@ -211,7 +223,7 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
       401,
     );
     await withTraffic(
-      () => !buffer.isIngesting(),
+      () => !buffer.isReporting(),
       5000,
       "the refusal to reach the agent",
     );
@@ -226,12 +238,13 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
     collector.answerWith({});
     // The worker backs off after a refusal - one flush interval at first.
     await withTraffic(
-      () => buffer.isIngesting(),
+      () => buffer.isReporting(),
       10_000,
       "a batch to get in again",
     );
 
     expectOn(await call("accepted-again"));
+    expect(said("OpenTelemetry interop is on again")).toBe(1);
   });
 
   // Last: a paused worker sends nothing until the pause lapses.
@@ -248,7 +261,7 @@ describe("OpenTelemetry interop, beside the worker's ingest", () => {
       "the rate limit to reach the agent",
     );
 
-    expect(buffer.isIngesting()).toBe(true);
+    expect(buffer.isReporting()).toBe(true);
     expectOn(await call("rate-limited"));
     expect(pauses()).toBe(pausesBefore);
   });

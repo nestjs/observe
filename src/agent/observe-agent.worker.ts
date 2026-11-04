@@ -178,6 +178,10 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       }
     } else {
       this.initializeWorker();
+      // Not in `initializeWorker`, which restarts a stopped worker too: that
+      // one has to get a batch in first.
+      this.observeAgentSharedBuffer.recordStarted();
+      this.reportOpenTelemetryInterop("started");
     }
 
     if (this.options.openTelemetry === true && this.sendsNothing) {
@@ -681,7 +685,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     const mode = parseDegradedMessage(msg);
     if (mode !== null) {
       this.observeAgentSharedBuffer.recordAccepted();
-      this.reportOpenTelemetryInterop();
+      this.reportOpenTelemetryInterop("accepted");
       this.reportFirstAcceptedBatch();
       this.applyIngestMode(mode, parseOveragePauseReason(msg));
       return;
@@ -706,23 +710,29 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
   /**
    * Says when OpenTelemetry interop turns on or off, with `openTelemetry` on:
    * it runs only beside reporting to NestJS Observe (see
-   * `ObserveAgentSharedBuffer.isIngesting`), and a `traceparent` that stops
-   * going out with no word would read as a bug in the agent.
+   * `ObserveAgentSharedBuffer.isReporting`), and a `traceparent` that stops
+   * going out with no word would read as a bug in the agent. `why` is what
+   * just happened, which the line gives as the reason.
    */
-  private reportOpenTelemetryInterop(why?: "refused" | "stopped"): void {
+  private reportOpenTelemetryInterop(
+    why: "started" | "accepted" | "refused" | "stopped",
+  ): void {
     if (this.options.openTelemetry !== true) {
       return;
     }
-    const on = this.observeAgentSharedBuffer.isIngesting();
+    const on = this.observeAgentSharedBuffer.isReporting();
     if (on === this.reportedOpenTelemetry) {
       return;
     }
     this.reportedOpenTelemetry = on;
     if (on) {
       this.logger.log(
-        "OpenTelemetry interop is on: the collector accepted this app's telemetry, so traceparent is read and sent. " +
-          "It stays on through collector outages and rate limits, and pauses only if the collector refuses the app's " +
-          "credentials or the telemetry worker stops.",
+        why === "started"
+          ? "OpenTelemetry interop is on: traceparent is read and sent beside reporting to NestJS Observe. " +
+              "It stays on through collector outages and rate limits, and pauses only if the collector refuses the " +
+              "app's credentials or the telemetry worker stops."
+          : "OpenTelemetry interop is on again: the collector accepted this app's telemetry, so traceparent is read " +
+              "and sent.",
       );
       return;
     }

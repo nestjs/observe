@@ -748,22 +748,26 @@ export interface ObserveOptions {
    *   reported under the trace of the server span the SDK opened for it, the
    *   request that starts a trace included, and `traceparent` on outbound
    *   calls is left to the SDK.
-   * - A BullMQ or Bull job, and a message over the TCP or Redis transport,
-   *   carry a W3C `traceparent` beside their trace id, and run in it for an
-   *   OpenTelemetry SDK in the process that runs them - so its spans there,
-   *   and the calls they make, stay in the trace that handed the work on.
+   * - A BullMQ or Bull job, and a message over a built-in transport - TCP and
+   *   Redis on `@nestjs/microservices` 12.0.4 and later, NATS, Kafka,
+   *   RabbitMQ, MQTT 5 and gRPC on 12.3.3 and later - carry a W3C
+   *   `traceparent` beside their trace id, for whatever runs them to
+   *   continue: an OpenTelemetry SDK in the Nest process that runs one does,
+   *   in the span an instrumentation such as `bullmq-otel` opens for the
+   *   work, else in the trace handed on - so its spans there, and the calls
+   *   they make, stay in the trace that handed the work on.
    *
    * A `traceIdGenerator` passed to `createObserveModule()` still names the
    * trace; the W3C one is carried on beside it.
    *
-   * It works only beside reporting to NestJS Observe: it turns on with the
-   * first batch the collector accepts, and stays on through collector outages
-   * and rate limits, so traces through the services around this one stay
-   * whole while NestJS Observe is down. It pauses - each time with a line in
-   * the log - only while the collector refuses the app's credentials or the
-   * agent's worker is down, and resumes with the next batch the collector
-   * accepts. With `enabled: false`, or without credentials for the hosted
-   * collector, it never turns on.
+   * It works only beside reporting to NestJS Observe. It is on from
+   * start-up, and stays on through collector outages and rate limits, so
+   * traces through the services around this one stay whole from an
+   * instance's first request, and while NestJS Observe is down. It pauses -
+   * each time with a line in the log - only while the collector refuses the
+   * app's credentials or the agent's worker is down, and resumes with the
+   * next batch the collector accepts. With `enabled: false`, or without
+   * credentials for the hosted collector, it never turns on.
    * @default false
    */
   openTelemetry?: boolean;

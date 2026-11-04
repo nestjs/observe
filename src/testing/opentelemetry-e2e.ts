@@ -30,13 +30,14 @@ export const asUuid = (hex: string): string =>
 
 /**
  * Sends requests to the app's `/health` until the collector has accepted a
- * batch from its worker. OpenTelemetry interop runs only from then on, so a
- * suite that asserts on it waits here first - as a deployed service's first
- * requests do.
+ * batch from its worker - for a suite that asserts on what the collector's
+ * replies set, an OTLP export grant say, or on a service past its first
+ * batch, as most of a deployed service's requests are. OpenTelemetry interop
+ * does not wait for it: it runs from start-up.
  *
  * `also` names services the app's `/health` reaches in turn - a microservice,
- * which has no HTTP route of its own - to wait for as well: each turns
- * interop on with its own worker's first accepted batch.
+ * which has no HTTP route of its own - to wait for as well: each has its own
+ * worker to get a batch in.
  */
 export async function untilIngesting(
   app: INestApplication,

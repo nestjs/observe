@@ -331,9 +331,10 @@ describe("the not-ingested line", () => {
 
 /**
  * Whether this app reports to NestJS Observe, which OpenTelemetry interop
- * runs on: only beside reporting to NestJS Observe. A batch that fails to get
- * in for any other reason than refused credentials is no input here at all -
- * see the worker's interop suite.
+ * runs on, and whether the collector takes its telemetry, which what the
+ * collector's replies grant holds on. A batch that fails to get in for any
+ * other reason than refused credentials is no input here at all - see the
+ * worker's interop suite.
  */
 describe("the shared buffer's ingest health", () => {
   const bufferOf = () =>
@@ -341,36 +342,58 @@ describe("the shared buffer's ingest health", () => {
       serviceId: "svc",
     } as ObserveModuleOptionsWithDefaults);
 
-  it("starts off, until a first batch gets in", () => {
+  it("starts off, until the worker starts", () => {
     const buffer = bufferOf();
+    expect(buffer.isReporting()).toBe(false);
     expect(buffer.isIngesting()).toBe(false);
 
+    buffer.recordStarted();
+    expect(buffer.isReporting()).toBe(true);
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("ingests from the first batch that gets in", () => {
+    const buffer = bufferOf();
+    buffer.recordStarted();
     buffer.recordAccepted();
+
+    expect(buffer.isReporting()).toBe(true);
     expect(buffer.isIngesting()).toBe(true);
   });
 
-  it("stops at once when the collector refuses the credentials", () => {
+  it("keeps a batch already taken when the worker's start is recorded after it", () => {
     const buffer = bufferOf();
     buffer.recordAccepted();
-    buffer.recordRefused();
+    buffer.recordStarted();
 
-    expect(buffer.isIngesting()).toBe(false);
+    expect(buffer.isIngesting()).toBe(true);
   });
 
-  it("stops at once when the worker stops", () => {
-    const buffer = bufferOf();
-    buffer.recordAccepted();
-    buffer.recordStopped();
+  it.each([
+    ["the collector refuses the credentials", "recordRefused"],
+    ["the worker stops", "recordStopped"],
+  ] as const)("stops at once when %s", (_, record) => {
+    const started = bufferOf();
+    started.recordStarted();
+    started[record]();
+    const ingesting = bufferOf();
+    ingesting.recordStarted();
+    ingesting.recordAccepted();
+    ingesting[record]();
 
-    expect(buffer.isIngesting()).toBe(false);
+    for (const buffer of [started, ingesting]) {
+      expect(buffer.isReporting()).toBe(false);
+      expect(buffer.isIngesting()).toBe(false);
+    }
   });
 
   it("turns back on with the next batch that gets in", () => {
     const buffer = bufferOf();
-    buffer.recordAccepted();
+    buffer.recordStarted();
     buffer.recordRefused();
     buffer.recordAccepted();
 
+    expect(buffer.isReporting()).toBe(true);
     expect(buffer.isIngesting()).toBe(true);
   });
 });
