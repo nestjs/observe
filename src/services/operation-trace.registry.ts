@@ -182,6 +182,11 @@ export class OperationTraceRegistry {
    */
   private hasReportedSkipSpansFailure = false;
   /**
+   * A slice recorder that fails to close one span is likely to fail on every
+   * span, so the failure is reported once rather than once per span.
+   */
+  private hasReportedSliceExitFailure = false;
+  /**
    * Scrubs error messages and stacks before they are attached to a span.
    *
    * On by default, with the same defaults the log forwarder uses, for the
@@ -620,7 +625,7 @@ export class OperationTraceRegistry {
       return;
     }
     snapshot.refsMarkedAsComplete += 1;
-    activeSliceRecorder()?.exit(callerId);
+    this.exitSlice(callerId);
 
     const refsByCaller = this.callerIdsByTraceId.get(traceId);
     if (!refsByCaller) {
@@ -672,6 +677,24 @@ export class OperationTraceRegistry {
         }
       } else {
         activeTrace.error = true;
+      }
+    }
+  }
+
+  /**
+   * Closes a span's profiling slice. A recorder that throws here must not stop
+   * `internalEndTraceStep` from finishing the node it has already counted as
+   * complete, or the span would ship without its duration and error.
+   */
+  private exitSlice(callerId: string | undefined): void {
+    try {
+      activeSliceRecorder()?.exit(callerId);
+    } catch (error) {
+      if (!this.hasReportedSliceExitFailure) {
+        this.hasReportedSliceExitFailure = true;
+        this.logger.warn(
+          `Closing a span's profiling slice failed; the span is still recorded. Later failures are not reported: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
   }

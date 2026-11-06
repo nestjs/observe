@@ -1285,6 +1285,9 @@ describe("OperationTraceRegistry", () => {
         throw new Error("bookkeeping");
       });
       setActiveSliceRecorder(recorder);
+      const warn = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => {});
       try {
         startJob("r5");
         await expect(
@@ -1300,7 +1303,29 @@ describe("OperationTraceRegistry", () => {
           }),
         ).rejects.toBe(failure);
         expect(registry.hasOpenSpans("r6")).toBe(false);
+
+        // The span is still finished in full, not just counted as complete.
+        registry.endTrace("r5", { status: "completed" });
+        const completed = await registry.pluckSnapshot("r5");
+        expect(completed!.traces[0]).toMatchObject({
+          name: "ok",
+          duration: expect.any(Number),
+        });
+        expect(completed!.tags?.[UNFINISHED_SPANS_TAG]).toBeUndefined();
+
+        registry.endTrace("r6", { status: "failed" });
+        const failed = await registry.pluckSnapshot("r6");
+        expect(failed!.traces[0]).toMatchObject({
+          name: "failing",
+          duration: expect.any(Number),
+        });
+        expect(failed!.error).toMatchObject({ message: "consumer boom" });
+
+        // A recorder that fails once fails on every span: reported once.
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toContain("bookkeeping");
       } finally {
+        warn.mockRestore();
         setActiveSliceRecorder(null);
       }
     });

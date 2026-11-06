@@ -148,7 +148,8 @@ export class TracerService<
           queueName,
           name,
           id:
-            typeof job.id === "number" || (typeof job.id === "string" && job.id)
+            typeof job.id === "number" ||
+            (typeof job.id === "string" && job.id.trim())
               ? job.id
               : uuidv7(),
           opts: { [JOB_TRACE_OPTION_KEY]: traceId },

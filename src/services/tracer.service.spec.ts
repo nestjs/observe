@@ -211,11 +211,14 @@ describe("TracerService", () => {
     it("reports a numeric run id as a string, and mints one in place of a blank id", async () => {
       await tracer.runJob({ ...job, id: 42 }, () => null);
       await tracer.runJob({ ...job, id: "" }, () => null);
+      await tracer.runJob({ ...job, id: "  " }, () => null);
 
-      await vi.waitFor(() => expect(jobSnapshots).toHaveLength(2));
+      await vi.waitFor(() => expect(jobSnapshots).toHaveLength(3));
       expect(jobSnapshots[0].id).toBe("42");
-      expect(jobSnapshots[1].id).toEqual(expect.any(String));
-      expect(jobSnapshots[1].id).not.toBe("");
+      for (const blank of jobSnapshots.slice(1)) {
+        expect(blank.id).toEqual(expect.any(String));
+        expect(blank.id.trim()).not.toBe("");
+      }
     });
 
     it("mints its own trace id in place of a malformed one", async () => {
