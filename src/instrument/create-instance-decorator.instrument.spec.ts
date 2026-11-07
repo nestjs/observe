@@ -1,3 +1,5 @@
+import * as common from "@nestjs/common";
+import { ParseFilePipe, ParseIntPipe, ValidationPipe } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
@@ -774,6 +776,295 @@ describe("createInstanceDecorator", () => {
 
       expect(withTrace(() => service.check())).toEqual("ok");
       expect(endCalls).toBe(0);
+    });
+  });
+
+  describe("when decorating a pipe", () => {
+    class CreateOrderDto {}
+
+    /** The packages `ValidationPipe` would otherwise load, which it can be handed. */
+    const validationPipe = (validate: () => unknown[] = () => []) =>
+      new ValidationPipe({
+        transform: true,
+        validatorPackage: { validate } as never,
+        transformerPackage: {
+          plainToInstance: (_type: unknown, value: unknown) => value,
+          classToPlain: (value: unknown) => value,
+        } as never,
+      });
+
+    const steps = () =>
+      startedSteps.map((step) => `${step.className}.${step.methodName}`);
+
+    it("makes no span for a ValidationPipe run that validates nothing", async () => {
+      const pipe = decorate(validationPipe()) as ValidationPipe;
+
+      await expect(
+        withTrace(() =>
+          pipe.transform("7", { type: "param", metatype: Number, data: "id" }),
+        ),
+      ).resolves.toBe(7);
+      expect(steps()).toEqual([]);
+    });
+
+    it("traces only `validate` when a ValidationPipe validates", async () => {
+      const pipe = decorate(validationPipe()) as ValidationPipe;
+
+      await withTrace(() =>
+        pipe.transform(
+          { total: 1 },
+          { type: "body", metatype: CreateOrderDto },
+        ),
+      );
+      expect(steps()).toEqual(["ValidationPipe.validate"]);
+    });
+
+    it("still refuses what fails validation", async () => {
+      const pipe = decorate(
+        validationPipe(() => [
+          { property: "total", constraints: { isInt: "total must be an int" } },
+        ]),
+      ) as ValidationPipe;
+
+      await expect(
+        withTrace(() =>
+          pipe.transform({}, { type: "body", metatype: CreateOrderDto }),
+        ),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(steps()).toEqual(["ValidationPipe.validate"]);
+    });
+
+    it("traces only `validate` on ParseFilePipe", async () => {
+      const pipe = decorate(
+        new ParseFilePipe({
+          validators: [{ isValid: () => true } as never],
+        }),
+      ) as ParseFilePipe;
+
+      await withTrace(() => pipe.transform({ size: 1 }));
+      expect(steps()).toEqual(["ParseFilePipe.validate"]);
+    });
+
+    // Not in every supported @nestjs/common.
+    const { StandardSchemaValidationPipe } = common as unknown as {
+      StandardSchemaValidationPipe?: new () => {
+        transform(value: unknown, metadata: unknown): Promise<unknown>;
+      };
+    };
+    (StandardSchemaValidationPipe ? it : it.skip)(
+      "traces only `validate` on StandardSchemaValidationPipe",
+      async () => {
+        const pipe = decorate(new StandardSchemaValidationPipe!()) as {
+          transform(value: unknown, metadata: unknown): Promise<unknown>;
+        };
+        const schema = {
+          "~standard": { validate: (value: unknown) => ({ value }) },
+        };
+
+        await expect(
+          withTrace(() => pipe.transform("a", { type: "body", schema })),
+        ).resolves.toBe("a");
+        expect(steps()).toEqual(["StandardSchemaValidationPipe.validate"]);
+      },
+    );
+
+    it("traces what a subclass adds, and not what it inherits", async () => {
+      class AppValidationPipe extends ValidationPipe {
+        override async transform(value: unknown, metadata: never) {
+          return super.transform(this.normalize(value), metadata);
+        }
+
+        normalize(value: unknown) {
+          return value;
+        }
+      }
+      const pipe = decorate(
+        new AppValidationPipe({
+          validatorPackage: { validate: () => [] } as never,
+          transformerPackage: {
+            plainToInstance: (_type: unknown, value: unknown) => value,
+            classToPlain: (value: unknown) => value,
+          } as never,
+        }),
+      ) as AppValidationPipe;
+
+      await withTrace(() =>
+        pipe.transform({}, { type: "body", metatype: CreateOrderDto } as never),
+      );
+      expect(steps()).toEqual([
+        "AppValidationPipe.transform",
+        "AppValidationPipe.normalize",
+        "AppValidationPipe.validate",
+      ]);
+    });
+
+    it("traces everything on a pipe an application wrote, whatever its name", () => {
+      // The pipe Nest's documentation has readers write, by the same name.
+      class WrittenByHand {
+        transform(value: string) {
+          return this.toValidate(value) ? this.validate(value) : value;
+        }
+
+        toValidate(value: string) {
+          return value.length > 0;
+        }
+
+        validate(value: string) {
+          return value;
+        }
+      }
+      Object.defineProperty(WrittenByHand, "name", { value: "ValidationPipe" });
+      const pipe = decorate(new WrittenByHand()) as WrittenByHand;
+
+      withTrace(() => pipe.transform("a"));
+      expect(steps()).toEqual([
+        "ValidationPipe.transform",
+        "ValidationPipe.toValidate",
+        "ValidationPipe.validate",
+      ]);
+    });
+
+    it("leaves Nest's other pipes as they were", async () => {
+      const pipe = decorate(new ParseIntPipe()) as ParseIntPipe;
+
+      await withTrace(() => pipe.transform("42", { type: "param" }));
+      expect(steps()).toEqual([
+        "ParseIntPipe.transform",
+        "ParseIntPipe.isNumeric",
+      ]);
+    });
+
+    it("leaves guards and interceptors as they were", () => {
+      class SessionGuard {
+        canActivate() {
+          return this.hasSession();
+        }
+
+        hasSession() {
+          return true;
+        }
+      }
+      class EnvelopeInterceptor {
+        intercept() {
+          return this.wrap();
+        }
+
+        wrap() {
+          return {};
+        }
+      }
+      const guard = decorate(new SessionGuard()) as SessionGuard;
+      const interceptor = decorate(
+        new EnvelopeInterceptor(),
+      ) as EnvelopeInterceptor;
+
+      withTrace(() => {
+        guard.canActivate();
+        interceptor.intercept();
+      });
+      expect(steps()).toEqual([
+        "SessionGuard.canActivate",
+        "SessionGuard.hasSession",
+        "EnvelopeInterceptor.intercept",
+        "EnvelopeInterceptor.wrap",
+      ]);
+    });
+  });
+
+  describe("when decorating @nestjs/config's ConfigService", () => {
+    /** The shape of @nestjs/config 4's ConfigService, which the SDK doesn't depend on. */
+    class ConfigService {
+      private readonly cache: Record<string, unknown> = {};
+
+      constructor(private readonly internalConfig: Record<string, unknown>) {}
+
+      get(propertyPath: string, options?: unknown) {
+        this.isGetOptionsObject(options);
+        const value =
+          this.getFromValidatedEnv(propertyPath) ??
+          this.getFromProcessEnv(propertyPath) ??
+          this.getFromInternalConfig(propertyPath);
+        this.setInCacheIfDefined(propertyPath, value);
+        return value;
+      }
+
+      getOrThrow(propertyPath: string) {
+        const value = this.get(propertyPath);
+        if (value === undefined) {
+          throw new Error(`"${propertyPath}" does not exist`);
+        }
+        return value;
+      }
+
+      getFromValidatedEnv(_propertyPath: string): unknown {
+        return undefined;
+      }
+
+      getFromProcessEnv(_propertyPath: string): unknown {
+        return undefined;
+      }
+
+      getFromInternalConfig(propertyPath: string) {
+        return this.internalConfig[propertyPath];
+      }
+
+      setInCacheIfDefined(propertyPath: string, value: unknown) {
+        this.cache[propertyPath] = value;
+      }
+
+      isGetOptionsObject(options: unknown) {
+        return typeof options === "object";
+      }
+    }
+
+    const steps = () =>
+      startedSteps.map((step) => `${step.className}.${step.methodName}`);
+
+    it("traces what an application calls, not its helpers", () => {
+      const config = decorate(
+        new ConfigService({ port: 3000 }),
+      ) as ConfigService;
+
+      withTrace(() => {
+        expect(config.get("port")).toBe(3000);
+        expect(config.getOrThrow("port")).toBe(3000);
+      });
+      expect(steps()).toEqual([
+        "ConfigService.get",
+        "ConfigService.getOrThrow",
+        "ConfigService.get",
+      ]);
+    });
+
+    it("traces what a subclass adds", () => {
+      class AppConfig extends ConfigService {
+        databaseUrl() {
+          return this.get("databaseUrl");
+        }
+      }
+      const config = decorate(
+        new AppConfig({ databaseUrl: "postgres://" }),
+      ) as AppConfig;
+
+      withTrace(() => config.databaseUrl());
+      expect(steps()).toEqual(["AppConfig.databaseUrl", "AppConfig.get"]);
+    });
+
+    it("traces everything on an application's own ConfigService", () => {
+      class OwnConfig {
+        get(key: string) {
+          return this.read(key);
+        }
+
+        read(key: string) {
+          return key;
+        }
+      }
+      Object.defineProperty(OwnConfig, "name", { value: "ConfigService" });
+      const config = decorate(new OwnConfig()) as OwnConfig;
+
+      withTrace(() => config.get("port"));
+      expect(steps()).toEqual(["ConfigService.get", "ConfigService.read"]);
     });
   });
 
