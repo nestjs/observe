@@ -92,6 +92,106 @@ function isMongoDriverHandle(instance: object): boolean {
   }
 }
 
+/**
+ * Library classes traced only in part, each with a method only it has, which
+ * tells it from an application's own class of the same name - `ValidationPipe`
+ * is what Nest's documentation calls the pipe it has readers write themselves,
+ * and plenty of applications have a `ConfigService` of their own.
+ *
+ * - Nest's validating pipes keep only `validate`. `ValidationPipe` runs once
+ *   per handler argument, and for each one `transform`, `toValidate` and
+ *   `transformPrimitive` were spans, usually of a few microseconds and each
+ *   one billed, on runs that mostly validate nothing: 82% of runs across the
+ *   hosted platform on 2026-11-06, which made it the busiest class after
+ *   `pg`, and 404,552 of 404,652 on one REST app.
+ * - `@nestjs/config`'s `ConfigService` keeps what an application calls. Each
+ *   `get` made four or five more spans of its private helpers - 2.7M of its
+ *   4.6M a day, in 220 projects.
+ *
+ * Folding cannot reach any of them (`collapseRepeatedSpans`), because each
+ * repeats only a few times under its parent.
+ *
+ * By name, because `StandardSchemaValidationPipe` is not in every supported
+ * `@nestjs/common` and an application may carry a second copy of a package.
+ * A class that stops matching is simply traced like any other.
+ */
+const PARTLY_TRACED_CLASSES = new Map<
+  string,
+  { marker: string; traced: ReadonlySet<string> }
+>([
+  [
+    "ValidationPipe",
+    { marker: "flattenValidationErrors", traced: new Set(["validate"]) },
+  ],
+  [
+    "StandardSchemaValidationPipe",
+    { marker: "formatIssueMessages", traced: new Set(["validate"]) },
+  ],
+  [
+    "ParseFilePipe",
+    { marker: "validateFilesOrFile", traced: new Set(["validate"]) },
+  ],
+  [
+    "ConfigService",
+    {
+      marker: "getFromValidatedEnv",
+      traced: new Set(["get", "getOrThrow", "set", "setEnvFilePaths"]),
+    },
+  ],
+]);
+
+/** The methods a prototype's class keeps traced, if it is one of those. */
+function partlyTracedMethodsOf(proto: object): ReadonlySet<string> | null {
+  const candidate = proto as Record<string, unknown>;
+  const entry = PARTLY_TRACED_CLASSES.get(
+    (candidate.constructor as { name?: string } | undefined)?.name ?? "",
+  );
+  return entry !== undefined && typeof candidate[entry.marker] === "function"
+    ? entry.traced
+    : null;
+}
+
+/** Whether an instance is one of those classes, or extends one. */
+function extendsPartlyTracedClass(instance: object): boolean {
+  for (
+    let proto = Object.getPrototypeOf(instance);
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto)
+  ) {
+    if (partlyTracedMethodsOf(proto) !== null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a method is one of those classes' internals, and so makes no span.
+ *
+ * Asked of the class that holds the method, so what an application adds to or
+ * overrides in a subclass is still traced. An instance's own function - the
+ * `exceptionFactory` a constructor assigns - goes by the instance's class.
+ */
+function isLibraryInternal(
+  target: object,
+  methodName: string | symbol,
+): boolean {
+  let holder: object | null = target;
+  while (holder !== null && !Object.hasOwn(holder, methodName)) {
+    holder = Object.getPrototypeOf(holder);
+  }
+  if (holder === null) {
+    return false;
+  }
+  const traced = partlyTracedMethodsOf(
+    holder === target ? Object.getPrototypeOf(target) : holder,
+  );
+  return (
+    traced !== null &&
+    !(typeof methodName === "string" && traced.has(methodName))
+  );
+}
+
 interface TracedCallSpec {
   /**
    * Name of the class owning the instrumented method, or
@@ -334,6 +434,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     let hasPrivateMembers: boolean;
     let slotBacked: boolean;
     let bareBuiltIn: boolean;
+    let partlyTraced: boolean;
     try {
       // Inspected here, inside the guard, for the same reason as the checks
       // below: reading a provider's constructor can run a trap that throws.
@@ -343,6 +444,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       hasPrivateMembers = usesNativePrivateMembers(instance);
       slotBacked = isSlotBackedBuiltIn(instance);
       bareBuiltIn = slotBacked && isNativeFunction(instance.constructor);
+      partlyTraced = extendsPartlyTracedClass(instance);
     } catch {
       // Reading the prototype ran a trap that threw (nestjs-cls proxy
       // providers do this outside a CLS context). An instance that cannot be
@@ -401,7 +503,10 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           // mid-trace). This subsumes the Axios special case that used to sit
           // here: an Axios instance is a bound `request` carrying its API as
           // own properties.
-          !isCallableObject(attributeValue);
+          !isCallableObject(attributeValue) &&
+          // Handed out as it is, so it still runs against the proxy: the
+          // `this.validate()` inside `transform` comes back through here.
+          !(partlyTraced && isLibraryInternal(target, prop));
         if (!shouldProxy) {
           // Remembered, as a wrapped method is: telling them apart reads the
           // function's source and its prototype's keys, which a Mongoose
