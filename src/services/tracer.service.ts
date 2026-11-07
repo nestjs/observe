@@ -3,22 +3,44 @@ import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { Gauge, GaugeKind, Summary } from "../custom-metrics/index.js";
 import { Counter } from "../custom-metrics/counter.js";
-import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
+import {
+  ObserveModuleOptionsWithDefaults,
+  RunJobOptions,
+} from "../interfaces/index.js";
+import { JobTraceRunner } from "../protocols/job-trace-runner.js";
 import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { Path, PathValue } from "../types/path-value.type.js";
 import {
   CALLER_METADATA_KEY,
+  JOB_TRACE_OPTION_KEY,
   OBSERVE_OPTIONS,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
+import { uuidv7 } from "../utils/uuid-v7.util.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 
 /**
- * Longest operation id the collector stores, counted by code point as it
- * counts. A longer one is cut there anyway; cut here, a name built from a
- * request body cannot grow the batch it rides in without bound.
+ * Longest operation id the collector stores, and span label a job's names
+ * become, counted by code point as it counts. A longer one is cut there
+ * anyway; cut here, a name built from a request body cannot grow the batch it
+ * rides in without bound.
  */
-const MAX_OPERATION_ID_LENGTH = 255;
+const MAX_NAME_LENGTH = 255;
+
+function toBoundedName(value: unknown): string {
+  const name = typeof value === "string" ? value.trim() : "";
+  return name.length > MAX_NAME_LENGTH
+    ? Array.from(name).slice(0, MAX_NAME_LENGTH).join("")
+    : name;
+}
+
+function describeUnusableName(value: unknown): string {
+  return value === null || value === undefined
+    ? String(value)
+    : typeof value === "string"
+      ? "a blank string"
+      : `a value of type ${typeof value}`;
+}
 
 @Injectable()
 export class TracerService<
@@ -33,6 +55,8 @@ export class TracerService<
   private readonly summaries = new Map<string, Summary<any>>();
   private readonly logger = new Logger(TracerService.name);
   private hasReportedUnusableOperationId = false;
+  private hasReportedUnusableJobName = false;
+  private readonly runner: JobTraceRunner<Record<string | symbol, unknown>>;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -42,7 +66,15 @@ export class TracerService<
     private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,
-  ) {}
+  ) {
+    this.runner = new JobTraceRunner(
+      observeAgentSharedBuffer,
+      options,
+      operationTraceRegistry,
+      als,
+      this.logger,
+    );
+  }
 
   /**
    * Creates a new trace span with the given name and executes the provided callback within that span.
@@ -65,6 +97,77 @@ export class TracerService<
       callerId,
       name,
       callback,
+    );
+  }
+
+  /**
+   * Runs `callback` under a trace of its own, reported as a job - for work that
+   * arrives through no hook the agent patches: a Kafka consumer, a cron added
+   * at runtime, a script on a standalone application context. Providers it
+   * calls nest under a root span named after the run. Its result is returned
+   * and its error re-thrown unchanged; an error also marks the run failed.
+   *
+   * Every call outside a recorded trace is a job of its own, so use stable,
+   * bounded names, not per-run values. Both are trimmed and cut to 255
+   * characters, and a blank or non-string one runs the callback untraced.
+   * Inside a recorded operation, it opens a child span there instead, as
+   * `createSpan` does.
+   */
+  async runJob<T>(
+    job: RunJobOptions,
+    callback: (span: TraceSpanDelegate) => T | Promise<T>,
+  ): Promise<Awaited<T>> {
+    if (this.options.enabled === false) {
+      return await callback(new TraceSpanDelegate("", undefined, {}));
+    }
+    const queueName = toBoundedName(job?.queueName);
+    const name = toBoundedName(job?.name);
+    if (!queueName || !name) {
+      this.reportUnusableJobName(queueName ? job?.name : job?.queueName);
+      return await callback(new TraceSpanDelegate("", undefined, {}));
+    }
+
+    const store = this.als.getStore();
+    const outerTraceId =
+      store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
+    if (
+      typeof outerTraceId === "string" &&
+      this.operationTraceRegistry.hasTrace(outerTraceId)
+    ) {
+      return await this.createSpan(name, callback);
+    }
+
+    // A context whose trace is no longer open - a timer or consumer set up
+    // inside a request that has since been shipped - is left behind, or the
+    // runner would read its trace id as an outer operation and record nothing.
+    // Its trace id is still inherited, so the run correlates with it.
+    const traceId = job.traceId ?? this.currentTraceId();
+    return await this.als.exit(() =>
+      this.runner.run(
+        {
+          queueName,
+          name,
+          id:
+            typeof job.id === "number" ||
+            (typeof job.id === "string" && job.id.trim())
+              ? job.id
+              : uuidv7(),
+          opts: { [JOB_TRACE_OPTION_KEY]: traceId },
+          metadata: {},
+        },
+        () => {
+          const registryKey = this.als.getStore()?.get(TRACE_REGISTRY_KEY);
+          if (typeof registryKey !== "string") {
+            return callback(new TraceSpanDelegate("", name, {}));
+          }
+          return this.operationTraceRegistry.createRootSpan(
+            registryKey,
+            { className: queueName, methodKey: name },
+            name,
+            callback,
+          );
+        },
+      ),
     );
   }
 
@@ -368,7 +471,7 @@ export class TracerService<
     // Typed, but often read off a request body, which nothing checks at
     // runtime: a number would have the collector refuse the batch it rides in,
     // and a blank name would have the agent drop the request, error and all.
-    const name = typeof operationId === "string" ? operationId.trim() : "";
+    const name = toBoundedName(operationId);
     if (!name) {
       this.reportUnusableOperationId(operationId);
       return;
@@ -377,12 +480,7 @@ export class TracerService<
     const traceId =
       store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
     if (typeof traceId === "string") {
-      this.operationTraceRegistry.setOperationId(
-        traceId,
-        name.length > MAX_OPERATION_ID_LENGTH
-          ? Array.from(name).slice(0, MAX_OPERATION_ID_LENGTH).join("")
-          : name,
-      );
+      this.operationTraceRegistry.setOperationId(traceId, name);
     }
   }
 
@@ -395,14 +493,19 @@ export class TracerService<
       return;
     }
     this.hasReportedUnusableOperationId = true;
-    const given =
-      value === null || value === undefined
-        ? String(value)
-        : typeof value === "string"
-          ? "a blank string"
-          : `a value of type ${typeof value}`;
     this.logger.warn(
-      `setOperationId ignored ${given}: an operation id is a non-blank string. Later ones are not reported.`,
+      `setOperationId ignored ${describeUnusableName(value)}: an operation id is a non-blank string. Later ones are not reported.`,
+    );
+  }
+
+  /** Reported once, for the same reason as an unusable operation id. */
+  private reportUnusableJobName(value: unknown): void {
+    if (this.hasReportedUnusableJobName) {
+      return;
+    }
+    this.hasReportedUnusableJobName = true;
+    this.logger.warn(
+      `runJob ran a job untraced, given ${describeUnusableName(value)}: a job's queueName and name are non-blank strings. Later ones are not reported.`,
     );
   }
 

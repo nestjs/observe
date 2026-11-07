@@ -83,6 +83,15 @@ const UNHANDLED_ERROR_STATUS_CODE = 500;
  */
 const HANDLED_ERROR_STATUS_CODE = 400;
 
+/** Runs span bookkeeping whose failure must not reach the caller. */
+function ignoreFailure(fn: () => unknown): void {
+  try {
+    fn();
+  } catch {
+    // The span is a side effect of the call, not part of its outcome.
+  }
+}
+
 /** A node and everything below it. */
 function countNodes(node: {
   children?: Array<CompleteTraceEventNode | OngoingTraceEventNode>;
@@ -179,6 +188,11 @@ export class OperationTraceRegistry {
    * failure is reported once rather than once per request.
    */
   private hasReportedSkipSpansFailure = false;
+  /**
+   * A slice recorder that fails to close one span is likely to fail on every
+   * span, so the failure is reported once rather than once per span.
+   */
+  private hasReportedSliceExitFailure = false;
   /**
    * Scrubs error messages and stacks before they are attached to a span.
    *
@@ -644,7 +658,7 @@ export class OperationTraceRegistry {
       return;
     }
     snapshot.refsMarkedAsComplete += 1;
-    activeSliceRecorder()?.exit(callerId);
+    this.exitSlice(callerId);
 
     const refsByCaller = this.callerIdsByTraceId.get(traceId);
     if (!refsByCaller) {
@@ -696,6 +710,24 @@ export class OperationTraceRegistry {
         }
       } else {
         activeTrace.error = true;
+      }
+    }
+  }
+
+  /**
+   * Closes a span's profiling slice. A recorder that throws here must not stop
+   * `internalEndTraceStep` from finishing the node it has already counted as
+   * complete, or the span would ship without its duration and error.
+   */
+  private exitSlice(callerId: string | undefined): void {
+    try {
+      activeSliceRecorder()?.exit(callerId);
+    } catch (error) {
+      if (!this.hasReportedSliceExitFailure) {
+        this.hasReportedSliceExitFailure = true;
+        this.logger.warn(
+          `Closing a span's profiling slice failed; the span is still recorded. Later failures are not reported: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
   }
@@ -1083,7 +1115,49 @@ export class OperationTraceRegistry {
     if (!activeSpan || !snapshot) {
       return spanFunction(new TraceSpanDelegate("", name, {}));
     }
+    return this.runManualSpan(
+      traceId,
+      snapshot,
+      callerId,
+      { className: activeSpan.className, methodKey: activeSpan.methodKey },
+      name,
+      spanFunction,
+    );
+  }
 
+  /**
+   * Opens a manual span at the root of the trace, under `labels` in place of
+   * a caller's class and method. A trace that ends with no span at all is
+   * dropped, so a run no instrumented call opened one for needs this one.
+   */
+  async createRootSpan<T>(
+    traceId: string,
+    labels: { className: string; methodKey: string },
+    name: string,
+    spanFunction: (span: TraceSpanDelegate) => T | Promise<T>,
+  ): Promise<Awaited<T>> {
+    const snapshot = this.traceSnapshots.get(traceId);
+    if (!snapshot) {
+      return await spanFunction(new TraceSpanDelegate("", name, {}));
+    }
+    return this.runManualSpan(
+      traceId,
+      snapshot,
+      undefined,
+      labels,
+      name,
+      spanFunction,
+    );
+  }
+
+  private runManualSpan(
+    traceId: string,
+    snapshot: SnapshotWithSignal,
+    callerId: string | undefined,
+    labels: { className: string; methodKey: string },
+    name: string,
+    spanFunction: (span: TraceSpanDelegate) => any,
+  ) {
     // Book the span in the same ledger auto spans use. Completion goes through
     // internalEndTraceStep, which increments refsMarkedAsComplete - without
     // the matching increment here, every completed manual span pushed the
@@ -1108,35 +1182,43 @@ export class OperationTraceRegistry {
       name,
       origin: "manual",
       type: "start",
-      className: activeSpan.className,
-      methodKey: activeSpan.methodKey,
+      className: labels.className,
+      methodKey: labels.methodKey,
       startTime,
       startOffset: this.toStartOffset(snapshot, startTime),
       children: [],
     };
-    const refsByCaller = this.callerIdsByTraceId.get(traceId);
+    let refsByCaller = this.callerIdsByTraceId.get(traceId);
     this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);
 
-    refsByCaller?.set(newNodeId, manualSpan);
+    if (!refsByCaller) {
+      refsByCaller = new Map<string, OngoingTraceEventNode>();
+      this.callerIdsByTraceId.set(traceId, refsByCaller);
+    }
+    refsByCaller.set(newNodeId, manualSpan);
 
-    const onResponse = (res: unknown) => {
-      this.internalEndTraceStep(
-        traceId,
-        newNodeId,
-        manualSpan.className,
-        manualSpan.methodKey,
-        newNodeId,
+    const onResponse = <R>(res: R) => {
+      ignoreFailure(() =>
+        this.internalEndTraceStep(
+          traceId,
+          newNodeId,
+          manualSpan.className,
+          manualSpan.methodKey,
+          newNodeId,
+        ),
       );
       return res;
     };
     const onError = (err: unknown) => {
-      this.internalEndTraceStep(
-        traceId,
-        newNodeId,
-        manualSpan.className,
-        manualSpan.methodKey,
-        newNodeId,
-        err as Error | string | object,
+      ignoreFailure(() =>
+        this.internalEndTraceStep(
+          traceId,
+          newNodeId,
+          manualSpan.className,
+          manualSpan.methodKey,
+          newNodeId,
+          err as Error | string | object,
+        ),
       );
       // Re-throw the error to maintain original behavior
       throw err;

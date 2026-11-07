@@ -1,4 +1,8 @@
-import { INestApplication, INestMicroservice } from "@nestjs/common";
+import {
+  INestApplication,
+  INestApplicationContext,
+  INestMicroservice,
+} from "@nestjs/common";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
@@ -131,7 +135,7 @@ export class CollectedJobSnapshots {
 
 /** Intercepts job snapshots at `ObserveAgentSharedBuffer.insertJobSnapshot`. */
 export function collectJobSnapshots(
-  app: INestApplication | INestMicroservice,
+  app: INestApplicationContext,
 ): CollectedJobSnapshots {
   const collected = new CollectedJobSnapshots();
   const buffer = app.get(ObserveAgentSharedBuffer, { strict: false });
