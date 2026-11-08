@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync } from "fs";
 import { resolve, sep } from "path";
+import { fileURLToPath } from "url";
 import { resolveOriginalPosition } from "./source-map-resolver.util.js";
 
 /**
@@ -199,6 +200,23 @@ function parseFrameLine(raw: string): ParsedFrame | undefined {
   };
 }
 
+/**
+ * A frame's file as a path. V8 names an ES module's file by its URL -
+ * `at run (file:///app/dist/main.js:3:9)` - which is the same file as the
+ * path a CommonJS frame carries. `undefined` for a URL that names no local
+ * file.
+ */
+function toFilePath(file: string): string | undefined {
+  if (!file.startsWith("file://")) {
+    return file;
+  }
+  try {
+    return fileURLToPath(file);
+  } catch {
+    return undefined;
+  }
+}
+
 function parseFrames(
   stack: string,
   message: string | undefined,
@@ -211,8 +229,9 @@ function parseFrames(
       continue;
     }
 
-    const { file, line, column } = parsed;
-    if (isIgnored(file)) {
+    const { line, column } = parsed;
+    const file = toFilePath(parsed.file);
+    if (file === undefined || isIgnored(file)) {
       continue;
     }
 
