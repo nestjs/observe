@@ -1,7 +1,10 @@
 import { Counter } from "../custom-metrics/counter.js";
 import { Gauge } from "../custom-metrics/gauge.js";
 import { Summary } from "../custom-metrics/summary.js";
-import type { EncodedCustomMetric } from "../encoders/custom-metrics.encoder.js";
+import {
+  CustomMetricsEncoder,
+  type EncodedCustomMetric,
+} from "../encoders/custom-metrics.encoder.js";
 import type { EncodedJobSnapshot } from "../encoders/job-snapshot.encoder.js";
 import type { EncodedRequestSnapshot } from "../encoders/request-snapshot.encoder.js";
 import {
@@ -1121,6 +1124,36 @@ describe("ObserveAgentSharedBuffer", () => {
       expect(custom).toHaveLength(1);
       expect(custom[0].n).toHaveLength(100);
       expect(custom[0].v).toEqual({ default: 2 });
+    });
+
+    it("encodes a summary once per batch rather than on every observation", () => {
+      const buffer = createBuffer();
+      const summary = new Summary("request.duration");
+      const encode = vi.spyOn(CustomMetricsEncoder, "encode");
+
+      for (let value = 1; value <= 100; value++) {
+        summary.observe(value);
+        buffer.upsertCustomMetric(summary);
+      }
+      expect(encode).not.toHaveBeenCalled();
+
+      buffer.encodeAndWrite();
+      expect(encode).toHaveBeenCalledTimes(1);
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toHaveLength(1);
+      expect(batch.custom[0]).toMatchObject({
+        n: "request.duration",
+        q50: { default: 50 },
+        q99: { default: 99 },
+        ct: { default: 100 },
+        mx: { default: 100 },
+      });
     });
   });
 });
