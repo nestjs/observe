@@ -101,7 +101,7 @@ jobs:
         # the address a broker advertises, so it advertises the one the
         # suite reaches it on. The health check is a JVM each time, hence
         # the longer interval.
-        image: apache/kafka:3.9.0
+        image: apache/kafka:3.9.2
         env:
           KAFKA_NODE_ID: "1"
           KAFKA_PROCESS_ROLES: broker,controller
