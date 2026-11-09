@@ -2,6 +2,7 @@ import { UnauthorizedException } from "@nestjs/common";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, join, relative } from "path";
+import { pathToFileURL } from "url";
 import { collectCodeFrames } from "./source-context.util.js";
 import { resetSourceMapCache } from "./source-map-resolver.util.js";
 
@@ -174,6 +175,25 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     expect(collect(new Error())?.[0].file).toContain(
       "source-context.util.spec",
     );
+  });
+
+  it("reads the frames of an ES module, which name their file by URL", () => {
+    const module = join(inside, "module.mjs");
+    writeFileSync(module, 'throw new Error("boom");\n');
+
+    const frames = collectCodeFrames(
+      `Error: boom\n    at run (${pathToFileURL(module).href}:1:7)`,
+      { message: "boom" },
+    );
+
+    expect(frames).toEqual([
+      {
+        file: module,
+        line: 1,
+        firstLine: 1,
+        lines: ['throw new Error("boom");', ""],
+      },
+    ]);
   });
 
   it("rejects a pathological line in linear time", () => {
