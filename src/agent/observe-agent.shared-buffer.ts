@@ -223,6 +223,9 @@ export class ObserveAgentSharedBuffer {
    */
   private readonly _awaitingFlushAck = new Set<Counter<any> | Summary<any>>();
 
+  /** Summaries observed into the current buffer, encoded as it is written. */
+  private readonly _summariesToEncode = new Set<Summary<any>>();
+
   get sharedBuffer() {
     return this._sharedBuffer;
   }
@@ -737,20 +740,37 @@ export class ObserveAgentSharedBuffer {
       this._awaitingFlushAck.add(metric);
     }
 
+    // Encoded when the batch is written, not on every observation: encoding a
+    // summary sorts its sample once per quantile, and a summary is observed
+    // on the request path, where sorting on every `observe` costs the main
+    // thread more the fuller the window gets.
+    if (metric instanceof Summary) {
+      this._summariesToEncode.add(metric);
+      return;
+    }
+    this.placeCustomMetric(metric);
+  }
+
+  private placeCustomMetric(metric: Counter<any> | Gauge<any> | Summary<any>) {
+    const custom = this._mainThreadBuffer?.custom;
+    if (!custom) {
+      return;
+    }
+
     // Matched on the name as sent, which the encoder cuts to what the
     // collector accepts. Matched on the metric's own, a metric whose name is
     // cut would be buffered again on every change.
     const encoded = CustomMetricsEncoder.encode(metric as CustomMetric);
-    const existingMetricIndex = this._mainThreadBuffer.custom.findIndex(
+    const existingMetricIndex = custom.findIndex(
       (m) => m.n === encoded.n && m.t === encoded.t,
     );
     if (existingMetricIndex !== -1) {
-      this._mainThreadBuffer.custom[existingMetricIndex] = {
-        ...this._mainThreadBuffer.custom[existingMetricIndex],
+      custom[existingMetricIndex] = {
+        ...custom[existingMetricIndex],
         ...encoded,
       };
     } else {
-      this._mainThreadBuffer.custom.push(encoded);
+      custom.push(encoded);
     }
   }
 
@@ -850,6 +870,11 @@ export class ObserveAgentSharedBuffer {
   encodeAndWrite() {
     this.withholdLogs();
 
+    for (const summary of this._summariesToEncode) {
+      this.placeCustomMetric(summary);
+    }
+    this._summariesToEncode.clear();
+
     if (this.options.debug) {
       if (this._mainThreadBuffer?.snapshots) {
         this.logger.debug(
@@ -894,6 +919,7 @@ export class ObserveAgentSharedBuffer {
 
   resetMainThreadBuffer() {
     this._mainThreadBuffer = null;
+    this._summariesToEncode.clear();
     this.withheldSnapshots = 0;
     this.withheldJobs = 0;
   }
