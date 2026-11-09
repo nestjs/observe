@@ -13,6 +13,84 @@ const TABLE_AFTER: Record<string, RegExp> = {
   UPDATE: /^\s*UPDATE\s+(?:ONLY\s+)?([\w."`[\]]+)/i,
 };
 
+/**
+ * Words that put a table or a subquery, not a function's arguments, in the
+ * parenthesis after them.
+ */
+const NOT_A_FUNCTION = new Set([
+  "ALL",
+  "AND",
+  "ANY",
+  "AS",
+  "EXCEPT",
+  "EXISTS",
+  "FROM",
+  "IN",
+  "INTERSECT",
+  "JOIN",
+  "LATERAL",
+  "NOT",
+  "ON",
+  "OR",
+  "SELECT",
+  "SOME",
+  "UNION",
+  "USING",
+  "VALUES",
+  "WHERE",
+  "WITH",
+]);
+
+/** Whether the parenthesis at `index` opens a function's arguments. */
+function opensArguments(statement: string, index: number): boolean {
+  let end = index;
+  if (statement[end - 1] === " ") {
+    end--;
+  }
+  let start = end;
+  while (start > 0 && /[\w$]/.test(statement[start - 1])) {
+    start--;
+  }
+  return (
+    start < end &&
+    /^[A-Za-z_]/.test(statement[start]) &&
+    !NOT_A_FUNCTION.has(statement.slice(start, end).toUpperCase())
+  );
+}
+
+/**
+ * `statement` with what a function's arguments hold left out:
+ * `EXTRACT(EPOCH FROM created_at)` and `TRIM(BOTH ' ' FROM name)` have a
+ * `FROM` that is an argument, not the table. A parenthesis counts as one when
+ * a name comes right before it. One after `FROM` or `JOIN` - a derived table,
+ * a subquery, a parenthesised join - is kept as it is. Only what a function
+ * holds is taken out, so every `FROM` left is followed by what followed it
+ * before. One pass, so it stays linear however deeply the parentheses nest.
+ */
+function withoutFunctionArguments(statement: string): string {
+  let text = "";
+  let copied = 0;
+  // How deep inside a function's arguments `index` is, 0 outside any.
+  let depth = 0;
+  for (let index = 0; index < statement.length; index++) {
+    const char = statement[index];
+    if (char === "(") {
+      if (depth) {
+        depth++;
+      } else if (opensArguments(statement, index)) {
+        text += statement.slice(copied, index);
+        copied = index;
+        depth = 1;
+      }
+    } else if (char === ")" && depth && !--depth) {
+      text += "()";
+      copied = index + 1;
+    }
+  }
+  // Arguments that never close are kept as they are.
+  return text + statement.slice(copied);
+}
+
 export interface SqlStatementDescription {
   /**
    * A low-cardinality label: the verb and the table, `SELECT users`. It names
@@ -143,7 +221,7 @@ export function describeSanitizedSqlStatement(
     return { operation: "QUERY", statement };
   }
   const table = TABLE_AFTER[verb]
-    ?.exec(statement)?.[1]
+    ?.exec(withoutFunctionArguments(statement))?.[1]
     ?.replace(/["`[\]]/g, "")
     .slice(0, MAX_IDENTIFIER_LENGTH);
   return { operation: table ? `${verb} ${table}` : verb, statement };

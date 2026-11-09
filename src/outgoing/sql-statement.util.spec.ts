@@ -39,6 +39,41 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
       "DELETE sessions",
       "DELETE FROM ONLY sessions WHERE id = ?",
     ],
+    [
+      "SELECT EXTRACT(EPOCH FROM created_at) AS ts FROM events WHERE id = 1",
+      "SELECT events",
+      "SELECT EXTRACT(EPOCH FROM created_at) AS ts FROM events WHERE id = ?",
+    ],
+    [
+      "SELECT TRIM(BOTH ' ' FROM lower(name)) FROM users",
+      "SELECT users",
+      "SELECT TRIM(BOTH ? FROM lower(name)) FROM users",
+    ],
+    [
+      "SELECT * FROM (SELECT id FROM orders) AS recent",
+      "SELECT orders",
+      "SELECT * FROM (SELECT id FROM orders) AS recent",
+    ],
+    [
+      "SELECT * FROM ((SELECT a FROM b) UNION ALL (SELECT c FROM d)) AS u",
+      "SELECT b",
+      "SELECT * FROM ((SELECT a FROM b) UNION ALL (SELECT c FROM d)) AS u",
+    ],
+    [
+      "SELECT COALESCE((SELECT max(x) FROM a), 0) AS m FROM b",
+      "SELECT b",
+      "SELECT COALESCE((SELECT max(x) FROM a), ?) AS m FROM b",
+    ],
+    [
+      "SELECT * FROM (VALUES (1), (2)) AS v(id)",
+      "SELECT",
+      "SELECT * FROM (VALUES (?), (?)) AS v(id)",
+    ],
+    [
+      "SELECT * FROM (a JOIN b ON a.id = b.a_id) WHERE a.x = 1",
+      "SELECT",
+      "SELECT * FROM (a JOIN b ON a.id = b.a_id) WHERE a.x = ?",
+    ],
     ["BEGIN", "BEGIN", "BEGIN"],
     ["  ", "QUERY", ""],
   ])("%s", (sql, operation, statement) => {
