@@ -436,6 +436,16 @@ Once the module and the instrument are in place, the agent reports, with no furt
 
 Query and outbound-HTTP spans are not billed as events. Turn them off with `outgoing: false`, or one side with `outgoing: { database: false }` / `outgoing: { http: false }`.
 
+### Hooks your application sets too
+
+Several of the places the agent hooks into hold one hook each: GraphQL's `ResolverDecoratorHost` request hooks, the HTTP adapter's `setOnRequestHook`, `setOnResponseHook` and `setOnRouteTriggered`, a microservice server's processing hooks, a `ClientProxy`'s `setOnDispatchHook`, and `@nestjs/bullmq`'s `ProcessorDecoratorService.prototype.decorate`. They are yours to use as well: the agent runs its part beside your hook, whichever is set first, and a getter such as `getOnRequestStartHook()` hands back your own. Three cannot be shared, because the hook is set before Nest hands the object over and nothing can read it back, so the agent's replaces it:
+
+- a request or response hook set on an adapter you build yourself, before `NestFactory.create()`;
+- a processing hook set on a server you pass as `strategy`, before `createMicroservice()` or `connectMicroservice()`;
+- a dispatch hook set in a client's own `useFactory`, or in the constructor of a `customClass` client.
+
+Set those after instead: on `app.getHttpAdapter()` before `listen()`, on `app.getTransportServer()`, or on the injected client from a provider.
+
 ## Capturing failed and slow requests
 
 The inputs behind a failing request are usually the fastest way to reproduce it. The agent keeps them only for the requests worth it - never for ordinary traffic:
