@@ -1,9 +1,13 @@
 import { AsyncLocalStorage } from "async_hooks";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { createObserveModule } from "../../observe.module.js";
 import { OperationTraceRegistry } from "../../services/operation-trace.registry.js";
 import { testObserveOptions } from "../../testing/observe-harness.js";
 import { OutgoingObserveAgentService } from "../outgoing-observe-agent.service.js";
 import {
+  activateLlmFetchObserver,
+  attachLlmSpan,
   installLlmFetchObserver,
   llmCallsOff,
   uninstallLlmFetchObserver,
@@ -22,6 +26,77 @@ beforeEach(() => {
 afterEach(() => {
   uninstallLlmFetchObserver();
   globalThis.fetch = realFetch;
+});
+
+describe("a model reply the application drops", () => {
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+
+  /** A provider reply that never ends, and remembers being cancelled. */
+  const provider = (cancelled: unknown[], released: () => void) => {
+    globalThis.fetch = async () => {
+      attachLlmSpan({
+        spanId: "1",
+        end: () => undefined,
+        hold: () => released,
+      });
+      return new Response(
+        new ReadableStream(
+          {
+            pull: (controller) => controller.enqueue(bytes("{")),
+            cancel: (reason) => void cancelled.push(reason),
+          },
+          { highWaterMark: 0 },
+        ),
+        { headers: { "content-type": "application/json" } },
+      );
+    };
+    installLlmFetchObserver();
+    return activateLlmFetchObserver({ isRecording: () => true } as never);
+  };
+
+  const collect = async (until: () => boolean) => {
+    for (let attempt = 0; attempt < 20 && !until(); attempt++) {
+      gc();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  const bytes = (text: string) => new TextEncoder().encode(text);
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  it("cancels the provider's stream once nothing can read it any more", async () => {
+    const cancelled: unknown[] = [];
+    const released = vi.fn();
+    const stop = provider(cancelled, released);
+    try {
+      // Read a little, then dropped: an abandoned stream, a lost race.
+      await (async () => {
+        const response = await globalThis.fetch(url, { body: "{}" });
+        await response.body!.getReader().read();
+      })();
+      await collect(() => cancelled.length > 0);
+    } finally {
+      stop();
+    }
+    expect(cancelled).toHaveLength(1);
+    expect(released).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a stream the caller still holds alone", async () => {
+    const cancelled: unknown[] = [];
+    const stop = provider(cancelled, vi.fn());
+    try {
+      const response = await globalThis.fetch(url, { body: "{}" });
+      const body = response.body!;
+      await collect(() => false);
+      expect(cancelled).toEqual([]);
+      await body.cancel("done");
+      expect(cancelled).toEqual(["done"]);
+    } finally {
+      stop();
+    }
+  });
 });
 
 describe("llmCallsOff", () => {

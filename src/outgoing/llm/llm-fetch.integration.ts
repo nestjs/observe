@@ -169,6 +169,21 @@ interface CallContext {
   requestModel: string | undefined;
 }
 
+/**
+ * Cancels a provider's stream once the stream handed to the caller in its
+ * place can no longer be read. undici does this for an unread response it
+ * created, but not for one whose body is locked, as the provider's is once
+ * it is read through here: a reply the application drops would otherwise
+ * hold its socket, its buffered body and its span for good.
+ */
+const abandonedBodies = new FinalizationRegistry<() => void>((release) => {
+  try {
+    release();
+  } catch {
+    /* thrown from here it would be an uncaught exception in the host */
+  }
+});
+
 async function observeCall(
   original: typeof fetch,
   input: Parameters<typeof fetch>[0],
@@ -223,6 +238,8 @@ async function observeCall(
       return;
     }
     tagged = true;
+    // Read to its end, failed or cancelled: nothing is left to release.
+    abandonedBodies.unregister(holder);
     let usage: LlmUsage = {};
     try {
       usage = reader.finish();
@@ -269,6 +286,22 @@ async function observeCall(
       },
     },
     { highWaterMark: 0 },
+  );
+  // Watching `body`, not the response: a caller that keeps only the body,
+  // or a clone, can still read it. Nothing registered may reach `body`, or
+  // it would never be collected.
+  abandonedBodies.register(
+    body,
+    () => {
+      try {
+        finish();
+      } finally {
+        source
+          .cancel("Response object has been garbage collected")
+          .catch(() => undefined);
+      }
+    },
+    holder,
   );
   return rewrap(response, body);
 }
