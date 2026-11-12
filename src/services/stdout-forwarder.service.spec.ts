@@ -683,7 +683,7 @@ describe("StdoutForwarderService", () => {
         expect(buffer.entries[0].text).toMatch(/^Cannot import key: /);
       });
 
-      it("redacts a quoted value cut by a line break as far as the redactor reads it", () => {
+      it("redacts a quoted value cut by a line break whole", () => {
         const service = build();
 
         write(
@@ -691,13 +691,14 @@ describe("StdoutForwarderService", () => {
           'Error: secret="aGVsbG8gd29ybGQgaGVsbG8g\nd29ybGQ=" is not base64url\n    at main (/app/main.js:1:1)\n',
         );
 
-        // The lines go to the redactor as the one text they were written as;
-        // how far a quoted value runs is its rule's to say, and it ends one
-        // left open at the end of its line - so the line under it is the
-        // redactor's to mask, not the forwarder's.
+        // The lines go to the redactor as the one text they were written as,
+        // and a quoted value runs on to its closing quote on the next line.
         const sent = JSON.stringify(buffer.entries);
         expect(sent).not.toContain("aGVsbG8");
-        expect(buffer.entries[0].text).toBe("Error: secret=[REDACTED]");
+        expect(sent).not.toContain("d29ybGQ");
+        expect(buffer.entries[0].text).toBe(
+          "Error: secret=[REDACTED] is not base64url",
+        );
       });
 
       it("keeps a line that has a prefix of its own apart", () => {
