@@ -199,7 +199,9 @@ describe("LogRedactor", () => {
       redactor.redactMessage(text);
       redactor.redactSource(text.split("\n"));
 
-      expect(performance.now() - startedAt).toBeLessThan(250);
+      // Generous, for a loaded machine: a scan that rescanned the rest of the
+      // text per key would take tens of seconds on these.
+      expect(performance.now() - startedAt).toBeLessThan(1000);
     });
   });
 
@@ -357,7 +359,8 @@ describe("LogRedactor", () => {
         20_001,
       );
 
-      expect(performance.now() - startedAt).toBeLessThan(250);
+      // Generous, for a loaded machine: the quadratic rule took ~17 s here.
+      expect(performance.now() - startedAt).toBeLessThan(1000);
     });
 
     it("masks a JWT right after a percent escape or a JSON escape", () => {
