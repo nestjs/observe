@@ -68,8 +68,17 @@ interface GqlRequestStartContext {
 
 interface GqlRequestEndContext extends GqlRequestStartContext {
   /** `GraphQLError`s, structurally: the `graphql` package is an optional peer. */
-  errors?: readonly { message?: string; originalError?: unknown }[];
+  errors?: readonly GqlError[];
   state?: unknown;
+}
+
+/** A `GraphQLError`, as much of it as is read here. */
+interface GqlError {
+  message?: string;
+  originalError?: unknown;
+  /** Where in the response it belongs; absent before execution begins. */
+  path?: unknown;
+  extensions?: { code?: unknown };
 }
 
 /**
@@ -505,6 +514,9 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
    * `GraphQLError` wrapping it, because that is the error the registry
    * classifies: an `IntrinsicException` a handler raised on purpose reads as
    * handled, and it stops being recognisable once GraphQL has wrapped it.
+   *
+   * An error graphql refused the request with is recorded by its class and
+   * code alone - see `toRefusal`.
    */
   private toSpanError(
     errors: GqlRequestEndContext["errors"],
@@ -513,7 +525,17 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     if (!first) {
       return undefined;
     }
-    return (first.originalError as Error | undefined) ?? first;
+    const original = first.originalError as
+      | (Error & { nodes?: unknown })
+      | undefined;
+    const error = original ?? first;
+    // No path: raised by parsing, validation or the coercion of variables,
+    // before any resolver ran. A path, and an original error pointing at
+    // syntax of its own: an argument refused as its field was executed. A
+    // resolver's own error points at none.
+    return first.path == null || original?.nodes != null
+      ? toRefusal(first, error)
+      : error;
   }
 
   private lookupResolverHandler(
@@ -600,4 +622,44 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       "graphql",
     );
   }
+}
+
+/**
+ * What a request graphql refused is recorded with: the error's class and its
+ * code, `GRAPHQL_VALIDATION_FAILED` or `BAD_USER_INPUT`, and nothing graphql
+ * worded. graphql words these errors around the value it refused - `String
+ * cannot represent a non string value: 489213`, `found String "..."` - which
+ * the recorded document shows blanked, and which no rule can blank in prose:
+ * a string is printed there unescaped. The stack is the message again, then
+ * frames of graphql and the server, not of the application.
+ */
+function toRefusal(first: GqlError, error: object): Error {
+  const code =
+    first.extensions?.code ??
+    (error as { extensions?: { code?: unknown } }).extensions?.code;
+  const message =
+    typeof code === "string" && /^[A-Z][A-Z0-9_]*$/.test(code)
+      ? code
+      : "GraphQL request error";
+  const refusal: Error =
+    error instanceof Error
+      ? (Object.create(Object.getPrototypeOf(error) as object) as Error)
+      : new Error();
+  const name = (error as { constructor?: { name?: unknown } }).constructor
+    ?.name;
+  // What the registry classifies a failure by: its class, kept above, and
+  // the status an `HttpException` thrown by a custom scalar answers with.
+  const status = (error as { status?: unknown }).status;
+  if (typeof status === "number") {
+    Object.defineProperty(refusal, "status", { value: status });
+  }
+  Object.defineProperties(refusal, {
+    message: { value: message, configurable: true, writable: true },
+    stack: {
+      value: `${typeof name === "string" && name ? name : "Error"}: ${message}`,
+      configurable: true,
+      writable: true,
+    },
+  });
+  return refusal;
 }

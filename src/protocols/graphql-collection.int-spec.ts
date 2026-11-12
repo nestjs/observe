@@ -72,6 +72,16 @@ class OrdersResolver {
     return { id: 99, name };
   }
 
+  @Mutation(() => Boolean)
+  verifyOtp(@Args("code") _code: string): boolean {
+    return true;
+  }
+
+  @Query(() => Int)
+  countNames(@Args("names", { type: () => [String] }) names: string[]): number {
+    return names.length;
+  }
+
   /** A schema name that differs from the method name, asserted on below. */
   @Query(() => [Order], { name: "latestOrders" })
   findLatest(): Order[] {
@@ -326,6 +336,69 @@ describe.each<Platform>(onPlatforms(["express", "node"]))(
 
       expect(snapshot.attributes?.statusCode).toBe(500);
       expect(snapshot.error?.message).toBe("deliberate");
+    });
+
+    /**
+     * graphql words the errors it refuses a request with around the value it
+     * refused, which the recorded document shows blanked: a one-time code
+     * sent as a number where the schema says `String` reached the collector
+     * in the error's message and stack.
+     */
+    describe("an error graphql refused the request with", () => {
+      const send = (
+        traceId: string,
+        query: string,
+        variables?: Record<string, unknown>,
+      ) =>
+        request(app.getHttpServer())
+          .post("/graphql")
+          .set("x-request-id", traceId)
+          .send({ query, variables });
+
+      // The status each is recorded with, as it was before.
+      it.each<[string, number, string, Record<string, unknown>?]>([
+        [
+          "a literal of the wrong type",
+          400,
+          "mutation { verifyOtp(code: 489213) }",
+        ],
+        [
+          "a variable of the wrong type",
+          400,
+          "mutation ($code: String!) { verifyOtp(code: $code) }",
+          { code: 489213 },
+        ],
+        [
+          "a document that does not parse",
+          400,
+          'mutation { verifyOtp(code "48\\"9213") }',
+        ],
+        [
+          "an argument refused as its field runs",
+          500,
+          'query ($n: String = "a") { countNames(names: [$n, "489213"]) }',
+          { n: null },
+        ],
+      ])(
+        "is recorded without the value, for %s",
+        async (_, statusCode, query, variables) => {
+          const traceId = `refused-${Math.random().toString(36).slice(2)}`;
+          const response = await send(traceId, query, variables);
+          expect(response.body.errors).toBeDefined();
+
+          const snapshot = await waitForSnapshot(
+            collected,
+            (item) => item.traceId === traceId,
+          );
+
+          // By its code, or failing that by what it is.
+          expect(snapshot.error?.message).toMatch(
+            /^(GRAPHQL_[A-Z_]+|BAD_USER_INPUT|GraphQL request error)$/,
+          );
+          expect(snapshot.attributes?.statusCode).toBe(statusCode);
+          expect(JSON.stringify(snapshot)).not.toContain("9213");
+        },
+      );
     });
 
     it("collects field-resolver work under the operation span", async () => {
