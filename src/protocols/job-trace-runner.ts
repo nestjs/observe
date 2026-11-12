@@ -341,8 +341,14 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       return invoke(() => undefined);
     }
 
-    const hasOuterContext = outerStore?.has(this.options.traceIdKey);
-
+    // Any other run opens a store and a trace of its own, whatever store it
+    // starts in. A trace id there is no proof that an operation is still open
+    // around the run: a store outlives its operation in whatever the
+    // operation left running - the timer chain of a cron job a request
+    // rescheduled, a Redis connection a request opened - and a run read as
+    // nested in it used to run in an id-less store, unreported, with
+    // `TracerService.createSpan()` throwing in its handler.
+    //
     // The same map `run` is given, rather than `getStore()` inside the
     // callback: identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
@@ -350,17 +356,6 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       store.set(ACTIVE_JOB_KEY as KeyOf<Store>, activeJob);
     }
     return this.asyncLocalStorage.run(store, () => {
-      if (hasOuterContext) {
-        // If the outer context already has a trace ID
-        // ignore the inner context
-        if (this.options.debug) {
-          this.logger.debug(
-            `Outer context already has a trace ID. Skipping inner context for job "${job.name}" job.id: ${job.id}`,
-          );
-        }
-        return invoke(() => undefined);
-      }
-
       // The registry key is always this run's own. The inherited id may belong
       // to a request still open in this process, and a retry reuses it.
       const registryKey = uuidv7();

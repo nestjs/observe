@@ -191,12 +191,34 @@ describe("JobTraceRunner: a run nested in its own job's run", () => {
     expect(inner).toEqual(outer);
   });
 
-  it("still isolates a different job that happens to start in that context", () => {
-    const inner = runner.run(job("7"), () =>
+  it("runs a different job that starts in that context as a run of its own", () => {
+    const [outer, inner] = runner.run(job("7"), () => [
+      observeRun(),
       runner.run(job("8"), () => observeRun()),
-    );
+    ]);
 
-    expect(inner).toEqual({ traceId: undefined, registryKey: undefined });
+    expect(inner.traceId).toEqual(expect.any(String));
+    expect(inner.traceId).not.toBe(outer.traceId);
+    expect(inner.registryKey).not.toBe(outer.registryKey);
+    expect(registry.hasTrace(inner.registryKey!)).toBe(true);
+  });
+
+  it("opens a run of its own in a store an operation left behind", () => {
+    // `cron` re-arms a job's timer from the previous timer's callback, so a
+    // job a request rescheduled fires in that request's store from then on.
+    // Read as an operation still open around the run, the store sent every
+    // firing into an id-less one: `TracerService.createSpan()` threw in the
+    // handler, and no run was reported again.
+    const stale = new Map<string, unknown>([
+      [TRACE_ID_KEY, "answered-request"],
+      [TRACE_REGISTRY_KEY, "answered-request-key"],
+    ]);
+
+    const seen = als.run(stale, () => runner.run(job("9"), () => observeRun()));
+
+    expect(seen.traceId).toEqual(expect.any(String));
+    expect(seen.traceId).not.toBe("answered-request");
+    expect(registry.hasTrace(seen.registryKey!)).toBe(true);
   });
 });
 
