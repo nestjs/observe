@@ -122,6 +122,7 @@ export class OutgoingSpanRecorder {
         methodKey,
         spanId,
         error === undefined || error === null ? undefined : (error as Error),
+        true,
       );
       // A held span closes late; the call itself ended at `endedAt`.
       if (node && endedAt !== undefined && startTime !== undefined) {

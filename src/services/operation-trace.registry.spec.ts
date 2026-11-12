@@ -1524,6 +1524,120 @@ describe("OperationTraceRegistry", () => {
    * A failing message pattern that reported no status code at all would show up
    * as zero errors of either kind, which is the bug these cases pin down.
    */
+  describe("an outgoing call's error with no span around it", () => {
+    // A query in a cold Observable runs when Nest subscribes, after the
+    // provider that built it has returned: its span sits at the root, and
+    // whoever handles its error is not traced.
+    const duplicateKey = () =>
+      Object.assign(
+        new Error(
+          "Duplicate entry 'LK528c1f' for key 'activations.licence_key'",
+        ),
+        { code: "ER_DUP_ENTRY" },
+      );
+
+    const queryFails = (traceId: string, error: Error) => {
+      const spanId = registry.internalStartTraceStep(
+        traceId,
+        "mysql2",
+        "INSERT activations",
+        undefined,
+      );
+      registry.internalEndTraceStep(
+        traceId,
+        spanId,
+        "mysql2",
+        "INSERT activations",
+        spanId,
+        error,
+        true,
+      );
+    };
+
+    it("is not the error of a request that answered it with a 4xx", async () => {
+      startRequest("o1");
+      queryFails("o1", duplicateKey());
+      registry.endTrace("o1", { statusCode: 409 });
+      const snapshot = (await registry.pluckSnapshot("o1")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(409);
+      expect(snapshot.error).toBeUndefined();
+      // The call's own span still says what failed.
+      expect(snapshot.traces?.[0].error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("Duplicate"),
+        }),
+      );
+    });
+
+    it("does not turn a request answered with a fallback into a failure", async () => {
+      startRequest("o2");
+      queryFails("o2", duplicateKey());
+      registry.endTrace("o2", { statusCode: 200 });
+      const snapshot = (await registry.pluckSnapshot("o2")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(200);
+      expect(snapshot.error).toBeUndefined();
+    });
+
+    it("is the error of a request that failed with a 5xx and recorded no other", async () => {
+      startRequest("o3");
+      queryFails("o3", duplicateKey());
+      registry.endTrace("o3", { statusCode: 500 });
+      const snapshot = (await registry.pluckSnapshot("o3")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(500);
+      expect(snapshot.error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("Duplicate"),
+        }),
+      );
+    });
+
+    it("gives way to the error of a traced call", async () => {
+      startRequest("o4");
+      queryFails("o4", duplicateKey());
+      const spanId = registry.internalStartTraceStep(
+        "o4",
+        "LicencesService",
+        "activate",
+        undefined,
+      );
+      registry.internalEndTraceStep(
+        "o4",
+        spanId,
+        "LicencesService",
+        "activate",
+        spanId,
+        new Error("activation failed"),
+      );
+      registry.endTrace("o4", { statusCode: 500 });
+      const snapshot = (await registry.pluckSnapshot("o4")) as RequestSnapshot;
+
+      expect(snapshot.error).toEqual(
+        expect.objectContaining({ message: "activation failed" }),
+      );
+    });
+
+    it("still fails an operation whose transport reports no status", async () => {
+      registry.startTrace("o5", {
+        operationId: "licences.activate",
+        protocol: "TCP",
+        tags: {},
+      });
+      queryFails("o5", duplicateKey());
+      registry.endTrace("o5", {});
+      const snapshot = (await registry.pluckSnapshot("o5")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(500);
+      expect(snapshot.error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("Duplicate"),
+        }),
+      );
+    });
+  });
+
   describe("errors on transports without a status code", () => {
     const startRpc = (traceId: string) =>
       registry.startTrace(traceId, {

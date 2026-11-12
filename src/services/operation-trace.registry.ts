@@ -99,6 +99,11 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    */
   errorStatusCode?: number;
   /**
+   * `errorStatusCode` as an outgoing call's span with no span around it
+   * would set it - see `endTrace` for when it counts.
+   */
+  outgoingErrorStatusCode?: number;
+  /**
    * The name `TracerService.setOperationId` gave the operation, put in place
    * on hand-off. Held apart until then so that the transport's own naming -
    * the route hook, which fires after middleware, and the GraphQL root field -
@@ -420,6 +425,11 @@ export class OperationTraceRegistry {
   /** See `countUnrecordedSpan`. */
   private hasReportedSpanLimit = false;
   /**
+   * Root spans of outgoing calls - a query, an HTTP call - that ended with
+   * an error. See `endTrace` for what they decide.
+   */
+  private readonly failedOutgoingRoots = new WeakSet<object>();
+  /**
    * Applied to every tree as it is plucked. Defaults are live from
    * construction rather than waiting for `configureSpanCollapse`, so a
    * registry the module has not (yet) configured still bounds what it ships.
@@ -679,8 +689,18 @@ export class OperationTraceRegistry {
       "statusCode" in opts && typeof opts.statusCode === "number"
         ? opts.statusCode
         : undefined;
+    // An outgoing call's error at the root (see `internalEndTraceStep`) may
+    // have been caught and answered: a duplicate key turned into a 409, a
+    // failed lookup into a 200 with a fallback. A transport that reports a
+    // status code says how the operation ended, so there it does not stand in
+    // for one; on one that reports none, it is all there is to go on.
     const errorStatusCode =
-      "protocol" in snapshot ? snapshot.errorStatusCode : undefined;
+      "protocol" in snapshot
+        ? snapshot.errorStatusCode ??
+          (reportedStatusCode === undefined
+            ? snapshot.outgoingErrorStatusCode
+            : undefined)
+        : undefined;
 
     // A root span that threw outranks a success status code reported by the
     // transport. Two cases need this. Transports that carry no status code of
@@ -726,15 +746,35 @@ export class OperationTraceRegistry {
     delete snapshot.startTimestamp; // Clean up to avoid confusion
 
     if (snapshot.traces && snapshot.traces.length > 0) {
-      // Iterate through root traces to check if any have errors
+      // The first root span that failed gives the operation its error. An
+      // outgoing call's counts only where nothing else did and the operation
+      // failed by its status - or reported none: otherwise its error was
+      // caught and answered, and recording it as the operation's put the
+      // driver's message, bound values and all, in place of what the
+      // application returned.
+      let outgoing: (typeof snapshot.traces)[number] | undefined;
+      let found = false;
       for (const trace of snapshot.traces) {
-        if ("error" in trace && trace.error) {
-          // If any root trace has an error, we mark the entire snapshot as having an error
-          if (typeof trace.error === "object") {
-            snapshot.error = trace.error;
-          }
-          break; // No need to check further once an error is found
+        if (!("error" in trace) || !trace.error) {
+          continue;
         }
+        if (this.failedOutgoingRoots.has(trace)) {
+          outgoing ??= trace;
+          continue;
+        }
+        if (typeof trace.error === "object") {
+          snapshot.error = trace.error;
+        }
+        found = true;
+        break;
+      }
+      if (
+        !found &&
+        typeof outgoing?.error === "object" &&
+        (reportedStatusCode === undefined ||
+          (typeof statusCode === "number" && statusCode >= 500))
+      ) {
+        snapshot.error = outgoing.error;
       }
     }
   }
@@ -952,6 +992,8 @@ export class OperationTraceRegistry {
     // other unknown caller.
     callerId: string | undefined,
     error?: Error | string | object,
+    /** The span is an outgoing call's, opened by `OutgoingSpanRecorder`. */
+    outgoing = false,
   ): void {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
@@ -999,14 +1041,23 @@ export class OperationTraceRegistry {
 
     if (error && !activeTrace.error) {
       const isRootSpan = !parent;
-      if (isRootSpan) {
+      if (isRootSpan && outgoing) {
+        // An outgoing call at the root ran outside every traced call of the
+        // operation - most often a query in a cold Observable, run when Nest
+        // subscribed, after the provider that built it had returned. Whoever
+        // handles its error is not traced, so the error says nothing yet of
+        // how the operation ended: `endTrace` decides what it counts for.
+        snapshot.outgoingErrorStatusCode = this.toErrorStatusCode(error);
+        this.failedOutgoingRoots.add(activeTrace);
+      } else if (isRootSpan) {
         // Only a root span decides this: an error thrown deeper down may well
         // have been caught and handled by its caller, in which case the
         // operation did not fail at all.
         snapshot.errorStatusCode = this.toErrorStatusCode(error);
-
-        // If this is the root span, we can directly set the error on the snapshot
-        // if it's a non-intrinsic error
+      }
+      if (isRootSpan) {
+        // A root span keeps the error's details: it may become the
+        // operation's own.
         if (typeof error === "object") {
           activeTrace.error = this.toErrorPayload(error);
         } else {
@@ -1270,7 +1321,7 @@ export class OperationTraceRegistry {
       }
       cleanup();
 
-      // These seven are what distinguish the registry's working copy from the
+      // These are what distinguish the registry's working copy from the
       // snapshot the API receives, so removing them is the hand-off.
       const bookkeeping = snapshot as Partial<SnapshotWithSignal>;
       const customOperationId = bookkeeping.customOperationId;
@@ -1287,6 +1338,7 @@ export class OperationTraceRegistry {
       delete bookkeeping.refsCounter;
       delete bookkeeping.refsMarkedAsComplete;
       delete bookkeeping.errorStatusCode;
+      delete bookkeeping.outgoingErrorStatusCode;
       delete bookkeeping.customOperationId;
       delete bookkeeping.keptWithoutSpans;
       delete bookkeeping.capturedErrors;
