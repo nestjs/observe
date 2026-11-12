@@ -92,6 +92,8 @@ export function captureRequest(
   req: unknown,
   options: HttpCaptureOptions | false | undefined,
   redactor: LogRedactor | null,
+  /** `http.queryParamsObfuscateRegex`, global. */
+  obfuscateUrl?: RegExp,
 ): CapturedRequest | undefined {
   if (options === false || typeof req !== "object" || req === null) {
     return undefined;
@@ -108,14 +110,24 @@ export function captureRequest(
       if (typeof value !== "string" || value.length === 0) {
         continue;
       }
-      const bounded = value.slice(0, MAX_HEADER_VALUE_LENGTH);
-      // A referer is a URL, and its query string is where the tokens live.
-      headers[key] =
-        key === "referer" ? redactUrlQuery(bounded, redactor) : bounded;
+      // Any header can carry a URL - `referer`, `x-forwarded-uri`,
+      // `x-original-url` - and its query string is where the tokens live.
+      // Masking is by key, so a value that is no URL comes back untouched.
+      headers[key] = redactUrlQuery(value, redactor, obfuscateUrl);
     }
     if (Object.keys(headers).length > 0) {
-      captured.headers = (
-        redactor ? redactor.redactAttributes(headers) : headers
+      // Redacted whole and cut afterwards, as the body is: the rules that
+      // recognise a secret by its end - a JWT's last dot, a closing quote, a
+      // card's last digits - stop matching once the cut goes through it, and
+      // the head of the secret would be sent.
+      const redacted = redactor ? redactor.redactAttributes(headers) : headers;
+      captured.headers = Object.fromEntries(
+        Object.entries(redacted ?? {}).map(([key, value]) => [
+          key,
+          typeof value === "string"
+            ? value.slice(0, MAX_HEADER_VALUE_LENGTH)
+            : value,
+        ]),
       ) as Record<string, string>;
     }
   }

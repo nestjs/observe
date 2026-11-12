@@ -24,7 +24,7 @@ import {
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
-import { redactUrlQuery } from "../utils/redact-url-query.js";
+import { redactUrlQuery, toGlobalRegExp } from "../utils/redact-url-query.js";
 import { openTelemetryTraceIdGenerator } from "../utils/default-trace-id-generator.util.js";
 import { usesDefaultTraceIdGenerator } from "../utils/trace-id-generator-origin.util.js";
 import { inboundTraceContext } from "../utils/trace-context.util.js";
@@ -231,13 +231,11 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // disclosure either way. A configured regex still applies, on top rather
       // than instead - it exists for the keys only that deployment knows
       // about.
-      const redactedUrl = redactUrlQuery(
+      const originalUrl = redactUrlQuery(
         req.url,
         this.operationTraceRegistry.getRedactor(),
+        this.queryParamsObfuscateRegex,
       );
-      const originalUrl = this.queryParamsObfuscateRegex
-        ? redactedUrl.replaceAll(this.queryParamsObfuscateRegex, "[REDACTED]")
-        : redactedUrl;
 
       this.operationTraceRegistry.startTrace(
         registryKey,
@@ -300,6 +298,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
             req,
             this.options.http?.capture,
             this.operationTraceRegistry.getRedactor(),
+            this.queryParamsObfuscateRegex,
           );
           if (captured) {
             (snapshot as RequestSnapshot).request = captured;
@@ -427,17 +426,6 @@ function testIgnoreRegex(pattern: RegExp, value: string): boolean {
     return pattern.test(value);
   }
   return new RegExp(pattern.source, pattern.flags).test(value);
-}
-
-/**
- * Rebuilds a RegExp with the global flag when it lacks one, keeping the
- * original otherwise. `replaceAll` refuses a non-global pattern outright.
- */
-function toGlobalRegExp(pattern: RegExp | undefined): RegExp | undefined {
-  if (!pattern || pattern.global) {
-    return pattern;
-  }
-  return new RegExp(pattern.source, pattern.flags + "g");
 }
 
 /**

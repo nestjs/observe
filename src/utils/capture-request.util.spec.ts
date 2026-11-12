@@ -48,6 +48,58 @@ describe("captureRequest", () => {
     });
   });
 
+  it("masks the query of a URL in any captured header, not only referer", () => {
+    const captured = captureRequest(
+      {
+        headers: {
+          "x-forwarded-uri": "/oauth/callback?code=abc123&state=xyz",
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+          accept: "text/html;q=0.9,*/*;q=0.8",
+        },
+      },
+      { headers: ["x-forwarded-uri", "user-agent", "accept"] },
+      redactor,
+    );
+
+    expect(captured?.headers).toEqual({
+      "x-forwarded-uri":
+        "/oauth/callback?code=%5BREDACTED%5D&state=%5BREDACTED%5D",
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      accept: "text/html;q=0.9,*/*;q=0.8",
+    });
+  });
+
+  it("redacts a header before cutting it, so a secret across the cut is masked", () => {
+    const jwt =
+      "eyJhbGciOiJIUzI1NiJ9." +
+      "eyJzdWIiOiJ1c2VyLTQyIiwiZW1haWwiOiJhQGV4YW1wbGUuY29tIn0." +
+      "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    // The cut at 512 falls inside the JWT's payload, before its last dot.
+    const referer = `https://app.example.com/${"a".repeat(440)}/${jwt}`;
+
+    const captured = captureRequest(
+      { headers: { referer } },
+      undefined,
+      redactor,
+    );
+
+    expect(captured?.headers?.referer).not.toContain("eyJzdWIi");
+    expect(captured?.headers?.referer.length).toBeLessThanOrEqual(512);
+  });
+
+  it("applies the deployment's query obfuscation pattern to captured URLs", () => {
+    const captured = captureRequest(
+      { headers: { referer: "https://app.example.com/x?tenant=acme&page=2" } },
+      undefined,
+      redactor,
+      /tenant=[^&]*/g,
+    );
+
+    expect(captured?.headers?.referer).toEqual(
+      "https://app.example.com/x?[REDACTED]&page=2",
+    );
+  });
+
   it("records a body only on request, redacted by key before serialization", () => {
     const captured = captureRequest(req, { body: true }, redactor);
     const body = JSON.parse(captured!.body!);

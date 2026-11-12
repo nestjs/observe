@@ -14,6 +14,7 @@ import {
   loadAsResolvedBy,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
+import { toGlobalRegExp } from "../utils/redact-url-query.js";
 import type { TraceContext } from "../utils/trace-context.util.js";
 import { subscribeOutgoingHttp } from "./http.integration.js";
 import {
@@ -169,6 +170,7 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
           this.options.openTelemetry === true &&
           http.traceContext !== false &&
           this.observeAgentSharedBuffer?.isReporting() === true,
+        toGlobalRegExp(this.options.http?.queryParamsObfuscateRegex),
       );
       // Model calls are read off the spans above, so they go with them.
       if (outgoing?.llm !== false) {

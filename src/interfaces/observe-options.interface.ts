@@ -565,7 +565,9 @@ export interface ObserveOptions {
      * Applied *in addition to* the built-in redaction, which always masks the
      * values of well-known sensitive parameters (`token`, `password`, `code`,
      * `signature`, ...) whether or not this is set. Use it for the parameters
-     * only your application knows are sensitive.
+     * only your application knows are sensitive. It is matched against every
+     * URL the agent records: the request's own, a URL in a captured request
+     * header (`referer`, ...) and the URL of an outgoing HTTP call.
      * @default undefined
      */
     queryParamsObfuscateRegex?: RegExp;

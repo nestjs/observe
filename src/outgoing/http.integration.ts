@@ -111,6 +111,8 @@ export function subscribeOutgoingHttp(
    * `ObserveAgentSharedBuffer.isReporting`). Off unless given.
    */
   traceContextOn: () => boolean = () => false,
+  /** `http.queryParamsObfuscateRegex`, global: held to every recorded URL. */
+  obfuscateUrl?: RegExp,
 ): () => void {
   const spans = new WeakMap<object, OpenOutgoingSpan>();
   /**
@@ -160,7 +162,7 @@ export function subscribeOutgoingHttp(
       `${method} ${host}`,
       {
         "http.method": method,
-        "http.url": redactUrlQuery(url, getRedactor()),
+        "http.url": redactUrlQuery(url, getRedactor(), obfuscateUrl),
       },
       presetSpanId,
     );
