@@ -124,6 +124,42 @@ describe("OperationTraceRegistry", () => {
       await expect(registry.pluckSnapshot("t2")).resolves.toBeUndefined();
     });
 
+    it("holds nothing of a span-less trace it discards, whatever its logger records", async () => {
+      // A logger taken from the container is wrapped like any provider, and
+      // it writes the missing-instrumentation line inside the request's async
+      // store - so writing it opens spans in the very trace being dropped.
+      const opened: Array<string | undefined> = [];
+      const error = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "error")
+        .mockImplementation(() => {
+          const spanId = registry.internalStartTraceStep(
+            "t2a",
+            "AppLogger",
+            "error",
+            undefined,
+          );
+          opened.push(spanId);
+          registry.internalEndTraceStep(
+            "t2a",
+            spanId,
+            "AppLogger",
+            "error",
+            spanId,
+          );
+        });
+
+      startRequest("t2a");
+      registry.endTrace("t2a", { statusCode: 400 });
+
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(opened).toEqual([undefined]);
+      expect(
+        (registry as unknown as { callerIdsByTraceId: Map<string, unknown> })
+          .callerIdsByTraceId.size,
+      ).toBe(0);
+      await expect(registry.pluckSnapshot("t2a")).resolves.toBeUndefined();
+    });
+
     /** A CORS preflight as the HTTP agent starts it: no route matched it. */
     const startPreflight = (traceId: string) =>
       registry.startTrace(traceId, {

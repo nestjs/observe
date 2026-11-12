@@ -388,8 +388,14 @@ export class OperationTraceRegistry {
         // recorded a span for it. Both at once has one cause: the instance
         // decorator never wrapped the providers, because `instrument` never
         // reached NestFactory.
+        //
+        // Dropped before the line is written, not after: a logger taken from
+        // the container is wrapped like any provider and writes inside this
+        // operation's async store, so with the trace still registered every
+        // call it makes on itself opened a span here - in a span map nothing
+        // would ever free again.
+        this.abandonTrace(traceId);
         this.reportMissingInstrumentation(snapshot);
-        this.traceSnapshots.delete(traceId);
         return;
       }
 
@@ -397,7 +403,7 @@ export class OperationTraceRegistry {
       // the request didnt even have a handler in the first place - unless
       // the transport said the operation is complete without one.
       if (!snapshot.keptWithoutSpans) {
-        this.traceSnapshots.delete(traceId);
+        this.abandonTrace(traceId);
         return;
       }
     }
