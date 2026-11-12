@@ -28,6 +28,75 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
+describe("a model reply read through the agent", () => {
+  const url = "https://api.openai.com/v1/chat/completions";
+  const encode = (text: string) => new TextEncoder().encode(text);
+
+  /** Answers every call with `reply`, under a span that is held and tagged. */
+  const answerWith = (reply: () => Response) => {
+    const tags: unknown[] = [];
+    const released = vi.fn();
+    globalThis.fetch = async () => {
+      attachLlmSpan({
+        spanId: "1",
+        end: () => undefined,
+        tag: (extra) => void tags.push(extra),
+        hold: () => released,
+      });
+      return reply();
+    };
+    installLlmFetchObserver();
+    const stop = activateLlmFetchObserver({
+      isRecording: () => true,
+    } as never);
+    return { tags, released, stop };
+  };
+
+  const settledWithin = <T>(promise: Promise<T>, ms: number) =>
+    Promise.race([
+      promise.then(
+        () => "fulfilled",
+        (error: Error) => `rejected: ${error.message}`,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), ms)),
+    ]);
+
+  // A call aborted, or a connection reset, while nothing is reading: plain
+  // fetch fails the body at once, and a stream piped on - `Readable.fromWeb`
+  // under a deadline - relies on `reader.closed` to hang up.
+  it("fails the body as soon as the provider's stream fails, not at the next read", async () => {
+    let provider!: ReadableStreamDefaultController<Uint8Array>;
+    const { released, stop } = answerWith(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              start: (controller) => void (provider = controller),
+              pull: (controller) =>
+                controller.enqueue(encode('data: {"a":1}\n')),
+            },
+            { highWaterMark: 0 },
+          ),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    try {
+      const response = await globalThis.fetch(url, { body: "{}" });
+      const reader = response.body!.getReader();
+      await reader.read();
+
+      provider.error(new Error("This operation was aborted"));
+
+      expect(await settledWithin(reader.closed, 200)).toBe(
+        "rejected: This operation was aborted",
+      );
+      expect(released).toHaveBeenCalledTimes(1);
+    } finally {
+      stop();
+    }
+  });
+});
+
 describe("a model reply the application drops", () => {
   setFlagsFromString("--expose-gc");
   const gc = runInNewContext("gc") as () => void;

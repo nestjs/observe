@@ -259,6 +259,21 @@ async function observeCall(
   const source = response.body.getReader();
   const body = new ReadableStream<Uint8Array>(
     {
+      start(controller) {
+        // Failed between two reads - the call's signal aborted, the
+        // connection reset: the caller hears of it now, as from plain
+        // `fetch`, not at a read that may never come. A stream piped on
+        // (`Readable.fromWeb`) stops reading while its buffer is full and
+        // waits on `closed` to hang up. A normal end or a cancel fulfils
+        // `closed`, and `error` does nothing to a stream already done.
+        // Held weakly: `source` is reachable from `abandonedBodies`, and so
+        // is what waits on it - a strong hold here would keep `body` alive.
+        const handle = new WeakRef(controller);
+        source.closed.catch((error: unknown) => {
+          finish();
+          handle.deref()?.error(error);
+        });
+      },
       async pull(controller) {
         let chunk: Awaited<ReturnType<typeof source.read>>;
         try {
