@@ -4,12 +4,15 @@ import {
   FastifyAdapter,
   NestFastifyApplication,
 } from "@nestjs/platform-fastify";
+import { connect } from "net";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
+  listenOnLoopback,
   testObserveOptions,
   waitFor,
   waitForSnapshot,
@@ -17,9 +20,24 @@ import {
 
 const { ObserveModule, ObserveInstrument } = createObserveModule();
 
+/** Lets the test hold a handler open, and learn that it was entered. */
+const slowRequests = {
+  entered: () => {},
+  release: () => {},
+};
+
 @Controller()
 class OrdersController {
   constructor(private readonly tracer: TracerService) {}
+
+  @Get("slow")
+  async slow() {
+    await new Promise<void>((resolve) => {
+      slowRequests.release = resolve;
+      slowRequests.entered();
+    });
+    return { ok: true };
+  }
 
   @Get("orders")
   findAll() {
@@ -226,5 +244,36 @@ describe("ObserveModule: HTTP collection (Fastify)", () => {
     // double-registered hook would show up here and nowhere else.
     await waitForSnapshot(collected, () => collected.items.length >= 3);
     expect(collected.items).toHaveLength(3);
+  });
+
+  it("drops the trace of a request whose client hung up", async () => {
+    // Fastify hands the request hook its reply, which is no emitter: the
+    // listener that frees an aborted request's trace was never attached, and
+    // every such request stayed in the registry for the life of the process.
+    const registry = app.get(OperationTraceRegistry);
+    const traceIds = () => [
+      ...(
+        registry as unknown as { traceSnapshots: Map<string, unknown> }
+      ).traceSnapshots.keys(),
+    ];
+    const before = traceIds();
+    const entered = new Promise<void>((resolve) => {
+      slowRequests.entered = resolve;
+    });
+    const { port } = new URL(await listenOnLoopback(app));
+    const socket = connect(Number(port), "127.0.0.1");
+    socket.write("GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    await entered;
+    expect(traceIds().length).toBe(before.length + 1);
+
+    socket.destroy();
+    await waitFor(
+      () => traceIds().length === before.length,
+      2000,
+      "the aborted request's trace to be dropped",
+    );
+    slowRequests.release();
+
+    expect(traceIds()).toEqual(before);
   });
 });

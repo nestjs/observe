@@ -37,13 +37,6 @@ import {
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
 
-/**
- * How long an aborted request's handler gets to finish its spans before the
- * trace is dropped from the registry. Generous next to a typical handler, tiny
- * next to a leak that never frees.
- */
-const ABORTED_TRACE_EVICTION_GRACE_MS = 30_000;
-
 /** The adapter hooks requests are traced through, all added in Nest 11.1.4. */
 const REQUEST_HOOKS = [
   "setOnRequestHook",
@@ -323,32 +316,35 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
    * of the process; on an ingest endpoint taking 16MB bodies over slow links,
    * aborts are routine, not exceptional.
    *
+   * Express and the Node adapter hand the request hook the Node response
+   * itself; Fastify hands it the reply, which is no emitter, with the Node
+   * response under it as `raw`.
+   *
    * On the normal path `close` follows `finish` with `writableFinished`
    * already true, so this stays a no-op there - `endHttpRequestTracing` has
-   * either plucked the trace or is about to.
+   * either plucked the trace or is about to. A response that does not say
+   * is left alone.
    *
-   * Eviction is deferred, not immediate: Express does not cancel the handler
-   * on abort, so its spans are usually still closing when `close` fires. The
-   * grace period lets the handler drain first; `unref` keeps the timer from
-   * holding a shutting-down process open.
+   * Dropped at once, not after a grace period: an abandoned trace is never
+   * reported, and the registry already lets a handler that outlives its
+   * client end its spans on a trace that is gone. Held for 30 s, it was the
+   * client's to say how many such traces the process kept.
    */
   private evictTraceOnClientAbort(res: unknown, traceId: string): void {
-    const response = res as {
-      on?: (event: string, listener: () => void) => void;
-      writableFinished?: boolean;
-    };
+    const given = res as { on?: unknown; raw?: unknown } | undefined;
+    const response = (typeof given?.on === "function" ? given : given?.raw) as
+      | {
+          on?: (event: string, listener: () => void) => void;
+          writableFinished?: boolean;
+        }
+      | undefined;
     if (typeof response?.on !== "function") {
       return;
     }
     response.on("close", () => {
-      if (response.writableFinished) {
-        return;
+      if (response.writableFinished === false) {
+        this.operationTraceRegistry.abandonTrace(traceId);
       }
-      const timer = setTimeout(
-        () => this.operationTraceRegistry.abandonTrace(traceId),
-        ABORTED_TRACE_EVICTION_GRACE_MS,
-      );
-      timer.unref?.();
     });
   }
 

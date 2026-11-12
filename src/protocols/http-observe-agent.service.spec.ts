@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
+import { EventEmitter } from "events";
 import { HttpAdapterHost } from "@nestjs/core";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
@@ -552,6 +553,76 @@ describe("HttpObserveAgentService", () => {
         });
       },
     );
+  });
+
+  describe("a client that goes away before its response finishes", () => {
+    /** Starts a request on `res`, answering the key it was registered under. */
+    const startOn = (res: unknown) => {
+      const als = new AsyncLocalStorage<Map<string, any>>();
+      const registry = new OperationTraceRegistry(als as never, false);
+      const service = new HttpObserveAgentService(
+        {} as HttpAdapterHost,
+        als,
+        {
+          traceIdKey: "traceId",
+          traceIdGenerator: () => "trace-1",
+          http: {},
+        } as unknown as ObserveModuleOptionsWithDefaults,
+        registry,
+        {} as ObserveAgentSharedBuffer,
+        { shouldCapture: () => true } as unknown as TraceSamplerService,
+      );
+      let registryKey!: string;
+      service.startHttpRequestTracing(
+        { url: "/upload", method: "POST", protocol: "http" },
+        res,
+        () => {
+          registryKey = als.getStore()!.get(TRACE_REGISTRY_KEY);
+        },
+      );
+      return { registry, registryKey };
+    };
+
+    /** A Node response, as Express and the Node adapter hand it over. */
+    const nodeResponse = (writableFinished: boolean | undefined) =>
+      Object.assign(new EventEmitter(), { writableFinished });
+
+    it.each([
+      ["Express or Node", (res: EventEmitter) => res],
+      // Fastify hands the request hook its reply, and the Node response sits
+      // under it: the reply has no `on`, and nothing listened at all.
+      ["Fastify", (res: EventEmitter) => ({ raw: res })],
+    ])("drops the trace as the response closes, on %s", (_, given) => {
+      const res = nodeResponse(false);
+      const { registry, registryKey } = startOn(given(res));
+
+      res.emit("close");
+
+      // Never reported either way: held on, it was the client's to say how
+      // many such traces the process kept.
+      expect(registry.hasTrace(registryKey)).toBe(false);
+    });
+
+    it.each([
+      ["Express or Node", (res: EventEmitter) => res],
+      ["Fastify", (res: EventEmitter) => ({ raw: res })],
+    ])("keeps the trace of a response that finished, on %s", (_, given) => {
+      const res = nodeResponse(true);
+      const { registry, registryKey } = startOn(given(res));
+
+      res.emit("close");
+
+      expect(registry.hasTrace(registryKey)).toBe(true);
+    });
+
+    it("keeps the trace when the response does not say whether it finished", () => {
+      const res = nodeResponse(undefined);
+      const { registry, registryKey } = startOn(res);
+
+      res.emit("close");
+
+      expect(registry.hasTrace(registryKey)).toBe(true);
+    });
   });
 
   describe("stateful regex request ignores", () => {
