@@ -8,6 +8,7 @@ import {
 import { AsyncLocalStorage } from "async_hooks";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
+import { LogRedactor } from "../utils/log-redactor.js";
 import {
   setActiveSliceRecorder,
   SpanSliceRecorder,
@@ -764,6 +765,117 @@ describe("OperationTraceRegistry", () => {
       };
       expect(root.error).toMatchObject({ message: "captured" });
       expect(root.tags).toMatchObject({ orderId: "o-1" });
+    });
+
+    describe("captured errors past the per-trace limit", () => {
+      /** A redactor that counts what it is handed - the payload's cost. */
+      const countRedactions = () => {
+        const redactor = new LogRedactor();
+        const redact = vi.spyOn(redactor, "redactMessage");
+        registry.configureRedaction(redactor);
+        return redact;
+      };
+
+      it("builds the details of at most 20 errors captured on one span", async () => {
+        const redact = countRedactions();
+        vi.spyOn(
+          (registry as unknown as { logger: Logger }).logger,
+          "warn",
+        ).mockImplementation(() => undefined);
+        startRequest("e-many");
+        const spanId = registry.internalStartTraceStep(
+          "e-many",
+          "ImportService",
+          "import",
+          undefined,
+        );
+
+        // A handler reporting each rejected row of a client's list: every
+        // payload redacted the whole message and stack, and all but the last
+        // were thrown away by the next.
+        for (let row = 0; row < 1_000; row++) {
+          registry.captureError(
+            "e-many",
+            spanId,
+            new Error(`row ${row} rejected`),
+            { row },
+          );
+        }
+        registry.internalEndTraceStep(
+          "e-many",
+          spanId,
+          "ImportService",
+          "import",
+          spanId,
+        );
+        registry.endTrace("e-many");
+
+        // Message and stack, for 20 errors.
+        expect(redact).toHaveBeenCalledTimes(40);
+        const snapshot = await registry.pluckSnapshot("e-many");
+        const root = snapshot!.traces[0] as {
+          error?: { message: string };
+          tags?: Record<string, unknown>;
+        };
+        expect(root.error).toMatchObject({ message: "row 19 rejected" });
+        // Tags still merge past the limit.
+        expect(root.tags).toMatchObject({ row: 999 });
+        expect(snapshot).not.toHaveProperty("capturedErrors");
+      });
+
+      it("marks a span captured past the limit as failed, without its details", async () => {
+        const redact = countRedactions();
+        const warn = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+          .mockImplementation(() => undefined);
+        startRequest("e-spans");
+        const root = registry.internalStartTraceStep(
+          "e-spans",
+          "ImportService",
+          "import",
+          undefined,
+        );
+        for (let row = 0; row < 25; row++) {
+          const spanId = registry.internalStartTraceStep(
+            "e-spans",
+            "ImportService",
+            "importRow",
+            root,
+          );
+          registry.captureError(
+            "e-spans",
+            spanId,
+            new Error(`row ${row} rejected`),
+            {},
+          );
+          registry.internalEndTraceStep(
+            "e-spans",
+            spanId,
+            "ImportService",
+            "importRow",
+            spanId,
+          );
+        }
+        registry.internalEndTraceStep(
+          "e-spans",
+          root,
+          "ImportService",
+          "import",
+          root,
+        );
+        registry.endTrace("e-spans");
+
+        expect(redact).toHaveBeenCalledTimes(40);
+        expect(warn).toHaveBeenCalledOnce();
+        const snapshot = await registry.pluckSnapshot("e-spans");
+        const rows = (
+          snapshot!.traces[0] as { children: Array<{ error?: unknown }> }
+        ).children;
+        expect(rows).toHaveLength(25);
+        expect(rows[19].error).toMatchObject({ message: "row 19 rejected" });
+        expect(rows[20].error).toBe(true);
+        expect(rows[24].error).toBe(true);
+      });
     });
 
     it("ignores a capture against an unknown trace", () => {

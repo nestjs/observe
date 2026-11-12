@@ -89,7 +89,25 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    * ran.
    */
   keptWithoutSpans?: true;
+  /**
+   * How many errors `captureError` has recorded in full for this operation -
+   * see `MAX_CAPTURED_ERRORS_PER_TRACE`. Absent until the first.
+   */
+  capturedErrors?: number;
 };
+
+/**
+ * Most errors `captureError` records in full for one operation, as many as
+ * repeated siblings it takes to collapse a group (`spanCollapse.threshold`).
+ *
+ * Building a payload redacts the whole message and the whole stack, which
+ * repeats the message, so a handler reporting each rejected row of a client's
+ * list paid rows x message length on the request thread - seconds for one
+ * 100 kB body - and, captured on a span per row, kept every payload until the
+ * flush. Past the limit a span is still marked as failed and its tags still
+ * merge; it only goes without the details.
+ */
+const MAX_CAPTURED_ERRORS_PER_TRACE = 20;
 
 /**
  * An error the business logic did not model. `IntrinsicException` is what Nest
@@ -185,6 +203,8 @@ export class OperationTraceRegistry {
   private hasReportedMissingInstrumentation = false;
   /** See `reportSpanDepthLimit`. */
   private hasReportedSpanDepthLimit = false;
+  /** See `reportCapturedErrorLimit`. */
+  private hasReportedCapturedErrorLimit = false;
   /**
    * Applied to every tree as it is plucked. Defaults are live from
    * construction rather than waiting for `configureSpanCollapse`, so a
@@ -911,7 +931,29 @@ export class OperationTraceRegistry {
     // Merge tags
     Object.assign(targetSpan.tags, tags);
 
+    const captured = snapshot.capturedErrors ?? 0;
+    if (captured >= MAX_CAPTURED_ERRORS_PER_TRACE) {
+      // A span that already holds the details of one keeps them.
+      targetSpan.error ??= true;
+      this.reportCapturedErrorLimit(reportedTraceId);
+      return;
+    }
+    snapshot.capturedErrors = captured + 1;
     targetSpan.error = this.toErrorPayload(error);
+  }
+
+  /**
+   * Once for the process: the operation that gets here does so on every
+   * request it is given the same input.
+   */
+  private reportCapturedErrorLimit(reportedTraceId: string): void {
+    if (this.hasReportedCapturedErrorLimit) {
+      return;
+    }
+    this.hasReportedCapturedErrorLimit = true;
+    this.logger.warn(
+      `Trace "${reportedTraceId}" captured more than ${MAX_CAPTURED_ERRORS_PER_TRACE} errors; the spans of later ones are marked as failed, without the error's details. Later traces past this limit are not reported.`,
+    );
   }
 
   /**
@@ -986,7 +1028,7 @@ export class OperationTraceRegistry {
       }
       cleanup();
 
-      // These five are what distinguish the registry's working copy from the
+      // These six are what distinguish the registry's working copy from the
       // snapshot the API receives, so removing them is the hand-off.
       const bookkeeping = snapshot as Partial<SnapshotWithSignal>;
       const customOperationId = bookkeeping.customOperationId;
@@ -995,6 +1037,7 @@ export class OperationTraceRegistry {
       delete bookkeeping.errorStatusCode;
       delete bookkeeping.customOperationId;
       delete bookkeeping.keptWithoutSpans;
+      delete bookkeeping.capturedErrors;
 
       // Before `skipSpans`, which judges the operation by the name it is
       // reported under.
