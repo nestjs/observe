@@ -27,6 +27,10 @@ import { patchMssql } from "./mssql.integration.js";
 import { patchMysql2 } from "./mysql2.integration.js";
 import { OutgoingSpanRecorder } from "./outgoing-span.recorder.js";
 import { patchPg } from "./pg.integration.js";
+import {
+  patchUndiciDispatch,
+  patchUndiciUnwrap,
+} from "./undici.integration.js";
 
 /**
  * Spans for what leaves the process: database queries and outbound HTTP.
@@ -147,6 +151,23 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     }
 
     if (outgoing?.http !== false) {
+      // undici creates a request, and publishes the channel read below, in
+      // whatever context the dispatch that hands it to a client runs in -
+      // for a queued pool request or a followed redirect, another request's.
+      // Loaded by deep path: undici's entry point would install its own
+      // `Agent` as the global `fetch` dispatcher.
+      this.patchDriver(
+        "undici",
+        "undici/lib/dispatcher/dispatcher-base",
+        [],
+        patchUndiciDispatch,
+      );
+      this.patchDriver(
+        "undici",
+        "undici/lib/handler/unwrap-handler",
+        [],
+        patchUndiciUnwrap,
+      );
       const http = typeof outgoing?.http === "object" ? outgoing.http : {};
       this.unsubscribeHttp = subscribeOutgoingHttp(
         recorder,

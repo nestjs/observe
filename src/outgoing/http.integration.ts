@@ -87,12 +87,14 @@ interface NodeClientRequest {
 /**
  * Spans for outbound HTTP, from the diagnostics channels Node publishes on its
  * own: `undici` - which is also what the global `fetch` runs on - and the
- * `node:http` client that axios, got and most SDKs sit on. Nothing is patched,
- * so there is no HTTP client to keep up with.
+ * `node:http` client that axios, got and most SDKs sit on. No HTTP client is
+ * patched, so there is none to keep up with.
  *
  * The handlers run synchronously inside the call that makes the request, which
  * is what puts the span under the right parent; the span is then carried to
- * the completion events on the request object itself.
+ * the completion events on the request object itself. An undici request a
+ * pool queued, or a redirect it follows, is created later, from a socket's
+ * events: `patchUndiciDispatch` puts it back in its caller's context first.
  *
  * Returns the function that removes every subscription.
  */
