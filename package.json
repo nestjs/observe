@@ -1,6 +1,6 @@
 {
   "name": "@nestjs/observe",
-  "version": "0.3.25",
+  "version": "0.3.26",
   "description": "Observability and APM agent for NestJS - traces, runtime metrics and custom metrics",
   "author": "Kamil Mysliwiec",
   "homepage": "https://observe.nestjs.com",
