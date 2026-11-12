@@ -403,7 +403,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const blocklist = this.options.http.ignore;
       return blocklist.some((item) => {
         if (typeof item === "string") {
-          return req.url === item;
+          return matchesPath(item, req.url);
         }
         if (item instanceof RegExp) {
           return testIgnoreRegex(item, req.url);
@@ -412,7 +412,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           return (
             item.method === req.method &&
             (typeof item.path === "string"
-              ? req.url === item.path
+              ? matchesPath(item.path, req.url)
               : testIgnoreRegex(item.path, req.url))
           );
         }
@@ -422,6 +422,27 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     }
     return false;
   }
+}
+
+/**
+ * Whether a string entry of `http.ignore` names this request: the URL itself,
+ * or its path - the URL up to a `?` or `#`. `req.url` carries the query string
+ * on every adapter, so compared whole, an endpoint that takes its input there
+ * was never ignored, and `/health` was traced whenever a caller added one. An
+ * entry written with a query string still matches that URL exactly. Read in
+ * place, without cutting the URL, as this runs for every request.
+ */
+function matchesPath(literal: string, url: string): boolean {
+  if (url === literal) {
+    return true;
+  }
+  const next = url[literal.length];
+  return (
+    (next === "?" || next === "#") &&
+    url.startsWith(literal) &&
+    !literal.includes("?") &&
+    !literal.includes("#")
+  );
 }
 
 /**

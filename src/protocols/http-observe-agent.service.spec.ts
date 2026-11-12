@@ -686,6 +686,44 @@ describe("HttpObserveAgentService", () => {
     });
   });
 
+  describe("a string request ignore", () => {
+    const shouldIgnore = (
+      ignore: NonNullable<ObserveModuleOptionsWithDefaults["http"]>["ignore"],
+      url: string,
+      method = "GET",
+    ) =>
+      (
+        createService({ ignore }) as unknown as {
+          shouldIgnoreRequest: (req: {
+            url: string;
+            method: string;
+          }) => boolean;
+        }
+      ).shouldIgnoreRequest({ url, method });
+
+    it.each([
+      "/account/recover?email=a%40b.c",
+      "/account/recover?",
+      "/account/recover#x",
+    ])("matches the path of %s, not the whole URL", (url) => {
+      // `req.url` carries the query string on every adapter: an endpoint
+      // that takes its input there was never ignored at all.
+      expect(shouldIgnore(["/account/recover"], url)).toBe(true);
+      expect(
+        shouldIgnore([{ method: "GET", path: "/account/recover" }], url),
+      ).toBe(true);
+    });
+
+    it("still matches an entry written with its query string, and nothing else", () => {
+      expect(shouldIgnore(["/health?full=1"], "/health?full=1")).toBe(true);
+      expect(shouldIgnore(["/health"], "/healthz")).toBe(false);
+      expect(shouldIgnore(["/health"], "/health/deep")).toBe(false);
+      expect(
+        shouldIgnore([{ method: "POST", path: "/health" }], "/health?x"),
+      ).toBe(false);
+    });
+  });
+
   describe("stateful regex request ignores", () => {
     it.each([
       ["global direct regex", "g", false],
