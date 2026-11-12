@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { OutgoingSpanRecorder } from "./outgoing-span.recorder.js";
 import { patchMethod } from "./patch-method.util.js";
 import { describeSqlStatement } from "./sql-statement.util.js";
@@ -36,6 +37,13 @@ export function patchMysql2(
       if (typeof first === "object" && first?.[SPANNED]) {
         return original.apply(this, args);
       }
+      const last = args.length - 1;
+      // mysql2 answers from the connection's socket, whose events fire in the
+      // context of the call that opened it - another request's. Bound first,
+      // so a call that is not recorded keeps its own context too.
+      if (typeof args[last] === "function") {
+        args[last] = AsyncResource.bind(args[last]);
+      }
       const sql = typeof first === "string" ? first : first?.sql;
       if (typeof sql !== "string") {
         return original.apply(this, args);
@@ -55,7 +63,6 @@ export function patchMysql2(
       // connection's `execute` reports a failed prepare to the callback it
       // was given, whatever `onResult` has been replaced with since.
       let hasCallback = false;
-      const last = args.length - 1;
       if (typeof args[last] === "function") {
         const callback = args[last];
         hasCallback = true;
@@ -105,5 +112,19 @@ export function patchMysql2(
     patchMethod(mysql2.Connection?.prototype, method, wrap),
     patchMethod(mysql2.Pool?.prototype, method, wrap),
   ]);
+  // A queued checkout is handed its connection on a tick scheduled by
+  // whichever call releases one: bound, it runs where it was asked for -
+  // under the pool's span and its cover, or under no trace at all.
+  patchMethod(
+    mysql2.Pool?.prototype,
+    "getConnection",
+    (original) =>
+      function (this: unknown, ...args: any[]) {
+        if (typeof args[0] === "function") {
+          args[0] = AsyncResource.bind(args[0]);
+        }
+        return original.apply(this, args);
+      },
+  );
   return patched.some(Boolean);
 }

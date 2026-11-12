@@ -1,8 +1,10 @@
+import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
 import { describeMongoCommand, patchMongodb } from "./mongodb.integration.js";
 import { patchMysql2 } from "./mysql2.integration.js";
 import { OutgoingSpanRecorder } from "./outgoing-span.recorder.js";
 import { patchMethod } from "./patch-method.util.js";
+import { patchPg } from "./pg.integration.js";
 
 /** A recorder that opens a span for every call and remembers how it ended. */
 const fakeRecorder = () => {
@@ -183,6 +185,167 @@ describe("patchMysql2", () => {
     expect(commands[0].listenerCount("error")).toBe(0);
     commands[0].emit("end");
     expect(spans[0].ended).toBe(1);
+  });
+});
+
+/**
+ * A recorder whose `cover` is the real thing, an async context, and which
+ * opens spans only where `record` says - so a callback that runs in another
+ * request's context shows, and so does a checkout that loses the cover.
+ */
+const contextRecorder = (record = true) => {
+  const covered = new AsyncLocalStorage<true>();
+  const spans: Array<{ methodKey: string; ended: number }> = [];
+  const recorder = {
+    open: (_className: string, methodKey: string) => {
+      if (!record || covered.getStore()) {
+        return undefined;
+      }
+      const span = { methodKey, ended: 0 };
+      spans.push(span);
+      return { end: () => (span.ended += 1) };
+    },
+    cover: <T>(fn: () => T) => covered.run(true, fn),
+    endWhenSettled: OutgoingSpanRecorder.prototype.endWhenSettled,
+  } as unknown as OutgoingSpanRecorder;
+  return { recorder, spans };
+};
+
+/** Whose request a callback runs in, as the application's own stores see it. */
+const request = new AsyncLocalStorage<string>();
+
+describe("patchPg", () => {
+  /**
+   * pg's shape: a client answers from its socket, and a pool hands a queued
+   * checkout over from whichever call releases a client.
+   */
+  const fakePg = () => {
+    const answers: Array<() => void> = [];
+    const pending: Array<(error: unknown, client: unknown) => void> = [];
+    class Client {
+      query(_text: unknown, _values: unknown, callback: any) {
+        answers.push(() => callback(null, { rows: [] }));
+      }
+    }
+    class Pool {
+      client = new Client();
+      connect(callback: (error: unknown, client: unknown) => void) {
+        pending.push(callback);
+      }
+      query(text: unknown, values: unknown, callback: any) {
+        this.connect((_error, client: any) =>
+          client.query(text, values, callback),
+        );
+      }
+      release() {
+        pending.shift()?.(null, this.client);
+      }
+    }
+    return { module: { Client, Pool }, answers };
+  };
+
+  it.each([true, false])(
+    "runs a query callback in its caller's context, recorded=%s",
+    (record) => {
+      const { module, answers } = fakePg();
+      patchPg(module, contextRecorder(record).recorder);
+      let seen: string | undefined;
+
+      request.run("caller", () =>
+        new module.Client().query("SELECT 1", [], () => {
+          seen = request.getStore();
+        }),
+      );
+      request.run("socket", () => answers.shift()!());
+
+      expect(seen).toBe("caller");
+    },
+  );
+
+  it("hands a queued checkout to the caller's context, where the pool's span covers it", () => {
+    const { module, answers } = fakePg();
+    const { recorder, spans } = contextRecorder();
+    patchPg(module, recorder);
+    const pool = new module.Pool();
+    let seen: string | undefined;
+
+    request.run("caller", () =>
+      pool.query("SELECT * FROM products", [], () => {
+        seen = request.getStore();
+      }),
+    );
+    request.run("releaser", () => pool.release());
+    request.run("socket", () => answers.shift()!());
+
+    expect(spans).toEqual([{ methodKey: "SELECT products", ended: 1 }]);
+    expect(seen).toBe("caller");
+  });
+});
+
+describe("patchMysql2 async context", () => {
+  /** mysql2's shape, with the pool's checkout queue. */
+  const fakeMysql2 = () => {
+    const commands: any[] = [];
+    const pending: Array<(error: unknown, connection: unknown) => void> = [];
+    class Connection {
+      execute(sql: unknown, _values: unknown, callback: any) {
+        const command = { sql, onResult: callback };
+        commands.push(command);
+        return command;
+      }
+    }
+    class Pool {
+      connection = new Connection();
+      getConnection(callback: (error: unknown, connection: unknown) => void) {
+        pending.push(callback);
+      }
+      execute(sql: string, values: unknown, callback: any) {
+        this.getConnection((_error, connection: any) =>
+          connection.execute(sql, values, callback),
+        );
+      }
+      release() {
+        pending.shift()?.(null, this.connection);
+      }
+    }
+    return { module: { Connection, Pool }, commands };
+  };
+
+  it.each([true, false])(
+    "runs a query callback in its caller's context, recorded=%s",
+    (record) => {
+      const { module, commands } = fakeMysql2();
+      patchMysql2(module, contextRecorder(record).recorder);
+      let seen: string | undefined;
+
+      request.run("caller", () =>
+        new module.Connection().execute("SELECT 1", [], () => {
+          seen = request.getStore();
+        }),
+      );
+      request.run("socket", () => commands[0].onResult(null, []));
+
+      expect(seen).toBe("caller");
+    },
+  );
+
+  it("hands a queued checkout to the caller's context, where the pool's span covers it", () => {
+    const { module, commands } = fakeMysql2();
+    const { recorder, spans } = contextRecorder();
+    patchMysql2(module, recorder);
+    const pool = new module.Pool();
+    let seen: string | undefined;
+
+    request.run("caller", () =>
+      pool.execute("INSERT INTO subscribers (email) VALUES (?)", [], () => {
+        seen = request.getStore();
+      }),
+    );
+    request.run("releaser", () => pool.release());
+    request.run("socket", () => commands[0].onResult(null, []));
+
+    expect(spans).toEqual([{ methodKey: "INSERT subscribers", ended: 1 }]);
+    expect(seen).toBe("caller");
   });
 });
 
