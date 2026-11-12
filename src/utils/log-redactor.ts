@@ -246,6 +246,10 @@ function keyValueRule(
   };
   return {
     scan: (text, mask) => {
+      // Most lines name no credential at all; they are passed over whole.
+      if (!checkEveryKey && !KEY_STEMS.test(text)) {
+        return text;
+      }
       const candidate = new RegExp(KEY_CANDIDATE.source, "g");
       let output = "";
       let copiedTo = 0;
@@ -518,7 +522,13 @@ const CARD_LAYOUTS = [
   [4, 4, 4, 1],
 ];
 
+/** Thirteen digits at least, however grouped: what any card has. */
+const MAY_HOLD_CARD = /\d(?:[ -]?\d){12}/;
+
 function scanCardNumbers(text: string, mask: (secret: string) => string) {
+  if (!MAY_HOLD_CARD.test(text)) {
+    return text;
+  }
   let output = "";
   let copiedTo = 0;
   for (const run of text.matchAll(DIGIT_RUN)) {
