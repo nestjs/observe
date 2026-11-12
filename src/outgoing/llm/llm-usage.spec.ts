@@ -43,6 +43,9 @@ describe("llmProviderForHost", () => {
   it("leaves every other host alone, unless the application names it", () => {
     expect(llmProviderForHost("api.stripe.com")).toBeUndefined();
     expect(llmProviderForHost("openai.com.evil.example")).toBeUndefined();
+    for (const inherited of ["constructor", "__proto__", "toString"]) {
+      expect(llmProviderForHost(inherited), inherited).toBeUndefined();
+    }
     const extra = new Set(["llm-gateway.internal:4000"]);
     expect(llmProviderForHost("llm-gateway.internal:4000", extra)).toBe(
       "custom",

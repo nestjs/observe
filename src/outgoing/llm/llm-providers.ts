@@ -7,21 +7,25 @@
  * same host, so a host list covers every client without knowing any of them.
  */
 
-/** Exact hosts, each with the provider name the dashboard groups by. */
-const EXACT_HOSTS: Readonly<Record<string, string>> = {
-  "api.openai.com": "openai",
-  "api.anthropic.com": "anthropic",
-  "generativelanguage.googleapis.com": "google",
-  "api.mistral.ai": "mistral",
-  "api.groq.com": "groq",
-  "openrouter.ai": "openrouter",
-  "api.together.xyz": "together",
-  "api.deepseek.com": "deepseek",
-  "api.x.ai": "xai",
-  "api.cohere.ai": "cohere",
-  "api.cohere.com": "cohere",
-  "api.perplexity.ai": "perplexity",
-};
+/**
+ * Exact hosts, each with the provider name the dashboard groups by. A `Map`,
+ * not an object literal: looked up by the host of any outgoing call, and a
+ * host spelt `constructor` or `__proto__` found an inherited member there.
+ */
+const EXACT_HOSTS: ReadonlyMap<string, string> = new Map([
+  ["api.openai.com", "openai"],
+  ["api.anthropic.com", "anthropic"],
+  ["generativelanguage.googleapis.com", "google"],
+  ["api.mistral.ai", "mistral"],
+  ["api.groq.com", "groq"],
+  ["openrouter.ai", "openrouter"],
+  ["api.together.xyz", "together"],
+  ["api.deepseek.com", "deepseek"],
+  ["api.x.ai", "xai"],
+  ["api.cohere.ai", "cohere"],
+  ["api.cohere.com", "cohere"],
+  ["api.perplexity.ai", "perplexity"],
+]);
 
 /** Hosts that carry a tenant or a region in a subdomain. */
 const HOST_PATTERNS: ReadonlyArray<[RegExp, string]> = [
@@ -38,7 +42,7 @@ export function llmProviderForHost(
 ): string | undefined {
   const normalized = host.toLowerCase();
   const hostname = normalized.replace(/:\d+$/, "");
-  const exact = EXACT_HOSTS[hostname];
+  const exact = EXACT_HOSTS.get(hostname);
   if (exact) {
     return exact;
   }
