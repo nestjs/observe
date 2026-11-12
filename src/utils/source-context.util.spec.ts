@@ -103,6 +103,33 @@ describe("collectCodeFrames with source maps", () => {
     expect(frames).toHaveLength(1);
     expect(frames![0].lines[0]).toBe("const embedded = true;");
   });
+
+  it("parses a map once, however its compiled file is spelt", () => {
+    // A frame's path comes off a stack, which a driver can copy from a
+    // server's reply: `/app/dist/./main.js`, `/app/dist/././main.js`, ... are
+    // one file, and each spelling held a parsed copy of its map.
+    const compiled = compile("spelt", "./main.ts", ["const first = 1;\n"]);
+    // Built by hand: `join` would fold the dots away.
+    const spelt = (dots: number) =>
+      `${join(inside, "spelt")}${"/.".repeat(dots)}/main.js`;
+
+    const first = collectCodeFrames(stackAt(spelt(1)), { sourceMaps: true });
+    // Rewritten on disk: a spelling that parses the map again reads this.
+    writeFileSync(
+      `${compiled}.map`,
+      JSON.stringify({
+        version: 3,
+        sources: ["./main.ts"],
+        names: [],
+        mappings: "AAAA",
+        sourcesContent: ["const second = 2;\n"],
+      }),
+    );
+    const second = collectCodeFrames(stackAt(spelt(2)), { sourceMaps: true });
+
+    expect(first?.[0].lines[0]).toBe("const first = 1;");
+    expect(second?.[0].lines[0]).toBe("const first = 1;");
+  });
 });
 
 /**
@@ -265,6 +292,30 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
 
     expect(performance.now() - startedAt).toBeLessThan(250);
     expect(files(frames)).toEqual(["secrets.js"]);
+  });
+
+  it("reads a file once, however its frame spells it", () => {
+    // Every spelling of one file - dot segments, a directory link inside the
+    // application - held a full copy of it, read and split again.
+    const file = join(inside, "spelt.js");
+    writeFileSync(file, "const first = 1;\n");
+    const linked = join(inside, "linked");
+    symlinkSync(inside, linked);
+    const read = (path: string) =>
+      collectCodeFrames(`Error: boom\n    at run (${path}:1:1)`, {
+        message: "boom",
+      })?.[0];
+
+    const first = read(`${inside}/./spelt.js`);
+    // Rewritten on disk: a spelling that reads the file again sees this.
+    writeFileSync(file, "const second = 2;\n");
+
+    expect(first?.lines[0]).toBe("const first = 1;");
+    expect(read(`${inside}/././spelt.js`)?.lines[0]).toBe("const first = 1;");
+    expect(read(file)?.lines[0]).toBe("const first = 1;");
+    expect(read(join(linked, "spelt.js"))?.lines[0]).toBe("const first = 1;");
+    // Each frame is still reported as it was written.
+    expect(first?.file).toBe(`${inside}/./spelt.js`);
   });
 
   it("does not follow a symlink out of the working directory", () => {

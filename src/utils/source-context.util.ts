@@ -95,7 +95,15 @@ const MAX_FRAME_LINE_LENGTH = 1024;
 const MAX_FRAME_LINES = 100;
 
 interface ParsedFrame {
+  /** As the frame spelt it, which is what a code frame reports. */
   file: string;
+  /**
+   * The same file, resolved, which is what it is looked up by. A frame's path
+   * is copied off a stack that a driver can take from a server's reply, and
+   * `/app/dist/./main.js`, `/app/dist/././main.js`, ... each held a copy of
+   * the whole file - and of its parsed source map - in caches keyed by spelling.
+   */
+  path: string;
   line: number;
   column: number;
 }
@@ -203,7 +211,7 @@ function frameLines(stack: string, message: string | undefined): string[] {
  * with no position quadratic to reject - seconds of event loop for a 100KB
  * line, and the line came from whoever wrote the error message.
  */
-function parseFrameLine(raw: string): ParsedFrame | undefined {
+function parseFrameLine(raw: string): Omit<ParsedFrame, "path"> | undefined {
   if (raw.length > MAX_FRAME_LINE_LENGTH) {
     return undefined;
   }
@@ -283,12 +291,23 @@ function parseFrames(
       continue;
     }
 
-    frames.push({ file, line, column });
+    frames.push({ file, path: resolve(file), line, column });
   }
 
   return frames;
 }
 
+function rememberSource(file: string, lines: string[] | null): void {
+  if (sourceCache.size >= MAX_CACHED_FILES) {
+    const oldest = sourceCache.keys().next().value;
+    if (oldest !== undefined) {
+      sourceCache.delete(oldest);
+    }
+  }
+  sourceCache.set(file, lines);
+}
+
+/** The lines of `file`, a resolved path. */
 function readSource(file: string): string[] | null {
   if (sourceCache.has(file)) {
     return sourceCache.get(file)!;
@@ -302,8 +321,17 @@ function readSource(file: string): string[] | null {
     // resolved path has to clear the same gate. The root is resolved too: a
     // working directory reached through a link is otherwise outside itself.
     const real = realpathSync(file);
-    if (isReadableSourcePath(real, realpathSync(process.cwd()))) {
+    if (real !== file && sourceCache.has(real)) {
+      // Another name for a file already read - a directory link inside the
+      // application, which can even lead back to where it sits and so spell
+      // one file endlessly. It shares that file's lines rather than holding
+      // a copy of its own.
+      lines = sourceCache.get(real)!;
+    } else if (isReadableSourcePath(real, realpathSync(process.cwd()))) {
       lines = readFileSync(real, "utf8").split("\n");
+      if (real !== file) {
+        rememberSource(real, lines);
+      }
     }
   } catch {
     // Unreadable for any reason - bundled away, permissions, deleted since
@@ -311,13 +339,7 @@ function readSource(file: string): string[] | null {
     lines = null;
   }
 
-  if (sourceCache.size >= MAX_CACHED_FILES) {
-    const oldest = sourceCache.keys().next().value;
-    if (oldest !== undefined) {
-      sourceCache.delete(oldest);
-    }
-  }
-  sourceCache.set(file, lines);
+  rememberSource(file, lines);
   return lines;
 }
 
@@ -386,12 +408,13 @@ export function collectCodeFrames(
 
     for (const frame of frames) {
       let file = frame.file;
+      let path = frame.path;
       let line = frame.line;
       let source: string[] | null = null;
 
       if (options.sourceMaps) {
         const original = resolveOriginalPosition(
-          frame.file,
+          frame.path,
           frame.line,
           frame.column,
         );
@@ -410,6 +433,7 @@ export function collectCodeFrames(
             continue;
           }
           file = original.file;
+          path = resolve(original.file);
           line = original.line;
           // Prefer the map's embedded copy - it is the source this build was
           // compiled from, and it works when the source tree is not deployed.
@@ -417,7 +441,7 @@ export function collectCodeFrames(
         }
       }
 
-      source ??= readSource(file);
+      source ??= readSource(path);
       if (!source) {
         continue;
       }
