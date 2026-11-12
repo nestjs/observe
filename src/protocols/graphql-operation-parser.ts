@@ -204,14 +204,30 @@ function toOperation(
   if (!rootTypeName) {
     return undefined;
   }
+  const operationName = words[0] ? words[1] : undefined;
+  // Whitespace is collapsed only here, at the end: `source` positions have to
+  // stay valid while the scan is still reading from it.
+  const sanitizedDocument = truncate(source.replace(/\s+/g, " ").trim());
+  // All three are cut from a string the size of the document, and V8 makes a
+  // cut a view that keeps the whole string it was cut from in memory. They
+  // outlive the request, on its trace until the batch is flushed, so past
+  // what the trace records they are copied out: a 100 kB document whose 8 kB
+  // the trace sent kept the 100 kB, twice over.
+  if (source.length <= MAX_SANITIZED_DOCUMENT_LENGTH) {
+    return { rootTypeName, fieldName, operationName, sanitizedDocument };
+  }
   return {
     rootTypeName,
-    fieldName,
-    operationName: words[0] ? words[1] : undefined,
-    // Whitespace is collapsed only here, at the end: `source` positions have to
-    // stay valid while the scan is still reading from it.
-    sanitizedDocument: truncate(source.replace(/\s+/g, " ").trim()),
+    fieldName: ownCopy(fieldName),
+    operationName:
+      operationName === undefined ? undefined : ownCopy(operationName),
+    sanitizedDocument: ownCopy(sanitizedDocument),
   };
+}
+
+/** The same code units, lone surrogates included, in storage of their own. */
+function ownCopy(value: string): string {
+  return Buffer.from(value, "utf16le").toString("utf16le");
 }
 
 function truncate(document: string): string {

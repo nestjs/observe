@@ -1,6 +1,9 @@
+import { setFlagsFromString } from "v8";
+import { runInNewContext } from "vm";
 import {
   clearGraphQLOperationCache,
   graphQLOperationCacheSize,
+  ParsedGraphQLOperation,
   parseGraphQLOperation,
   toResolveInfoLike,
 } from "./graphql-operation-parser.js";
@@ -279,6 +282,47 @@ describe("parseGraphQLOperation", () => {
       expect(recorded.length).toBe(8 * 1024);
       expect(recorded.endsWith("... [truncated by observe]")).toBe(true);
       expect(recorded.startsWith("{ orders { f0 f1")).toBe(true);
+    });
+  });
+
+  describe("what a parsed document keeps alive", () => {
+    /** Live heap after a full collection, in bytes. */
+    const liveHeap = () => {
+      setFlagsFromString("--expose-gc");
+      const gc = runInNewContext("gc") as () => void;
+      gc();
+      gc();
+      return process.memoryUsage().heapUsed;
+    };
+
+    /** Parses distinct documents, none of them kept but by what is returned. */
+    const parseLargeDocuments = (count: number, size: number) => {
+      const results: Array<ParsedGraphQLOperation | undefined> = [];
+      for (let i = 0; i < count; i++) {
+        const fields = `f${i} `.repeat(size / (`${i}`.length + 2));
+        results.push(
+          parseGraphQLOperation(
+            `query Operation${i}WithALongName { ordersWithALongName${i} { ${fields} } }`,
+          ),
+        );
+      }
+      return results;
+    };
+
+    it("keeps no more of a document past the cache's size than it records", () => {
+      // A buffered trace holds what is returned until its batch is flushed.
+      // A slice of a string is a view that keeps all of it in memory: an
+      // 8 kB slice of a 100 kB document kept the 100 kB.
+      const before = liveHeap();
+
+      const results = parseLargeDocuments(40, 100_000);
+      const held = liveHeap() - before;
+
+      expect(results.every((result) => result?.sanitizedDocument)).toBe(true);
+      expect(results[39]?.fieldName).toBe("ordersWithALongName39");
+      expect(results[39]?.operationName).toBe("Operation39WithALongName");
+      // 40 recorded documents of 8 kB each, and change; not 40 of 100 kB.
+      expect(held).toBeLessThan(1_500_000);
     });
   });
 
