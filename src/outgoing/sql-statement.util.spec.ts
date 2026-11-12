@@ -211,6 +211,23 @@ describe("describeSqlStatement for Postgres", () => {
     ["SELECT /* outer /* inner */ 1", "SELECT"],
     ["SELECT 5 # 3, 1_000_000, 0o17", "SELECT ? # ?, ?, ?"],
     ["SELECT a$b$c, $1 FROM t", "SELECT a$b$c, $1 FROM t"],
+    // A tag is a letter, `_` or non-ASCII character, then any of those or
+    // digits.
+    [
+      "INSERT INTO notes (body) VALUES ($q1$secret note$q1$)",
+      "INSERT INTO notes (body) VALUES (?)",
+    ],
+    [
+      "SELECT $body_2$it's secret$body_2$ FROM t WHERE b = 'secret-value'",
+      "SELECT ? FROM t WHERE b = ?",
+    ],
+    [
+      "SELECT $_1$secret$_1$, $é$secret$é$, $tag_ü9$secret$tag_ü9$",
+      "SELECT ?, ?, ?",
+    ],
+    ["SELECT $q1$a $q$ b $q11$ secret$q1$ FROM t", "SELECT ? FROM t"],
+    ["SELECT $q1$secret 'value", "SELECT ?"],
+    ["SELECT $1, $2 FROM t WHERE a = $3", "SELECT $1, $2 FROM t WHERE a = $3"],
   ])("%s", (sql, statement) => {
     expect(describeSqlStatement(sql, "postgresql").statement).toBe(statement);
   });

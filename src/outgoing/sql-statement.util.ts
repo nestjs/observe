@@ -114,7 +114,9 @@ export type SqlDialect = "postgresql" | "mysql";
  *
  * Postgres quotes names in `"`. A plain string takes a backslash as it is and
  * an `E'...'` string as an escape. A dollar quote opens only where a token
- * can start - Postgres reads `a$b$` as one name - and block comments nest, so
+ * can start - Postgres reads `a$b$` as one name - and its tag is empty, or a
+ * letter, `_` or non-ASCII character followed by any of those or digits, so
+ * `$q1$` opens one and `$1` stays a placeholder. Block comments nest, so
  * `/*` is matched alone and its end found by hand.
  *
  * MySQL quotes strings in `"` as well as `'`, as its default sql_mode does
@@ -126,7 +128,7 @@ export type SqlDialect = "postgresql" | "mysql";
  */
 const TOKEN: Record<SqlDialect, RegExp> = {
   postgresql:
-    /(?<nested>\/\*)|(?<comment>--[^\n]*)|(?<name>"(?:[^"]|"")*(?:"|$)|`(?:[^`]|``)*(?:`|$))|(?<![\w$])(?<escape>[eE])'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|(?<plain>'(?:[^']|'')*(?:'|$))|(?<!\w)\$(?<tag>[A-Za-z_]*)\$[\s\S]*?(?:\$\k<tag>\$|$)/g,
+    /(?<nested>\/\*)|(?<comment>--[^\n]*)|(?<name>"(?:[^"]|"")*(?:"|$)|`(?:[^`]|``)*(?:`|$))|(?<![\w$])(?<escape>[eE])'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|(?<plain>'(?:[^']|'')*(?:'|$))|(?<!\w)\$(?<tag>(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?)\$[\s\S]*?(?:\$\k<tag>\$|$)/g,
   mysql:
     // eslint-disable-next-line no-control-regex -- MySQL's rule for `--`.
     /(?<comment>\/\*[\s\S]*?(?:\*\/|$)|--(?=[\u0000-\u0020\u007f]|$)[^\n]*|#[^\n]*)|(?<name>`(?:[^`]|``)*(?:`|$))|(?<plain>'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|"(?:[^"\\]|\\[\s\S]?|"")*(?:"|$))/g,
