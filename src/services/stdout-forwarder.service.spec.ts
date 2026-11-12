@@ -162,7 +162,59 @@ describe("StdoutForwarderService", () => {
       write(service, "x".repeat(9 * 1024));
 
       expect(buffer.entries).toHaveLength(1);
-      expect(buffer.entries[0].text.length).toBeGreaterThan(8 * 1024);
+      // At least what the buffer keeps of an entry. The last 4 KB are only
+      // shown to the redactor - see the next cases.
+      expect(buffer.entries[0].text.length).toBeGreaterThanOrEqual(4 * 1024);
+    });
+
+    describe("a line cut at the cap", () => {
+      it("sends nothing of a secret whose value the cut held back", () => {
+        const service = build();
+
+        // A streamed reply printed piece by piece: the cap falls right after
+        // `password=`. Forwarded as a line of its own, the rest of it began
+        // with the whole password.
+        write(service, "x".repeat(8190) + " password=");
+        write(service, "hunter2secret and more\n");
+
+        expect(JSON.stringify(buffer.entries)).not.toContain("hunter2");
+      });
+
+      it("sends nothing of a secret the cut split", () => {
+        const service = build();
+
+        write(service, `${"a".repeat(8180)} apiKey="c0ffeec0ffee`);
+        write(service, 'c0ffee" done\n');
+
+        expect(buffer.entries.length).toBeGreaterThan(0);
+        expect(JSON.stringify(buffer.entries)).not.toContain("c0ffee");
+      });
+
+      it("drops the rest of that line, then forwards the next as usual", () => {
+        const service = build();
+
+        write(service, "y".repeat(9 * 1024));
+        write(service, "z".repeat(100));
+        write(service, "zz\nnext line\n");
+
+        expect(buffer.entries.map((entry) => entry.text[0])).toEqual([
+          "y",
+          "n",
+        ]);
+        expect(buffer.entries[1].text).toBe("next line");
+      });
+
+      it("keeps a stream's cut line apart from the other stream", () => {
+        const service = build();
+
+        write(service, "y".repeat(9 * 1024), "stdout");
+        write(service, "on stderr\n", "stderr");
+
+        expect(buffer.entries.map((entry) => entry.text.slice(0, 9))).toEqual([
+          "yyyyyyyyy",
+          "on stderr",
+        ]);
+      });
     });
   });
 

@@ -248,6 +248,21 @@ describe("parseLogLine", () => {
     });
   });
 
+  describe("format", () => {
+    it("says what a line was read as", () => {
+      expect(parseLogLine('{"level":"info","message":"ready"}').format).toBe(
+        "json",
+      );
+      expect(
+        parseLogLine("[Nest] 1  - 07/29/2026, 10:42:18 AM     LOG ready")
+          .format,
+      ).toBe("nest");
+      expect(parseLogLine("    at main (main.ts:4:9)").format).toBe("plain");
+      // JSON, but not a log record: the text path has it.
+      expect(parseLogLine('{"status":"ok"}').format).toBe("plain");
+    });
+  });
+
   describe("ANSI handling", () => {
     it("strips colour codes", () => {
       expect(stripAnsi("[32mgreen[39m")).toBe("green");

@@ -21,6 +21,13 @@ export interface ParsedLogLine {
   message: string;
   traceId?: string;
   attributes?: Record<string, unknown>;
+  /**
+   * What the line was read as: a record of a JSON logger, a line carrying
+   * Nest's text prefix, or neither. A JSON record is always a whole message;
+   * a `plain` line may be the rest of a message whose prefix was on the line
+   * above it.
+   */
+  format: "json" | "nest" | "plain";
 }
 /**
  * CSI escape sequences - colour codes and cursor moves. Narrower than a
@@ -100,7 +107,10 @@ export function stripAnsi(value: string): string {
 export function parseLogLine(line: string): ParsedLogLine {
   const clean = stripAnsi(line).trimEnd();
 
-  return parseStructured(clean) ?? parseNestText(clean) ?? { message: clean };
+  return (
+    parseStructured(clean) ??
+    parseNestText(clean) ?? { message: clean, format: "plain" }
+  );
 }
 
 function parseStructured(line: string): ParsedLogLine | null {
@@ -143,6 +153,7 @@ function parseStructured(line: string): ParsedLogLine | null {
     traceId: typeof record.traceId === "string" ? record.traceId : undefined,
     message: record.message,
     attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
+    format: "json",
   };
 }
 
@@ -160,6 +171,7 @@ function parseNestText(line: string): ParsedLogLine | null {
     context: context || undefined,
     traceId,
     message,
+    format: "nest",
   };
 }
 

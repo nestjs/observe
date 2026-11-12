@@ -19,8 +19,11 @@ import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "../observe.constants.js";
  *
  * A process that writes a long stretch without a newline (a progress bar, a
  * streamed response) would otherwise grow this string without bound. At the cap
- * the tail is forwarded as-is rather than discarded - a partial line is still
- * evidence.
+ * the tail is forwarded rather than discarded - a partial line is still
+ * evidence - and the rest of that line, up to its newline, is dropped: it is
+ * not a line of its own, and a secret the cap split would start it. A line
+ * written in one call loses everything past the 4 KB the shared buffer keeps
+ * of an entry anyway.
  */
 const MAX_PARTIAL_LINE_LENGTH = 8 * 1024;
 
@@ -95,6 +98,14 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
   private readonly partialLines: Record<ForwardedStream, string> = {
     stdout: "",
     stderr: "",
+  };
+  /**
+   * Set once a stream's held line was forwarded at the cap: what it writes up
+   * to its next newline is the rest of that line, and is dropped.
+   */
+  private readonly overflowed: Record<ForwardedStream, boolean> = {
+    stdout: false,
+    stderr: false,
   };
   private originalWrites: Record<
     ForwardedStream,
@@ -211,6 +222,14 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
   }
 
   private consume(chunk: string, name: ForwardedStream = "stdout") {
+    if (this.overflowed[name]) {
+      const newline = chunk.indexOf("\n");
+      if (newline === -1) {
+        return;
+      }
+      this.overflowed[name] = false;
+      chunk = chunk.slice(newline + 1);
+    }
     const combined = this.partialLines[name] + chunk;
     const segments = combined.split("\n");
 
@@ -233,20 +252,34 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (this.partialLines[name].length > MAX_PARTIAL_LINE_LENGTH) {
-      this.flushPartial(name);
+      this.flushPartial(name, true);
     }
   }
 
-  private flushPartial(name: ForwardedStream) {
+  /**
+   * Forwards the line a stream is holding. `atCap` when its length forced
+   * that: the line goes on past what is forwarded - see
+   * `MAX_PARTIAL_LINE_LENGTH`.
+   */
+  private flushPartial(name: ForwardedStream, atCap = false) {
     const partialLine = this.partialLines[name];
     this.partialLines[name] = "";
+    this.overflowed[name] = atCap;
     if (partialLine.trim().length === 0) {
       return;
     }
-    this.observeAgentSharedBuffer.pushLogs([this.toLogEntry(partialLine)]);
+    this.observeAgentSharedBuffer.pushLogs([
+      this.toLogEntry(partialLine, atCap),
+    ]);
   }
 
-  private toLogEntry(line: string) {
+  /**
+   * `unfinished` for a line that goes on past `line`, unseen: its last
+   * `REDACTION_LOOKAHEAD` characters are only shown to the redactor, so a
+   * secret that starts there and runs on is not half-sent. A JSON record has
+   * ended whatever follows it.
+   */
+  private toLogEntry(line: string, unfinished = false) {
     // Parsed whole: see `MAX_REDACTED_LENGTH`.
     const parsed = parseLogLine(line);
 
@@ -295,7 +328,13 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
           : this.redactor
             ? this.redactor.redactAttributes(parsed.attributes)
             : parsed.attributes,
-      text: this.redact(parsed.message),
+      text:
+        unfinished && parsed.format !== "json"
+          ? this.redact(
+              parsed.message,
+              parsed.message.length - REDACTION_LOOKAHEAD,
+            )
+          : this.redact(parsed.message),
     };
   }
 
@@ -314,11 +353,14 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       text.length > MAX_REDACTED_LENGTH
         ? text.slice(0, MAX_REDACTED_LENGTH)
         : text;
-    const sent = Math.min(
-      keep,
-      shown.length < text.length
-        ? MAX_REDACTED_LENGTH - REDACTION_LOOKAHEAD
-        : text.length,
+    const sent = Math.max(
+      0,
+      Math.min(
+        keep,
+        shown.length < text.length
+          ? MAX_REDACTED_LENGTH - REDACTION_LOOKAHEAD
+          : text.length,
+      ),
     );
     if (!this.redactor) {
       return sent < text.length ? text.slice(0, sent) : text;
