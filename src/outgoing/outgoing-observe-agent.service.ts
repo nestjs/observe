@@ -31,6 +31,7 @@ import {
   patchUndiciDispatch,
   patchUndiciUnwrap,
 } from "./undici.integration.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 /**
  * Spans for what leaves the process: database queries and outbound HTTP.
@@ -173,8 +174,10 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
         recorder,
         () => {
           const store = asyncLocalStorage.getStore();
-          const traceId: unknown = store?.get(this.options.traceIdKey);
-          if (typeof traceId !== "string") {
+          // A call a finished operation's timer makes, past the grace
+          // period, carries none of its ids.
+          const traceId = liveTraceId(store, this.options.traceIdKey);
+          if (traceId === undefined) {
             return undefined;
           }
           const traceContext = store?.get(TRACE_CONTEXT_KEY) as

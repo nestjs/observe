@@ -10,6 +10,11 @@ import {
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { TracerService } from "./tracer.service.js";
+import {
+  endOperation,
+  OPERATION_GRACE_MS,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /**
  * The public API of the agent - what application code actually calls.
@@ -161,6 +166,19 @@ describe("TracerService", () => {
 
     it("returns null when the store exists but carries no trace id", () => {
       expect(als.run(new Map(), () => tracer.currentTraceId())).toBeNull();
+    });
+
+    it("returns null in a store whose operation ended past the grace period", () => {
+      // A flush interval a request armed lazily, firing long after the
+      // request was answered: the id must not label what it does.
+      const store = new Map<string, unknown>([["traceId", "finished"]]);
+      const operation = openOperation(store);
+
+      expect(als.run(store, () => tracer.currentTraceId())).toBe("finished");
+      endOperation(operation);
+      expect(als.run(store, () => tracer.currentTraceId())).toBe("finished");
+      operation.endedAt = performance.now() - OPERATION_GRACE_MS - 1;
+      expect(als.run(store, () => tracer.currentTraceId())).toBeNull();
     });
   });
 

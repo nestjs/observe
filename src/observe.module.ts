@@ -68,6 +68,7 @@ import {
 import { fitToLength } from "./utils/fit-to-length.util.js";
 import { inferServiceVersion } from "./utils/infer-service-version.util.js";
 import { LogRedactor } from "./utils/log-redactor.js";
+import { liveTraceId } from "./utils/operation-state.util.js";
 
 /**
  * All three async providers are optional on the options type, but one of them
@@ -485,8 +486,13 @@ export function createObserveModule<Store extends Record<string, unknown>>(
           deliverRepliesToTheirCaller(instance, asyncLocalStorage);
           propagateTraceIdThrough(
             instance,
+            // Not a finished operation's, past its grace period: a message a
+            // timer it left armed sends is no part of its trace.
             () =>
-              asyncLocalStorage.getStore()?.get(options.traceIdKey as never),
+              liveTraceId(
+                asyncLocalStorage.getStore() as Map<unknown, unknown>,
+                options.traceIdKey!,
+              ),
             (traceId) =>
               openTelemetryInterop.isOn()
                 ? traceparentToHandOn(asyncLocalStorage.getStore(), traceId)

@@ -15,6 +15,7 @@ import {
   describePeerLoadError,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
+import { endOperation, openOperation } from "../utils/operation-state.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
   deferTraceCompletion,
@@ -313,6 +314,9 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
     return this.asyncLocalStorage.run(store, () => {
       const traceId = uuidv7();
       store.set(this.options.traceIdKey, traceId);
+      // Ended with the message's trace, or as an untraced message settles:
+      // see `liveTraceId`.
+      const operation = openOperation(store);
 
       setAttributesSafely(
         this.options.ws?.setAttributes,
@@ -338,10 +342,27 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
       ) {
         // No trace to end, but the store - and the trace id it carries for
         // logs - still has to reach a chain the adapter subscribes to later.
-        const result = invoke();
-        return result instanceof Promise
-          ? result.then((value) => this.keepStore(store, value))
-          : this.keepStore(store, result);
+        const end = () => endOperation(operation);
+        const settleUntraced = (value: unknown) => {
+          if (!isObservable(value)) {
+            end();
+            return value;
+          }
+          return this.subscribeInStore(store, value, end, end);
+        };
+        let untraced: unknown;
+        try {
+          untraced = invoke();
+        } catch (error) {
+          end();
+          throw error;
+        }
+        return untraced instanceof Promise
+          ? untraced.then(settleUntraced, (error: unknown) => {
+              end();
+              throw error;
+            })
+          : settleUntraced(untraced);
       }
 
       this.operationTraceRegistry.startTrace(traceId, {
@@ -366,6 +387,7 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
         open = false;
         unwatch();
         state.onStreamReturned = undefined;
+        endOperation(operation);
         return true;
       };
       const abandon = () => {
@@ -442,11 +464,6 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
       }
       return settle(result);
     });
-  }
-
-  /** What the chain resolved to, a stream subscribed in the message's store. */
-  private keepStore(store: Map<KeyOf<Store>, any>, value: unknown): unknown {
-    return isObservable(value) ? this.subscribeInStore(store, value) : value;
   }
 
   /**

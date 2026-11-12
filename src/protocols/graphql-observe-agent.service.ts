@@ -27,6 +27,12 @@ import {
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
+import {
+  endOperation,
+  OPERATION_STATE_KEY,
+  OperationState as OperationLifetime,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /**
  * Protocol recorded for a GraphQL operation that arrived over something other
@@ -446,6 +452,9 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     );
 
     if (state.ownsTrace) {
+      endOperation(
+        state.store?.get(OPERATION_STATE_KEY) as OperationLifetime | undefined,
+      );
       this.endOperationTrace(state.traceId, state.context);
     }
   }
@@ -516,6 +525,8 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     );
     const store = new Map<KeyOf<Store>, any>();
     store.set(this.options.traceIdKey, traceId);
+    // Ended with the operation's trace: see `liveTraceId`.
+    openOperation(store);
     this.asyncLocalStorage.enterWith(store);
 
     this.applyAttributes(info, ctx.context);

@@ -1,6 +1,10 @@
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
 import { defer, from, isObservable, Observable, Subject } from "rxjs";
+import {
+  OPERATION_STATE_KEY,
+  OperationState,
+} from "../utils/operation-state.util.js";
 import { WsObserveAgentService } from "./ws-observe-agent.service.js";
 
 type GatewayHandler = (...args: unknown[]) => unknown;
@@ -28,6 +32,8 @@ describe("WsObserveAgentService", () => {
 
   /** The callbacks the context creator was handed, in order. */
   let received: GatewayHandler[];
+  /** The agent's async store, as the last `instrument` built it. */
+  let als: AsyncLocalStorage<Map<string, any>>;
 
   /**
    * Builds the agent over a fresh context creator, and returns what the
@@ -71,12 +77,13 @@ describe("WsObserveAgentService", () => {
       hasOpenSpans: () => false,
     };
     // The agent patches the context creator from its constructor.
+    als = new AsyncLocalStorage<Map<string, any>>();
     void new WsObserveAgentService(
       { insertRequestSnapshot: vi.fn() } as never,
       { traceIdKey: "traceId", ws: {} } as never,
       registry as never,
       { shouldCapture: () => true } as never,
-      new AsyncLocalStorage<Map<string, any>>(),
+      als,
     );
     class Gateway {
       handle(...args: unknown[]) {
@@ -111,6 +118,32 @@ describe("WsObserveAgentService", () => {
       tracedIds(),
     );
     expect(registry.endTrace).not.toHaveBeenCalled();
+  });
+
+  it("ends a message's operation with its trace, or as its client leaves", async () => {
+    const operationOf = () =>
+      als.getStore()!.get(OPERATION_STATE_KEY) as OperationState;
+    let answered: OperationState | undefined;
+    const handle = instrument(() => {
+      answered ??= operationOf();
+      return "done";
+    });
+
+    await handle(new EventEmitter(), "first");
+    expect(answered?.endedAt).toEqual(expect.any(Number));
+
+    let waiting: OperationState | undefined;
+    const waits = instrument(() => {
+      waiting = operationOf();
+      return new Promise(() => undefined);
+    });
+    const socket = new EventEmitter();
+    void waits(socket, "second");
+    await Promise.resolve();
+    expect(waiting?.endedAt).toBeUndefined();
+    socket.emit("close");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(waiting?.endedAt).toEqual(expect.any(Number));
   });
 
   it("reports a handler that ends its own client's connection and then settles", async () => {

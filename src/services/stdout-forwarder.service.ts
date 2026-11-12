@@ -21,6 +21,7 @@ import {
   OBSERVE_OPTIONS,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 /**
  * Cap on the unterminated tail held between writes.
@@ -489,7 +490,9 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     context?: string,
     longest = 0,
   ): LogEntry {
-    const contextTraceId = store?.get(this.options.traceIdKey);
+    // Not a store whose operation ended a while ago: a line a timer it left
+    // armed writes is no line of that operation's.
+    const contextTraceId = liveTraceId(store, this.options.traceIdKey);
     // The line's own trace id wins: it was captured when the log was written,
     // whereas the async store is read now and may already have moved on.
     //

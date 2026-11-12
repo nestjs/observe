@@ -37,6 +37,11 @@ import {
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
+import {
+  endOperation,
+  OperationState,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /** The adapter hooks requests are traced through, all added in Nest 11.1.4. */
 const REQUEST_HOOKS = [
@@ -245,6 +250,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
       this.registryKeys.set(req, registryKey);
+      // Ended when the response closes, recorded or not, answered or
+      // aborted: see `liveTraceId`.
+      this.watchResponseClose(res, openOperation(store), registryKey);
 
       // With OpenTelemetry interop on, read whatever produced the trace id: a
       // `traceIdGenerator` of the application's own decides what Observe
@@ -311,7 +319,6 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       if (isPreflight(req)) {
         this.operationTraceRegistry.keepWithoutSpans(registryKey);
       }
-      this.evictTraceOnClientAbort(res, registryKey);
       return done();
     });
   }
@@ -372,7 +379,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
   }
 
   /**
-   * Frees the trace when the client goes away before the response finishes.
+   * Ends the request's operation when its response closes - answered or
+   * aborted, recorded or not - and frees the trace when the client went away
+   * before the response finished.
    *
    * The adapter's response hook rides `res.on("finish")`, and an aborted
    * request never emits it - the socket emits `close` instead. Without this,
@@ -385,16 +394,20 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
    * response under it as `raw`.
    *
    * On the normal path `close` follows `finish` with `writableFinished`
-   * already true, so this stays a no-op there - `endHttpRequestTracing` has
-   * either plucked the trace or is about to. A response that does not say
-   * is left alone.
+   * already true, so the trace is left alone there - `endHttpRequestTracing`
+   * has either plucked it or is about to. A response that does not say is
+   * left alone too.
    *
    * Dropped at once, not after a grace period: an abandoned trace is never
    * reported, and the registry already lets a handler that outlives its
    * client end its spans on a trace that is gone. Held for 30 s, it was the
    * client's to say how many such traces the process kept.
    */
-  private evictTraceOnClientAbort(res: unknown, traceId: string): void {
+  private watchResponseClose(
+    res: unknown,
+    operation: OperationState,
+    traceId: string,
+  ): void {
     const given = res as { on?: unknown; raw?: unknown } | undefined;
     const response = (typeof given?.on === "function" ? given : given?.raw) as
       | {
@@ -406,6 +419,8 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       return;
     }
     response.on("close", () => {
+      endOperation(operation);
+      // A request that was never recorded has nothing registered to drop.
       if (response.writableFinished === false) {
         this.operationTraceRegistry.abandonTrace(traceId);
       }

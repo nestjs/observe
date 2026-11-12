@@ -6,6 +6,10 @@ import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.j
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { TRACE_CONTEXT_KEY, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
+import {
+  OPERATION_STATE_KEY,
+  OperationState,
+} from "../utils/operation-state.util.js";
 import { JobRunDescriptor, JobTraceRunner } from "./job-trace-runner.js";
 
 /**
@@ -70,6 +74,29 @@ describe("JobTraceRunner: jobs.ignore", () => {
     expect(seen.traceId).toEqual(expect.any(String));
     expect(seen.traced).toBe(false);
     expect(insertJobSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("ends a run's operation as it settles, traced or ignored", async () => {
+    const operationOfRun = () =>
+      als.getStore()!.get(OPERATION_STATE_KEY) as OperationState;
+
+    const ignored = await createRunner({ ignore: () => true }).run(
+      job,
+      async () => {
+        const operation = operationOfRun();
+        expect(operation.endedAt).toBeUndefined();
+        return operation;
+      },
+    );
+    const traced = await createRunner({}).run(job, async () => {
+      const operation = operationOfRun();
+      expect(operation.endedAt).toBeUndefined();
+      return operation;
+    });
+    await Promise.resolve();
+
+    expect(ignored.endedAt).toEqual(expect.any(Number));
+    expect(traced.endedAt).toEqual(expect.any(Number));
   });
 
   it("traces a job the predicate does not match", () => {

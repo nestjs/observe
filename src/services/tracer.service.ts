@@ -12,6 +12,7 @@ import {
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 /**
  * Longest operation id the collector stores, counted by code point as it
@@ -419,9 +420,9 @@ export class TracerService<
    * propagate an id that simply isn't there yet.
    */
   currentTraceId(): string | null {
-    const store = this.als.getStore();
-    const traceId = store?.get(this.options.traceIdKey);
-    return typeof traceId === "string" ? traceId : null;
+    // Null once the operation is over, past a grace period: a timer the
+    // operation left armed is outside any trace in flight.
+    return liveTraceId(this.als.getStore(), this.options.traceIdKey) ?? null;
   }
 
   /**

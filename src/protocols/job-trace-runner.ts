@@ -26,6 +26,11 @@ import {
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
+import {
+  endOperation,
+  liveTraceId,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /** What a queue driver knows about the run it is about to start. */
 export interface JobRunDescriptor {
@@ -224,8 +229,10 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
    */
   private stampTraceId(opts: unknown): Record<string, unknown> | undefined {
     const store = this.asyncLocalStorage.getStore();
-    const traceId = store?.get(this.options.traceIdKey);
-    if (typeof traceId !== "string") {
+    // A job a finished operation's timer enqueues, past the grace period,
+    // is no part of that operation's trace.
+    const traceId = liveTraceId(store, this.options.traceIdKey);
+    if (traceId === undefined) {
       return undefined;
     }
     if (opts !== undefined && (typeof opts !== "object" || opts === null)) {
@@ -363,6 +370,8 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       const traceId = inheritedTraceId ?? registryKey;
       store.set(this.options.traceIdKey, traceId);
       store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, registryKey);
+      // Ended as the run settles, recorded or not: see `liveTraceId`.
+      const operation = openOperation(store);
 
       // With OpenTelemetry interop on, the job runs in the W3C trace context
       // it was enqueued in, for an OpenTelemetry SDK in this process - see
@@ -399,11 +408,27 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         // The trace id stays in the store so logs and jobs enqueued from here
         // still correlate; nothing is registered under the registry key, so
         // its spans have no trace to join.
-        return handedOn === undefined
-          ? invoke(() => undefined)
-          : continueHandedOnTrace(handedOn, traceId, () =>
-              invoke(() => undefined),
-            );
+        const end = () => endOperation(operation);
+        let result: T;
+        try {
+          result =
+            handedOn === undefined
+              ? invoke(end)
+              : continueHandedOnTrace(handedOn, traceId, () => invoke(end));
+        } catch (error) {
+          end();
+          throw error;
+        }
+        if (!settlesItself) {
+          // Its driver takes the promise as the outcome and consumes it, so
+          // watching it here changes nothing about how a rejection surfaces.
+          if (result instanceof Promise) {
+            result.then(end, end);
+          } else {
+            end();
+          }
+        }
+        return result;
       }
 
       this.operationTraceRegistry.startTrace(
@@ -426,6 +451,7 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
           return;
         }
         outcome = status;
+        endOperation(operation);
         if (status === "failed") {
           dropped?.then(undefined, ignoreRejection);
         }

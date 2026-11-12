@@ -29,6 +29,12 @@ import {
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
+import {
+  endOperation,
+  OPERATION_STATE_KEY,
+  OperationState,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /**
  * The `@nestjs/microservices` surface this agent reads, loaded on demand so
@@ -84,6 +90,9 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
    * `HttpObserveAgentService` keeps its keys by request.
    */
   private readonly registryKeys = new WeakMap<object, string>();
+
+  /** The operation each context was started for - see `rememberOperation`. */
+  private readonly operations = new WeakMap<object, OperationState>();
 
   constructor(
     private readonly asyncLocalStorage: AsyncLocalStorage<
@@ -227,6 +236,8 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
       this.rememberRegistryKey(ctx, registryKey);
+      // Ended by the end hook, recorded or not: see `liveTraceId`.
+      this.rememberOperation(ctx, openOperation(store));
 
       // With OpenTelemetry interop on, the handler runs in the W3C trace
       // context the message was sent in, for an OpenTelemetry SDK in this
@@ -323,6 +334,9 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       // context it started it with, so the key is kept by both.
       this.rememberRegistryKey(call, registryKey);
       this.rememberRegistryKey(call?.request, registryKey);
+      const operation = openOperation(store);
+      this.rememberOperation(call, operation);
+      this.rememberOperation(call?.request, operation);
 
       // As for a message: the call's span goes under the caller's for `otlp`,
       // and the calls the handler makes carry its decision on. Read now, while
@@ -391,6 +405,16 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     // ended. The store answers only for a context no key could be kept by:
     // a gRPC call with no request message of its own, as a client stream has
     // none.
+    endOperation(
+      (typeof ctx === "object" && ctx !== null
+        ? this.operations.get(ctx)
+        : undefined) ??
+        (this.asyncLocalStorage
+          .getStore()
+          ?.get(OPERATION_STATE_KEY as KeyOf<Store>) as
+          | OperationState
+          | undefined),
+    );
     const registryKey =
       (typeof ctx === "object" && ctx !== null
         ? this.registryKeys.get(ctx)
@@ -450,6 +474,13 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
   private rememberRegistryKey(ctx: unknown, registryKey: string): void {
     if (typeof ctx === "object" && ctx !== null) {
       this.registryKeys.set(ctx, registryKey);
+    }
+  }
+
+  /** As `rememberRegistryKey`, for the operation the end hook ends. */
+  private rememberOperation(ctx: unknown, operation: OperationState): void {
+    if (typeof ctx === "object" && ctx !== null) {
+      this.operations.set(ctx, operation);
     }
   }
 
