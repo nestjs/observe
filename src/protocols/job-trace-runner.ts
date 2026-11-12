@@ -259,9 +259,10 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
    * Runs one job under a trace.
    *
    * `invoke` is handed `settle` for drivers whose handlers finish through a
-   * callback; pass `settlesItself` for those, and a plain return is then not
-   * read as completion. Promise-returning and throwing handlers are settled
-   * here either way.
+   * callback; pass `settlesItself` for those, and what the handler returns,
+   * a promise included, is then not read as the outcome. A throwing handler
+   * is settled here either way, and a promise goes back to the driver as the
+   * handler returned it.
    */
   run<T>(
     job: JobRunDescriptor,
@@ -364,12 +365,18 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         traceContext,
       );
 
-      let settled = false;
+      let outcome: JobStatus | undefined;
+      // The promise a callback-style handler returned, which its driver
+      // drops - see where it is handed back, below.
+      let dropped: Promise<unknown> | undefined;
       const settle = (status: JobStatus) => {
-        if (settled) {
+        if (outcome) {
           return;
         }
-        settled = true;
+        outcome = status;
+        if (status === "failed") {
+          dropped?.then(undefined, ignoreRejection);
+        }
         deferTraceCompletion(
           async () => {
             this.operationTraceRegistry.endTrace(registryKey, { status });
@@ -403,15 +410,39 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
             ? invoke(settle)
             : continueHandedOnTrace(handedOn, traceId, () => invoke(settle));
         if (returnValue instanceof Promise) {
-          return returnValue
-            .then((ret) => {
-              settle("completed");
-              return ret;
-            })
-            .catch((error: Error) => {
-              settle("failed");
-              throw error;
-            }) as T;
+          // Handed back as the handler returned it, never as a promise
+          // chained onto it: a chained promise has none of the members of the
+          // handler's own (Bull calls `cancel()` on it when a job times out,
+          // and hands it to `active` listeners), and it rejects on its own.
+          if (settlesItself) {
+            // Bull drops what a callback-style processor returns, and `done`
+            // is the outcome. One that reports its failure through `done` and
+            // returns the promise it handled that way -
+            // `redis.hincrby(key, field, n, done)` - left a chained rejection
+            // nobody listened to, and the `unhandledRejection` ended a worker
+            // that carries on without the agent.
+            //
+            // So it is not watched either: watching marks it handled, and an
+            // `async (job, done)` processor that throws before it calls
+            // `done` has to raise `unhandledRejection` as it does without the
+            // agent. Only once `done` has reported a failure is the rejection
+            // marked handled: an instrumented provider's `@Process()` method
+            // hands back a promise chained onto its method's, and that one
+            // rejects again after the method's own was handled.
+            dropped = returnValue;
+            if (outcome === "failed") {
+              returnValue.then(undefined, ignoreRejection);
+            }
+          } else {
+            // A driver that takes the promise as the outcome consumes it, so
+            // the run is settled from a side branch. Attached before the
+            // driver's own reactions, it still settles the run first.
+            returnValue.then(
+              () => settle("completed"),
+              () => settle("failed"),
+            );
+          }
+          return returnValue;
         }
 
         if (!settlesItself) {
@@ -425,3 +456,6 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
     });
   }
 }
+
+/** Marks a rejection handled, where it has already been reported. */
+function ignoreRejection(): void {}

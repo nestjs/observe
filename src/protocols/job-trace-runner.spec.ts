@@ -200,6 +200,132 @@ describe("JobTraceRunner: a run nested in its own job's run", () => {
   });
 });
 
+/**
+ * What a handler returns goes back to its driver. Bull reads more off it than
+ * its value - it calls `cancel()` on a promise-style processor's promise when
+ * the job times out - and drops what a callback-style one returns, so a
+ * promise of the runner's own making in its place either lost those members
+ * or rejected where nothing listened.
+ */
+describe("JobTraceRunner: the promise a handler returns", () => {
+  const TRACE_ID_KEY = "traceId";
+
+  let als: AsyncLocalStorage<Map<string, unknown>>;
+  let endTrace: ReturnType<typeof vi.spyOn>;
+  let runner: JobTraceRunner<Record<string, unknown>>;
+
+  const job: JobRunDescriptor = {
+    queueName: "clicks",
+    name: "count",
+    id: 1,
+    metadata: {},
+  };
+
+  /** The status the run was ended with, once it is. */
+  const reportedStatus = async () => {
+    await vi.waitFor(() => expect(endTrace).toHaveBeenCalledOnce());
+    return (endTrace.mock.calls[0][1] as { status?: string }).status;
+  };
+
+  beforeEach(() => {
+    als = new AsyncLocalStorage();
+    const registry = new OperationTraceRegistry(als as never, false);
+    endTrace = vi.spyOn(registry, "endTrace");
+    runner = new JobTraceRunner(
+      { insertJobSnapshot: vi.fn() } as unknown as ObserveAgentSharedBuffer,
+      { traceIdKey: TRACE_ID_KEY } as ObserveModuleOptionsWithDefaults,
+      registry,
+      als as never,
+      { warn: vi.fn(), debug: vi.fn() } as unknown as Logger,
+    );
+  });
+
+  it("hands a promise-style handler's own promise back, members and all", async () => {
+    const cancel = vi.fn();
+    const work = Object.assign(Promise.resolve("rendered"), { cancel });
+
+    const returned = runner.run(job, () => work);
+
+    expect(returned).toBe(work);
+    expect(returned.cancel).toBe(cancel);
+    await expect(returned).resolves.toBe("rendered");
+    expect(await reportedStatus()).toBe("completed");
+  });
+
+  it("still reports a promise-style run as failed when its promise rejects", async () => {
+    const error = new Error("render failed");
+    const work = Promise.reject(error);
+
+    const returned = runner.run(job, () => work);
+
+    expect(returned).toBe(work);
+    await expect(returned).rejects.toBe(error);
+    expect(await reportedStatus()).toBe("failed");
+  });
+
+  it("hands a callback-style handler's promise back as it returned it", async () => {
+    // `(job, done) => redis.hincrby(key, field, n, done)`: ioredis reports the
+    // failure to `done` and returns the promise it has handled that way, and
+    // Bull drops what the processor returns.
+    const work = Promise.reject(new Error("ERR value is not an integer"));
+
+    const returned = runner.run(
+      job,
+      (settle) => {
+        work.then(undefined, () => settle("failed"));
+        return work;
+      },
+      true,
+    );
+
+    expect(returned).toBe(work);
+    expect(await reportedStatus()).toBe("failed");
+  });
+
+  it("takes a callback-style run's outcome from its callback, not its promise", async () => {
+    let done!: () => void;
+
+    void runner.run(
+      job,
+      (settle) => {
+        done = () => settle("failed");
+        return Promise.resolve();
+      },
+      true,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    done();
+
+    expect(await reportedStatus()).toBe("failed");
+  });
+
+  it("does not leave a dropped promise rejecting once its failure was reported", async () => {
+    // An instrumented provider's `@Process() count(job, done)` hands back a
+    // promise chained onto its method's: the method's own was handled, the
+    // chained one rejects as well, and Bull drops it.
+    let report!: () => void;
+    const chained = new Promise((_, reject) => {
+      report = () => reject(new Error("ERR value is not an integer"));
+    });
+
+    void runner.run(
+      job,
+      (settle) => {
+        queueMicrotask(() => {
+          settle("failed");
+          report();
+        });
+        return chained;
+      },
+      true,
+    );
+
+    expect(await reportedStatus()).toBe("failed");
+    // Vitest fails the file on a rejection nothing handled.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+});
+
 describe("JobTraceRunner: patchEnqueue", () => {
   const TRACE_ID_KEY = "traceId";
 

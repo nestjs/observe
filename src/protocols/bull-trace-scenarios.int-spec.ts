@@ -2,7 +2,7 @@ import { BullModule, InjectQueue, Process, Processor } from "@nestjs/bull";
 import { Controller, Injectable, Module, Post } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { NestExpressApplication } from "@nestjs/platform-express";
-import type { Job, Queue } from "bull";
+import type { DoneCallback, Job, Queue } from "bull";
 import { connect } from "net";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
@@ -87,6 +87,17 @@ class MailProcessor {
   @Process("repeating-mail")
   async repeating(_job: Job) {
     return this.mailer.deliver();
+  }
+
+  /**
+   * Reports its failure through `done` and returns the promise it handled
+   * that way, as `(job, done) => redis.hincrby(key, field, n, done)` does.
+   */
+  @Process("callback-mail")
+  callback(_job: Job, done: DoneCallback) {
+    const work = Promise.reject(new Error("ERR value is not an integer"));
+    work.then(undefined, (error: Error) => done(error));
+    return work;
   }
 
   @Process({ name: "slow-mail", concurrency: 3 })
@@ -218,6 +229,26 @@ describe.skipIf(!redisReachable)(
 
     const runsOf = (name: string) =>
       jobs.items.filter((item) => item.name === name);
+
+    it("fails a callback-style job through done, and goes on to the next one", async () => {
+      // The runner handed Bull a promise chained onto the processor's, which
+      // Bull drops for a callback-style processor: it rejected with nothing
+      // listening, and the unhandled rejection ended the worker.
+      await queue.add("callback-mail", {});
+      await queue.add("delayed-mail", {});
+
+      const failed = await waitForJobSnapshot(
+        jobs,
+        (item) => item.name === "callback-mail",
+      );
+      const next = await waitForJobSnapshot(
+        jobs,
+        (item) => item.name === "delayed-mail",
+      );
+      expect(failed.status).toBe("failed");
+      expect(next.status).toBe("completed");
+      jobs.clear();
+    });
 
     it("carries the id across a delay, and does not count the delay as time spent waiting", async () => {
       await post("/delayed", "bull-delayed-trace-1");
