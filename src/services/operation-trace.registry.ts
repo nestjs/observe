@@ -26,6 +26,26 @@ import { SkipSpansPredicate } from "./skip-spans.util.js";
 const SNAPSHOT_COMPLETION_TIMEOUT_MS = 1000;
 
 /**
+ * Deepest a span is nested in the tree that is shipped, root span included.
+ *
+ * Far past any call chain written by hand, and about a ninth of the depth at
+ * which the first walk of a tree - building it for shipping, collapsing it,
+ * encoding it, serialising the batch it rides in - runs out of stack. Async
+ * recursion is traced level by level (the instance decorator only keeps a
+ * synchronous call out of the tree), so a method that awaits and then calls
+ * itself once per level of a client's JSON body nested its spans as deep as
+ * the body was, and the batch's `JSON.stringify` threw away every other
+ * operation of the flush window with it.
+ */
+const MAX_SPAN_DEPTH = 256;
+
+/**
+ * A node as the registry keeps it while its trace is open: with its depth,
+ * which nothing outside the registry reads and `toShippedNode` leaves out.
+ */
+type TrackedNode = OngoingTraceEventNode & { depth: number };
+
+/**
  * Tag under which a snapshot records how many spans were left out of its tree
  * because they had not ended when it was shipped - the spans still open and
  * everything recorded under them.
@@ -163,6 +183,8 @@ export class OperationTraceRegistry {
    * would bury everything else in the log. Full text once, one line after.
    */
   private hasReportedMissingInstrumentation = false;
+  /** See `reportSpanDepthLimit`. */
+  private hasReportedSpanDepthLimit = false;
   /**
    * Applied to every tree as it is plucked. Defaults are live from
    * construction rather than waiting for `configureSpanCollapse`, so a
@@ -574,7 +596,7 @@ export class OperationTraceRegistry {
     // span: V8 hands back a batch afterwards, so there is nothing to label at
     // the moment a sample fires.
     activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
-    const newNode: OngoingTraceEventNode = {
+    const newNode: TrackedNode = {
       origin: "auto",
       type: "start",
       className,
@@ -588,6 +610,9 @@ export class OperationTraceRegistry {
       // store (CALLER_METADATA_KEY), so the two sides agree by construction
       // instead of by a timing heuristic. It costs a uuid per span on the wire.
       spanId: newNodeId,
+      // Set where the node is attached; in the literal so every node has the
+      // same shape from the start.
+      depth: 1,
     };
 
     let refsByCaller = this.callerIdsByTraceId.get(traceId);
@@ -615,21 +640,55 @@ export class OperationTraceRegistry {
    * ending after its caller did, is already tolerated in
    * `internalEndTraceStep`. Auto and manual spans both attach through here, so
    * they share the tolerance.
+   *
+   * A node past `MAX_SPAN_DEPTH` is kept out of its caller's children, and so
+   * out of the shipped tree, and everything opened under it goes the same
+   * way. Nothing else about it changes: it still has its parent, so an error
+   * it ends with is not taken for the operation's own, and it is still
+   * registered and counted, so the calls under it find their caller and the
+   * trace completes when it would have.
    */
   private attachToCaller(
     snapshot: SnapshotWithSignal,
     refsByCaller: Map<string | undefined, OngoingTraceEventNode> | undefined,
     callerId: string | undefined,
-    newNode: OngoingTraceEventNode,
+    newNode: TrackedNode,
   ): void {
-    const caller = callerId ? refsByCaller?.get(callerId) : undefined;
+    // Every node in the map was opened by this registry, with its depth.
+    const caller = (callerId ? refsByCaller?.get(callerId) : undefined) as
+      | TrackedNode
+      | undefined;
     if (caller?.type === "start") {
-      caller.children.push(newNode);
       newNode.parent = caller;
+      newNode.depth = caller.depth + 1;
+      if (newNode.depth <= MAX_SPAN_DEPTH) {
+        caller.children.push(newNode);
+      } else {
+        this.reportSpanDepthLimit(snapshot, newNode);
+      }
     } else {
       // No (live) caller means insert trace at the root level
       snapshot.traces.push(newNode);
     }
+  }
+
+  /**
+   * Once for the process: a chain that deep comes from one recursive method,
+   * which recurses that deep on every request it is given the same input.
+   * Flagged before the line is written, which an instrumented logger records
+   * as one more span of the same chain.
+   */
+  private reportSpanDepthLimit(
+    snapshot: SnapshotWithSignal,
+    node: TrackedNode,
+  ): void {
+    if (this.hasReportedSpanDepthLimit) {
+      return;
+    }
+    this.hasReportedSpanDepthLimit = true;
+    this.logger.warn(
+      `Trace "${snapshot.traceId}" is reported without the spans nested more than ${MAX_SPAN_DEPTH} levels deep, from "${node.className}#${node.methodKey}" down. A method that calls itself once per level of its input traces each level. Later traces this deep are not reported.`,
+    );
   }
 
   internalEndTraceStep(
@@ -1113,7 +1172,7 @@ export class OperationTraceRegistry {
     // completion no-ops and the span's execution time is silently attributed
     // to its parent - profile correlation for manual spans found nothing.
     activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
-    const manualSpan: OngoingTraceEventNode = {
+    const manualSpan: TrackedNode = {
       // Same identity rule as auto spans: the span id *is* the caller id it is
       // registered under, so a log line written inside this span carries an id
       // that resolves back to this node.
@@ -1126,6 +1185,7 @@ export class OperationTraceRegistry {
       startTime,
       startOffset: this.toStartOffset(snapshot, startTime),
       children: [],
+      depth: 1,
     };
     const refsByCaller = this.callerIdsByTraceId.get(traceId);
     this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);

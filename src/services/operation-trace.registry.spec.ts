@@ -264,6 +264,113 @@ describe("OperationTraceRegistry", () => {
   });
 
   describe("span tree", () => {
+    /** Levels from the root to the deepest leaf, walked without recursion. */
+    const depthOf = (nodes: Array<{ children?: unknown[] }>): number => {
+      let deepest = 0;
+      const stack = nodes.map((node) => ({ node, depth: 1 }));
+      while (stack.length > 0) {
+        const { node, depth } = stack.pop()!;
+        deepest = Math.max(deepest, depth);
+        for (const child of (node.children ?? []) as typeof nodes) {
+          stack.push({ node: child, depth: depth + 1 });
+        }
+      }
+      return deepest;
+    };
+
+    /**
+     * A method that awaits and then calls itself once per level of what it
+     * was given - a tree import over a client's JSON body - `levels` deep.
+     */
+    const recurse = (traceId: string, levels: number) => {
+      const opened: string[] = [];
+      for (let level = 0; level < levels; level++) {
+        opened.push(
+          registry.internalStartTraceStep(
+            traceId,
+            "CategoriesService",
+            "importTree",
+            opened.at(-1),
+          )!,
+        );
+      }
+      return opened;
+    };
+
+    it("ships a chain of spans nested no deeper than the limit, whatever the recursion", async () => {
+      startRequest("t-deep");
+      const opened = recurse("t-deep", 10_000);
+      for (const spanId of opened.toReversed()) {
+        registry.internalEndTraceStep(
+          "t-deep",
+          spanId,
+          "CategoriesService",
+          "importTree",
+          spanId,
+        );
+      }
+      expect(registry.hasOpenSpans("t-deep")).toBe(false);
+      registry.endTrace("t-deep", { statusCode: 201 });
+
+      // What the flush does to the whole batch: a tree a few thousand levels
+      // deep overflowed the stack here, and took every other operation of the
+      // flush window down with it.
+      const snapshot = await registry.pluckSnapshot("t-deep");
+      expect(() => JSON.stringify(snapshot)).not.toThrow();
+      expect(depthOf(snapshot!.traces)).toBe(256);
+      // The registry's own bookkeeping, not part of what is shipped.
+      expect(snapshot!.traces[0]).not.toHaveProperty("depth");
+    });
+
+    it("keeps a chain exactly as deep as the limit whole", async () => {
+      startRequest("t-at-limit");
+      const opened = recurse("t-at-limit", 256);
+      for (const spanId of opened.toReversed()) {
+        registry.internalEndTraceStep(
+          "t-at-limit",
+          spanId,
+          "CategoriesService",
+          "importTree",
+          spanId,
+        );
+      }
+      registry.endTrace("t-at-limit");
+
+      const snapshot = await registry.pluckSnapshot("t-at-limit");
+      expect(depthOf(snapshot!.traces)).toBe(256);
+    });
+
+    it("does not take an error past the limit for the operation's own", async () => {
+      startRequest("t-deep-error");
+      const opened = recurse("t-deep-error", 300);
+      const [deepest, ...callers] = opened.toReversed();
+      // Caught by its caller: the operation itself did not fail.
+      registry.internalEndTraceStep(
+        "t-deep-error",
+        deepest,
+        "CategoriesService",
+        "importTree",
+        deepest,
+        new Error("duplicate category"),
+      );
+      for (const spanId of callers) {
+        registry.internalEndTraceStep(
+          "t-deep-error",
+          spanId,
+          "CategoriesService",
+          "importTree",
+          spanId,
+        );
+      }
+      registry.endTrace("t-deep-error", { statusCode: 201 });
+
+      const snapshot = (await registry.pluckSnapshot(
+        "t-deep-error",
+      )) as RequestSnapshot;
+      expect(snapshot.error).toBeUndefined();
+      expect(snapshot.attributes?.statusCode).toBe(201);
+    });
+
     it("puts a span with no caller at the root", async () => {
       startRequest("t5");
       const spanId = registry.internalStartTraceStep(
