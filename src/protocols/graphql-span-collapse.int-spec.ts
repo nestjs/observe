@@ -6,7 +6,6 @@ import {
 } from "@nestjs/common";
 import { APP_PIPE, NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import { ApolloDriver, ApolloDriverConfig } from "@nestjs/apollo";
 import {
   Args,
@@ -26,6 +25,7 @@ import {
   DEFAULT_SPAN_COLLAPSE,
   SPAN_COLLAPSED_TAG,
 } from "../services/collapse-repeated-spans.util.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -108,7 +108,7 @@ type Platform = "express" | "node";
  * siblings under the operation span; the assertion is that what ships is
  * bounded by the defaults, with the slowest calls still present individually.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: GraphQL span collapsing (%s)",
   (platform) => {
     let app: INestApplication;
@@ -129,7 +129,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         GraphqlCollapseTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         { instrument: ObserveInstrument, logger: false },
       );
       await app.init();

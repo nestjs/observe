@@ -8,6 +8,7 @@ import {
 import { AsyncLocalStorage } from "async_hooks";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
+import { LogRedactor } from "../utils/log-redactor.js";
 import {
   setActiveSliceRecorder,
   SpanSliceRecorder,
@@ -16,6 +17,7 @@ import { SPAN_COLLAPSED_TAG } from "./collapse-repeated-spans.util.js";
 import {
   OperationTraceRegistry,
   UNFINISHED_SPANS_TAG,
+  UNRECORDED_SPANS_TAG,
 } from "./operation-trace.registry.js";
 import { resolveSkipSpans } from "./skip-spans.util.js";
 
@@ -124,6 +126,96 @@ describe("OperationTraceRegistry", () => {
       await expect(registry.pluckSnapshot("t2")).resolves.toBeUndefined();
     });
 
+    it("holds nothing of a span-less trace it discards, whatever its logger records", async () => {
+      // A logger taken from the container is wrapped like any provider, and
+      // it writes the missing-instrumentation line inside the request's async
+      // store - so writing it opens spans in the very trace being dropped.
+      const opened: Array<string | undefined> = [];
+      const error = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "error")
+        .mockImplementation(() => {
+          const spanId = registry.internalStartTraceStep(
+            "t2a",
+            "AppLogger",
+            "error",
+            undefined,
+          );
+          opened.push(spanId);
+          registry.internalEndTraceStep(
+            "t2a",
+            spanId,
+            "AppLogger",
+            "error",
+            spanId,
+          );
+        });
+
+      startRequest("t2a");
+      registry.endTrace("t2a", { statusCode: 400 });
+
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(opened).toEqual([undefined]);
+      expect(
+        (registry as unknown as { callerIdsByTraceId: Map<string, unknown> })
+          .callerIdsByTraceId.size,
+      ).toBe(0);
+      await expect(registry.pluckSnapshot("t2a")).resolves.toBeUndefined();
+    });
+
+    it("completes a trace whose user id cannot be made a string, without one", async () => {
+      startRequest("t2u");
+      const spanId = registry.internalStartTraceStep(
+        "t2u",
+        "Svc",
+        "handle",
+        undefined,
+      );
+      registry.internalEndTraceStep("t2u", spanId, "Svc", "handle", spanId);
+      // Thrown here, between ending the trace and plucking it, this left the
+      // trace registered for the life of the process.
+      const userId = JSON.parse('{"toString": 1}') as string;
+
+      expect(() =>
+        registry.endTrace("t2u", { statusCode: 200, userId }),
+      ).not.toThrow();
+      const snapshot = (await registry.pluckSnapshot("t2u")) as RequestSnapshot;
+      expect(snapshot).toBeDefined();
+      expect(snapshot).not.toHaveProperty("userId");
+      expect(registry.hasTrace("t2u")).toBe(false);
+    });
+
+    /** A CORS preflight as the HTTP agent starts it: no route matched it. */
+    const startPreflight = (traceId: string) =>
+      registry.startTrace(traceId, {
+        protocol: "http",
+        attributes: { method: "OPTIONS", originalUrl: "/orders/7" },
+        tags: {},
+      });
+
+    it("keeps a trace marked as complete without spans, and ships it unmarked", async () => {
+      // A traced CORS preflight: the CORS layer answered it before any
+      // handler, or any middleware, could record a span.
+      startPreflight("t2b");
+      registry.keepWithoutSpans("t2b");
+      registry.endTrace("t2b", { statusCode: 204 });
+
+      const snapshot = await registry.pluckSnapshot("t2b");
+      expect(snapshot).toBeDefined();
+      expect(snapshot?.traces).toEqual([]);
+      expect(snapshot).not.toHaveProperty("keptWithoutSpans");
+    });
+
+    it("still discards an unmarked trace beside a marked one", async () => {
+      startPreflight("t2c");
+      startPreflight("t2d");
+      registry.keepWithoutSpans("t2c");
+      registry.endTrace("t2c", { statusCode: 204 });
+      registry.endTrace("t2d", { statusCode: 204 });
+
+      await expect(registry.pluckSnapshot("t2c")).resolves.toBeDefined();
+      await expect(registry.pluckSnapshot("t2d")).resolves.toBeUndefined();
+    });
+
     it("replaces a trace started twice under the same id", async () => {
       startRequest("t3");
       const first = registry.internalStartTraceStep(
@@ -174,6 +266,113 @@ describe("OperationTraceRegistry", () => {
   });
 
   describe("span tree", () => {
+    /** Levels from the root to the deepest leaf, walked without recursion. */
+    const depthOf = (nodes: Array<{ children?: unknown[] }>): number => {
+      let deepest = 0;
+      const stack = nodes.map((node) => ({ node, depth: 1 }));
+      while (stack.length > 0) {
+        const { node, depth } = stack.pop()!;
+        deepest = Math.max(deepest, depth);
+        for (const child of (node.children ?? []) as typeof nodes) {
+          stack.push({ node: child, depth: depth + 1 });
+        }
+      }
+      return deepest;
+    };
+
+    /**
+     * A method that awaits and then calls itself once per level of what it
+     * was given - a tree import over a client's JSON body - `levels` deep.
+     */
+    const recurse = (traceId: string, levels: number) => {
+      const opened: string[] = [];
+      for (let level = 0; level < levels; level++) {
+        opened.push(
+          registry.internalStartTraceStep(
+            traceId,
+            "CategoriesService",
+            "importTree",
+            opened.at(-1),
+          )!,
+        );
+      }
+      return opened;
+    };
+
+    it("ships a chain of spans nested no deeper than the limit, whatever the recursion", async () => {
+      startRequest("t-deep");
+      const opened = recurse("t-deep", 10_000);
+      for (const spanId of opened.toReversed()) {
+        registry.internalEndTraceStep(
+          "t-deep",
+          spanId,
+          "CategoriesService",
+          "importTree",
+          spanId,
+        );
+      }
+      expect(registry.hasOpenSpans("t-deep")).toBe(false);
+      registry.endTrace("t-deep", { statusCode: 201 });
+
+      // What the flush does to the whole batch: a tree a few thousand levels
+      // deep overflowed the stack here, and took every other operation of the
+      // flush window down with it.
+      const snapshot = await registry.pluckSnapshot("t-deep");
+      expect(() => JSON.stringify(snapshot)).not.toThrow();
+      expect(depthOf(snapshot!.traces)).toBe(256);
+      // The registry's own bookkeeping, not part of what is shipped.
+      expect(snapshot!.traces[0]).not.toHaveProperty("depth");
+    });
+
+    it("keeps a chain exactly as deep as the limit whole", async () => {
+      startRequest("t-at-limit");
+      const opened = recurse("t-at-limit", 256);
+      for (const spanId of opened.toReversed()) {
+        registry.internalEndTraceStep(
+          "t-at-limit",
+          spanId,
+          "CategoriesService",
+          "importTree",
+          spanId,
+        );
+      }
+      registry.endTrace("t-at-limit");
+
+      const snapshot = await registry.pluckSnapshot("t-at-limit");
+      expect(depthOf(snapshot!.traces)).toBe(256);
+    });
+
+    it("does not take an error past the limit for the operation's own", async () => {
+      startRequest("t-deep-error");
+      const opened = recurse("t-deep-error", 300);
+      const [deepest, ...callers] = opened.toReversed();
+      // Caught by its caller: the operation itself did not fail.
+      registry.internalEndTraceStep(
+        "t-deep-error",
+        deepest,
+        "CategoriesService",
+        "importTree",
+        deepest,
+        new Error("duplicate category"),
+      );
+      for (const spanId of callers) {
+        registry.internalEndTraceStep(
+          "t-deep-error",
+          spanId,
+          "CategoriesService",
+          "importTree",
+          spanId,
+        );
+      }
+      registry.endTrace("t-deep-error", { statusCode: 201 });
+
+      const snapshot = (await registry.pluckSnapshot(
+        "t-deep-error",
+      )) as RequestSnapshot;
+      expect(snapshot.error).toBeUndefined();
+      expect(snapshot.attributes?.statusCode).toBe(201);
+    });
+
     it("puts a span with no caller at the root", async () => {
       startRequest("t5");
       const spanId = registry.internalStartTraceStep(
@@ -569,6 +768,240 @@ describe("OperationTraceRegistry", () => {
       expect(root.tags).toMatchObject({ orderId: "o-1" });
     });
 
+    it("records at most 4 kB of an error's message and 8 kB of its stack, frames included", async () => {
+      startRequest("e-long");
+      const spanId = registry.internalStartTraceStep(
+        "e-long",
+        "OrdersService",
+        "place",
+        undefined,
+      );
+      // A message quoting a field of the request body.
+      const error = new Error(`No product with sku ${"x".repeat(100_000)}`);
+      registry.internalEndTraceStep(
+        "e-long",
+        spanId,
+        "OrdersService",
+        "place",
+        spanId,
+        error,
+      );
+      registry.endTrace("e-long", { statusCode: 404 });
+
+      const snapshot = await registry.pluckSnapshot("e-long");
+      const recorded = snapshot!.error as { message: string; stack: string };
+      expect(recorded.message.length).toBeLessThanOrEqual(4 * 1024);
+      expect(recorded.message.startsWith("No product with sku xxx")).toBe(true);
+      expect(recorded.message.endsWith("... [truncated by observe]")).toBe(
+        true,
+      );
+      expect(recorded.stack.length).toBeLessThanOrEqual(8 * 1024);
+      expect(recorded.stack.startsWith("Error: No product with sku xxx")).toBe(
+        true,
+      );
+      // The frames follow the message, and are what the stack is kept for.
+      expect(recorded.stack).toContain(
+        error.stack!.slice(error.stack!.indexOf("\n    at ")),
+      );
+    });
+
+    describe("an error that cannot be read as text", () => {
+      it("is captured rather than thrown back at the caller", async () => {
+        startRequest("e-reply");
+        const spanId = registry.internalStartTraceStep(
+          "e-reply",
+          "OrdersService",
+          "place",
+          undefined,
+        );
+        // What a microservice client rejects with: the JSON object the remote
+        // service sent as its error, on which `String()` throws.
+        const reply = JSON.parse('{"status":"error","toString":1}') as Error;
+
+        expect(() =>
+          registry.captureError("e-reply", spanId, reply, {}),
+        ).not.toThrow();
+        registry.internalEndTraceStep(
+          "e-reply",
+          spanId,
+          "OrdersService",
+          "place",
+          spanId,
+        );
+        registry.endTrace("e-reply");
+
+        const snapshot = await registry.pluckSnapshot("e-reply");
+        expect(snapshot!.traces[0].error).toMatchObject({
+          message: "[object Object]",
+        });
+      });
+
+      it("is recorded without a stack that is not a string", async () => {
+        startRequest("e-stack");
+        const spanId = registry.internalStartTraceStep(
+          "e-stack",
+          "OrdersRepository",
+          "insert",
+          undefined,
+        );
+        // A driver error that copied a server reply's fields onto itself.
+        const error = Object.assign(new Error("insert failed"), { stack: 1 });
+
+        expect(() =>
+          registry.internalEndTraceStep(
+            "e-stack",
+            spanId,
+            "OrdersRepository",
+            "insert",
+            spanId,
+            error,
+          ),
+        ).not.toThrow();
+        registry.endTrace("e-stack");
+
+        const snapshot = await registry.pluckSnapshot("e-stack");
+        expect(snapshot!.error).toMatchObject({ message: "insert failed" });
+        expect(snapshot!.error?.stack).toBeUndefined();
+      });
+
+      it("is recorded with a message that is not a string as text", async () => {
+        startRequest("e-message");
+        const spanId = registry.internalStartTraceStep(
+          "e-message",
+          "OrdersService",
+          "place",
+          undefined,
+        );
+        const error = Object.assign(new Error(), { message: { code: 7 } });
+
+        registry.captureError("e-message", spanId, error, {});
+        registry.internalEndTraceStep(
+          "e-message",
+          spanId,
+          "OrdersService",
+          "place",
+          spanId,
+        );
+        registry.endTrace("e-message");
+
+        const snapshot = await registry.pluckSnapshot("e-message");
+        expect(snapshot!.traces[0].error).toMatchObject({
+          message: "[object Object]",
+        });
+      });
+    });
+
+    describe("captured errors past the per-trace limit", () => {
+      /** A redactor that counts what it is handed - the payload's cost. */
+      const countRedactions = () => {
+        const redactor = new LogRedactor();
+        const redact = vi.spyOn(redactor, "redactMessage");
+        registry.configureRedaction(redactor);
+        return redact;
+      };
+
+      it("builds the details of at most 20 errors captured on one span", async () => {
+        const redact = countRedactions();
+        vi.spyOn(
+          (registry as unknown as { logger: Logger }).logger,
+          "warn",
+        ).mockImplementation(() => undefined);
+        startRequest("e-many");
+        const spanId = registry.internalStartTraceStep(
+          "e-many",
+          "ImportService",
+          "import",
+          undefined,
+        );
+
+        // A handler reporting each rejected row of a client's list: every
+        // payload redacted the whole message and stack, and all but the last
+        // were thrown away by the next.
+        for (let row = 0; row < 1_000; row++) {
+          registry.captureError(
+            "e-many",
+            spanId,
+            new Error(`row ${row} rejected`),
+            { row },
+          );
+        }
+        registry.internalEndTraceStep(
+          "e-many",
+          spanId,
+          "ImportService",
+          "import",
+          spanId,
+        );
+        registry.endTrace("e-many");
+
+        // Message and stack, for 20 errors.
+        expect(redact).toHaveBeenCalledTimes(40);
+        const snapshot = await registry.pluckSnapshot("e-many");
+        const root = snapshot!.traces[0] as {
+          error?: { message: string };
+          tags?: Record<string, unknown>;
+        };
+        expect(root.error).toMatchObject({ message: "row 19 rejected" });
+        // Tags still merge past the limit.
+        expect(root.tags).toMatchObject({ row: 999 });
+        expect(snapshot).not.toHaveProperty("capturedErrors");
+      });
+
+      it("marks a span captured past the limit as failed, without its details", async () => {
+        const redact = countRedactions();
+        const warn = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+          .mockImplementation(() => undefined);
+        startRequest("e-spans");
+        const root = registry.internalStartTraceStep(
+          "e-spans",
+          "ImportService",
+          "import",
+          undefined,
+        );
+        for (let row = 0; row < 25; row++) {
+          const spanId = registry.internalStartTraceStep(
+            "e-spans",
+            "ImportService",
+            "importRow",
+            root,
+          );
+          registry.captureError(
+            "e-spans",
+            spanId,
+            new Error(`row ${row} rejected`),
+            {},
+          );
+          registry.internalEndTraceStep(
+            "e-spans",
+            spanId,
+            "ImportService",
+            "importRow",
+            spanId,
+          );
+        }
+        registry.internalEndTraceStep(
+          "e-spans",
+          root,
+          "ImportService",
+          "import",
+          root,
+        );
+        registry.endTrace("e-spans");
+
+        expect(redact).toHaveBeenCalledTimes(40);
+        expect(warn).toHaveBeenCalledOnce();
+        const snapshot = await registry.pluckSnapshot("e-spans");
+        const rows = (
+          snapshot!.traces[0] as { children: Array<{ error?: unknown }> }
+        ).children;
+        expect(rows).toHaveLength(25);
+        expect(rows[19].error).toMatchObject({ message: "row 19 rejected" });
+        expect(rows[20].error).toBe(true);
+        expect(rows[24].error).toBe(true);
+      });
+    });
+
     it("ignores a capture against an unknown trace", () => {
       expect(() =>
         registry.captureError("nope", "span", new Error("x"), {}),
@@ -622,6 +1055,120 @@ describe("OperationTraceRegistry", () => {
     });
   });
 
+  describe("spans past the per-trace limit", () => {
+    const quietWarnings = () =>
+      vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+    /** Opens and closes `count` sibling spans under `parent`. */
+    const openAndClose = (traceId: string, parent: string, count: number) => {
+      const opened: Array<string | undefined> = [];
+      for (let i = 0; i < count; i++) {
+        const spanId = registry.internalStartTraceStep(
+          traceId,
+          "InboxService",
+          "markRead",
+          parent,
+        );
+        opened.push(spanId);
+        if (spanId !== undefined) {
+          registry.internalEndTraceStep(
+            traceId,
+            spanId,
+            "InboxService",
+            "markRead",
+            spanId,
+          );
+        }
+      }
+      return opened;
+    };
+
+    it("opens at most 10,000 spans in one operation and counts the rest", async () => {
+      const warn = quietWarnings();
+      startRequest("cap-1");
+      const root = registry.internalStartTraceStep(
+        "cap-1",
+        "InboxGateway",
+        "markRead",
+        undefined,
+      )!;
+
+      // A handler calling a provider once per element of the list it was
+      // sent: every span is held until the operation ends.
+      const opened = openAndClose("cap-1", root, 12_000);
+      registry.internalEndTraceStep(
+        "cap-1",
+        root,
+        "InboxGateway",
+        "markRead",
+        root,
+      );
+      registry.endTrace("cap-1", { statusCode: 200 });
+      const snapshot = (await registry.pluckSnapshot(
+        "cap-1",
+      )) as RequestSnapshot;
+
+      expect(opened.filter((id) => id !== undefined)).toHaveLength(9_999);
+      expect(opened.slice(9_999).every((id) => id === undefined)).toBe(true);
+      expect(snapshot.tags).toEqual({ [UNRECORDED_SPANS_TAG]: 2_001 });
+      expect(snapshot.attributes?.statusCode).toBe(200);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("runs a manual span past the limit without recording it", async () => {
+      quietWarnings();
+      startRequest("cap-2");
+      const root = registry.internalStartTraceStep(
+        "cap-2",
+        "ReportService",
+        "build",
+        undefined,
+      )!;
+      openAndClose("cap-2", root, 9_999);
+
+      const result = await registry.createManualSpan(
+        "cap-2",
+        root,
+        "render page",
+        (span) => {
+          span.setTag("page", 1);
+          return "rendered";
+        },
+      );
+      registry.internalEndTraceStep(
+        "cap-2",
+        root,
+        "ReportService",
+        "build",
+        root,
+      );
+      registry.endTrace("cap-2");
+      const snapshot = (await registry.pluckSnapshot(
+        "cap-2",
+      )) as RequestSnapshot;
+
+      expect(result).toBe("rendered");
+      expect(snapshot.tags).toEqual({ [UNRECORDED_SPANS_TAG]: 1 });
+      expect(JSON.stringify(snapshot.traces)).not.toContain("render page");
+    });
+
+    it("counts each operation against the limit on its own", async () => {
+      quietWarnings();
+      startRequest("cap-3");
+      startRequest("cap-4");
+      openAndClose("cap-3", undefined as never, 10_000);
+
+      expect(
+        registry.internalStartTraceStep("cap-4", "Svc", "m", undefined),
+      ).toBeDefined();
+      expect(
+        registry.internalStartTraceStep("cap-3", "Svc", "m", undefined),
+      ).toBeUndefined();
+    });
+  });
+
   describe("route metadata", () => {
     it("records the matched route as the operation id", async () => {
       startRequest("r1");
@@ -645,6 +1192,99 @@ describe("OperationTraceRegistry", () => {
       expect(() =>
         registry.addRouteMetadataToTrace("nope", 0, "/x"),
       ).not.toThrow();
+    });
+
+    describe("a request nothing named", () => {
+      // A GraphQL query over GET that the GraphQL agent's request hook never
+      // labelled - refused by a middleware, sent as a persisted query's hash,
+      // or on an endpoint the hook is not registered for. Its query string is
+      // the operation itself, which the hook would have blanked.
+      const graphqlGet =
+        '/graphql?query=query($name:String!){patient(name:$name){id}}&variables={"name":"John Doe","diagnosis":"G40.9"}';
+
+      const unnamed = async (
+        traceId: string,
+        originalUrl: string,
+        rename?: string,
+      ) => {
+        registry.startTrace(traceId, {
+          protocol: "http",
+          attributes: { method: "GET", originalUrl },
+          tags: {},
+        });
+        const spanId = registry.internalStartTraceStep(
+          traceId,
+          "SessionMiddleware",
+          "use",
+          undefined,
+        );
+        if (rename) {
+          registry.setOperationId(traceId, rename);
+        }
+        registry.internalEndTraceStep(
+          traceId,
+          spanId,
+          "SessionMiddleware",
+          "use",
+          spanId,
+        );
+        registry.endTrace(traceId, { statusCode: 401 });
+        return (await registry.pluckSnapshot(traceId)) as RequestSnapshot;
+      };
+
+      it("is handed on without its query string", async () => {
+        const snapshot = await unnamed("r-unnamed", graphqlGet);
+
+        expect(snapshot.attributes?.originalUrl).toBe("/graphql");
+        expect(JSON.stringify(snapshot)).not.toContain("John Doe");
+      });
+
+      it("is handed on without it in absolute form too", async () => {
+        const snapshot = await unnamed(
+          "r-absolute",
+          `http://api.example.com${graphqlGet}`,
+        );
+
+        expect(snapshot.attributes?.originalUrl).toBe(
+          "http://api.example.com/graphql",
+        );
+      });
+
+      it("is handed on without it when renamed", async () => {
+        const snapshot = await unnamed("r-renamed", graphqlGet, "patients");
+
+        expect(snapshot.operationId).toBe("patients");
+        expect(snapshot.attributes?.originalUrl).toBe("/graphql");
+        expect(snapshot.attributes?.defaultOperationId).toBe("/graphql");
+      });
+
+      it("keeps the query string of a request a route named", async () => {
+        registry.startTrace("r-named", {
+          operationId: "/orders",
+          protocol: "http",
+          attributes: { method: "GET", originalUrl: "/orders?page=2" },
+          tags: {},
+        });
+        const spanId = registry.internalStartTraceStep(
+          "r-named",
+          "OrdersController",
+          "list",
+          undefined,
+        );
+        registry.internalEndTraceStep(
+          "r-named",
+          spanId,
+          "OrdersController",
+          "list",
+          spanId,
+        );
+        registry.endTrace("r-named", { statusCode: 200 });
+
+        const snapshot = (await registry.pluckSnapshot(
+          "r-named",
+        )) as RequestSnapshot;
+        expect(snapshot.attributes?.originalUrl).toBe("/orders?page=2");
+      });
     });
   });
 
@@ -884,6 +1524,120 @@ describe("OperationTraceRegistry", () => {
    * A failing message pattern that reported no status code at all would show up
    * as zero errors of either kind, which is the bug these cases pin down.
    */
+  describe("an outgoing call's error with no span around it", () => {
+    // A query in a cold Observable runs when Nest subscribes, after the
+    // provider that built it has returned: its span sits at the root, and
+    // whoever handles its error is not traced.
+    const duplicateKey = () =>
+      Object.assign(
+        new Error(
+          "Duplicate entry 'LK528c1f' for key 'activations.licence_key'",
+        ),
+        { code: "ER_DUP_ENTRY" },
+      );
+
+    const queryFails = (traceId: string, error: Error) => {
+      const spanId = registry.internalStartTraceStep(
+        traceId,
+        "mysql2",
+        "INSERT activations",
+        undefined,
+      );
+      registry.internalEndTraceStep(
+        traceId,
+        spanId,
+        "mysql2",
+        "INSERT activations",
+        spanId,
+        error,
+        true,
+      );
+    };
+
+    it("is not the error of a request that answered it with a 4xx", async () => {
+      startRequest("o1");
+      queryFails("o1", duplicateKey());
+      registry.endTrace("o1", { statusCode: 409 });
+      const snapshot = (await registry.pluckSnapshot("o1")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(409);
+      expect(snapshot.error).toBeUndefined();
+      // The call's own span still says what failed.
+      expect(snapshot.traces?.[0].error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("Duplicate"),
+        }),
+      );
+    });
+
+    it("does not turn a request answered with a fallback into a failure", async () => {
+      startRequest("o2");
+      queryFails("o2", duplicateKey());
+      registry.endTrace("o2", { statusCode: 200 });
+      const snapshot = (await registry.pluckSnapshot("o2")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(200);
+      expect(snapshot.error).toBeUndefined();
+    });
+
+    it("is the error of a request that failed with a 5xx and recorded no other", async () => {
+      startRequest("o3");
+      queryFails("o3", duplicateKey());
+      registry.endTrace("o3", { statusCode: 500 });
+      const snapshot = (await registry.pluckSnapshot("o3")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(500);
+      expect(snapshot.error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("Duplicate"),
+        }),
+      );
+    });
+
+    it("gives way to the error of a traced call", async () => {
+      startRequest("o4");
+      queryFails("o4", duplicateKey());
+      const spanId = registry.internalStartTraceStep(
+        "o4",
+        "LicencesService",
+        "activate",
+        undefined,
+      );
+      registry.internalEndTraceStep(
+        "o4",
+        spanId,
+        "LicencesService",
+        "activate",
+        spanId,
+        new Error("activation failed"),
+      );
+      registry.endTrace("o4", { statusCode: 500 });
+      const snapshot = (await registry.pluckSnapshot("o4")) as RequestSnapshot;
+
+      expect(snapshot.error).toEqual(
+        expect.objectContaining({ message: "activation failed" }),
+      );
+    });
+
+    it("still fails an operation whose transport reports no status", async () => {
+      registry.startTrace("o5", {
+        operationId: "licences.activate",
+        protocol: "TCP",
+        tags: {},
+      });
+      queryFails("o5", duplicateKey());
+      registry.endTrace("o5", {});
+      const snapshot = (await registry.pluckSnapshot("o5")) as RequestSnapshot;
+
+      expect(snapshot.attributes?.statusCode).toBe(500);
+      expect(snapshot.error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("Duplicate"),
+        }),
+      );
+    });
+  });
+
   describe("errors on transports without a status code", () => {
     const startRpc = (traceId: string) =>
       registry.startTrace(traceId, {
@@ -1078,6 +1832,60 @@ describe("OperationTraceRegistry", () => {
         name: "inner-work",
         origin: "manual",
       });
+    });
+
+    it("holds a name no longer than the collector takes", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      vi.spyOn(
+        (registry as unknown as { logger: Logger }).logger,
+        "warn",
+      ).mockImplementation(() => undefined);
+      startRequest("m-names");
+      const parent = registry.internalStartTraceStep(
+        "m-names",
+        "ImportService",
+        "import",
+        undefined,
+      );
+      // A span per row, named after a string of the client's: the tree held
+      // every name whole until the flush, which then read each in full.
+      const source = "s".repeat(70_000);
+      const names = [
+        "row 1",
+        `row 2 from ${"t".repeat(2_000)}`,
+        `row 3 from ${source}`,
+      ];
+      const delegates: Array<string | undefined> = [];
+      for (const name of names) {
+        await als.run(new Map([[CALLER_METADATA_KEY, parent]]), () =>
+          registry.createManualSpan("m-names", parent, name, (span) => {
+            delegates.push(span.name);
+            return registry.getActiveSpan(
+              "m-names",
+              als.getStore()!.get(CALLER_METADATA_KEY) as string,
+            )?.name;
+          }),
+        );
+      }
+      registry.internalEndTraceStep(
+        "m-names",
+        parent,
+        "ImportService",
+        "import",
+        parent,
+      );
+      registry.endTrace("m-names");
+
+      const snapshot = await registry.pluckSnapshot("m-names");
+      const recorded = (
+        snapshot!.traces[0] as { children: Array<{ name: string }> }
+      ).children.map((child) => child.name);
+      expect(recorded[0]).toBe("row 1");
+      expect(recorded[1]).toHaveLength(255);
+      expect(recorded[1].startsWith("row 2 from ttt")).toBe(true);
+      expect(recorded[2]).toBe("[span name of 70011 characters]");
+      // The callback still sees the name it gave.
+      expect(delegates).toEqual(names);
     });
 
     it("re-throws from the callback and records the failure", async () => {

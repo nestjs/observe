@@ -23,7 +23,6 @@ import {
   CollectedSnapshots,
   collectSnapshots,
   listenOnLoopback,
-  markIngesting,
   testObserveOptions,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
@@ -67,6 +66,8 @@ class CallerService {
   viaNodeHttp(path: string, headers?: Record<string, string>) {
     return nodeHttp(`${downstreamUrl}${path}`, headers);
   }
+
+  tick(): void {}
 }
 
 @Controller()
@@ -79,6 +80,15 @@ class CallerController {
       path,
       own ? { traceparent: own, tracestate: "caller=own" } : undefined,
     );
+  }
+
+  /** Past the spans one operation may open, then a call out. */
+  @Get("fetch-after-many")
+  async fetchAfterMany(@Query("path") path: string) {
+    for (let i = 0; i < 10_000; i += 1) {
+      this.caller.tick();
+    }
+    return this.caller.viaFetch(path);
   }
 
   @Get("node")
@@ -109,9 +119,6 @@ async function bootApp(overrides: Partial<ObserveOptions> = {}) {
     logger: false,
   });
   const collected = collectSnapshots(app);
-  // As though the collector had taken a first batch, which interop waits
-  // for - with the option off too, which must not care.
-  markIngesting(app);
   const url = await listenOnLoopback(app);
   return { app, collected, url };
 }
@@ -324,6 +331,20 @@ describe("ObserveModule: W3C trace context", () => {
         expect(callTo("/node-own").headers.traceparent).toBe(own);
       },
     );
+
+    it("still marks a fetch sampled when its operation has opened every span it may", async () => {
+      await request(url)
+        .get("/fetch-after-many")
+        .query({ path: "/after-many" })
+        .expect(200);
+
+      const snapshot = await snapshotFor("/after-many");
+      const context = readTraceContext(callTo("/after-many").headers);
+
+      expect(snapshot.tags?.["observe.unrecordedSpans"]).toBeGreaterThan(0);
+      expect(context?.traceId).toBe(snapshot.traceId.replace(/-/g, ""));
+      expect(context?.sampled).toBe(true);
+    });
 
     it("passes on an unsampled caller's decision", async () => {
       await request(url)
@@ -609,7 +630,6 @@ describe("ObserveModule: a trace through a hop that only passes traceparent on",
       logger: false,
     });
     backSnapshots = collectSnapshots(backApp);
-    markIngesting(backApp);
     backUrl = await listenOnLoopback(backApp);
 
     hop = createServer((req, res) => {
@@ -635,7 +655,6 @@ describe("ObserveModule: a trace through a hop that only passes traceparent on",
       logger: false,
     });
     frontSnapshots = collectSnapshots(frontApp);
-    markIngesting(frontApp);
     frontUrl = await listenOnLoopback(frontApp);
   });
 

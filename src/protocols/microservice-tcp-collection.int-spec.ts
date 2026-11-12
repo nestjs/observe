@@ -14,6 +14,7 @@ import {
   Payload,
   Transport,
 } from "@nestjs/microservices";
+import { connect } from "net";
 import { firstValueFrom } from "rxjs";
 import { createObserveModule } from "../observe.module.js";
 import {
@@ -91,9 +92,10 @@ describe("ObserveModule: microservice (TCP) collection", () => {
   let app: INestMicroservice;
   let client: ClientProxy;
   let collected: CollectedSnapshots;
+  let port: number;
 
   beforeAll(async () => {
-    const port = await freePort();
+    port = await freePort();
 
     app = await NestFactory.createMicroservice(TcpTestModule, {
       transport: Transport.TCP,
@@ -155,6 +157,35 @@ describe("ObserveModule: microservice (TCP) collection", () => {
     const ids = collected.items.map((item) => String(item.operationId));
     expect(ids.some((id) => id.includes("sum"))).toBe(true);
     expect(ids.some((id) => id.includes("orders.find"))).toBe(true);
+  });
+
+  it("names a message by the route it reached, however its sender spelt it", async () => {
+    // Nest finds the handler by the parsed, normalised pattern, so one
+    // handler answers to any number of spellings. Named by the text, each
+    // was an operation of the sender's choosing - and a route an
+    // `@Objective` on the handler was declared for, once an hour each.
+    const spellings = [
+      '{ "cmd" : "sum" }',
+      '{"cmd":"refund","cmd":"sum"}',
+      '{"cmd":"s\\u0075m"}',
+    ];
+    const socket = connect(port, "127.0.0.1");
+    try {
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      spellings.forEach((pattern, id) => {
+        const packet = JSON.stringify({ pattern, data: [id], id: `${id}` });
+        socket.write(`${packet.length}#${packet}`);
+      });
+      await waitForSnapshot(collected, () => collected.items.length >= 3);
+    } finally {
+      socket.destroy();
+    }
+
+    expect(collected.items.map((item) => item.operationId)).toEqual([
+      '{"cmd":"sum"}',
+      '{"cmd":"sum"}',
+      '{"cmd":"sum"}',
+    ]);
   });
 
   it("collects a handler that throws", async () => {

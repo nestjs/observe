@@ -4,7 +4,6 @@ import {
   IngestMode,
   isNotableSnapshot,
   isServerErrorSnapshot,
-  NOT_INGESTED_GRACE_MS,
 } from "./degraded-ingest.protocol.js";
 import { MAX_BATCH_ITEMS } from "./telemetry-wire-contract.js";
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
@@ -35,6 +34,8 @@ import { NodeRuntimeMetrics } from "../interfaces/node-runtime-metrics.interface
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import type { OtlpExportGrant } from "../otlp/otlp-export-grant.js";
+import { OtlpTraceExporter } from "../otlp/otlp-trace-exporter.service.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
 
 const SHARED_BUFFER_SIZE = 1024 * 1024 * 16; // 16 MB
@@ -199,6 +200,16 @@ interface AgentMetricsPayload {
   jobs?: Array<EncodedJobSnapshot>;
 }
 
+/**
+ * What a metric is told apart by in a batch: its type and the name as sent,
+ * which the encoder cuts to what the collector accepts. Matched on the
+ * metric's own name, two metrics whose names are cut alike would be two
+ * entries of one name.
+ */
+function sentMetricKey(encoded: EncodedCustomMetric): string {
+  return `${encoded.t}:${encoded.n}`;
+}
+
 @Injectable()
 export class ObserveAgentSharedBuffer {
   private readonly _sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
@@ -207,6 +218,8 @@ export class ObserveAgentSharedBuffer {
   private readonly encoder = new TextEncoder();
   private readonly logger = new Logger(ObserveAgentSharedBuffer.name);
   private _mainThreadBuffer: AgentMetricsPayload | null = null;
+  /** See `reportUnencodableMetric`. */
+  private hasReportedUnencodableMetric = false;
 
   /**
    * Log lines that did not fit the current batch, oldest first. Survives
@@ -222,6 +235,11 @@ export class ObserveAgentSharedBuffer {
    */
   private readonly _awaitingFlushAck = new Set<Counter<any> | Summary<any>>();
 
+  /** Metrics changed in the current buffer, encoded as it is written. */
+  private readonly _metricsToEncode = new Set<
+    Counter<any> | Gauge<any> | Summary<any>
+  >();
+
   get sharedBuffer() {
     return this._sharedBuffer;
   }
@@ -233,6 +251,9 @@ export class ObserveAgentSharedBuffer {
     // build it; the module always provides it.
     @Optional()
     private readonly objectivesRegistry?: ObjectivesRegistry,
+    // Optional for the same reason.
+    @Optional()
+    private readonly otlpTraceExporter?: OtlpTraceExporter,
   ) {}
 
   insertRequestSnapshot(snapshot: RequestSnapshot) {
@@ -243,10 +264,21 @@ export class ObserveAgentSharedBuffer {
     // over a single miss, so fall back to the transport's URL, and drop the
     // snapshot when even that is absent rather than poison the batch it would
     // ride in. The URL is folded to a route-like path first, or every query
-    // string and id would be a route of its own; `originalUrl` keeps it whole.
+    // string and id would be a route of its own. `originalUrl` keeps its ids;
+    // its query string the registry has already cut, as nothing that named
+    // the request said what it holds.
     snapshot.operationId ??= fallbackOperationId(
       snapshot.attributes?.originalUrl,
     );
+    // A full grant exports ahead of everything below that can leave the
+    // snapshot out: the collector's limits and its answers about this
+    // account decide what reaches Observe, not what an OTLP receiver of the
+    // application's own is sent. The raw snapshot, which the encoder below
+    // only copies. A capped grant exports what the batch keeps, further down.
+    const otlpExport = this.otlpExportGrant();
+    if (otlpExport === "full") {
+      this.otlpTraceExporter?.exportRequestSnapshot(snapshot);
+    }
     if (!snapshot.operationId) {
       if (this.options.debug) {
         this.logger.debug(
@@ -282,10 +314,15 @@ export class ObserveAgentSharedBuffer {
       // further down - they are not telemetry.
       if (this.sendsWhileErrorsOnly(encodedSnapshot)) {
         this._mainThreadBuffer.snapshots.push(encodedSnapshot);
+        if (otlpExport === "capped") {
+          // Sent, and never with its tree.
+          this.otlpTraceExporter?.exportRequestSnapshot(snapshot, false);
+        }
       } else {
         this.withheldSnapshots += 1;
       }
     } else {
+      let keepsTree = true;
       if (this.isDegraded() && !isNotableSnapshot(encodedSnapshot)) {
         // The collector is discarding these on arrival; shipping them costs
         // the application its own CPU and bandwidth for nothing. The snapshot
@@ -294,8 +331,12 @@ export class ObserveAgentSharedBuffer {
         // count goes with it, because it is the only record these existed.
         this.countTruncated(encodedSnapshot.t);
         encodedSnapshot.t = [];
+        keepsTree = false;
       }
       this._mainThreadBuffer.snapshots.push(encodedSnapshot);
+      if (otlpExport === "capped") {
+        this.otlpTraceExporter?.exportRequestSnapshot(snapshot, keepsTree);
+      }
     }
 
     // Read off the raw snapshot: the handler's span carries `Class.method`,
@@ -316,6 +357,12 @@ export class ObserveAgentSharedBuffer {
   }
 
   insertJobSnapshot(jobSnapshot: JobSnapshot) {
+    // A full grant exports before the cap below, as for a request; a capped
+    // one what the batch keeps.
+    const otlpExport = this.otlpExportGrant();
+    if (otlpExport === "full") {
+      this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot);
+    }
     if (!this._mainThreadBuffer) {
       this._mainThreadBuffer = this.createEmptyPayload();
     }
@@ -344,18 +391,26 @@ export class ObserveAgentSharedBuffer {
       // makes it a server error - which is what the collector keeps of it too.
       if (this.sendsWhileErrorsOnly(encodedJobSnapshot)) {
         this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
+        if (otlpExport === "capped") {
+          this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot, false);
+        }
       } else {
         this.withheldJobs += 1;
       }
     } else {
+      let keepsTree = true;
       if (this.isDegraded() && !isNotableSnapshot(encodedJobSnapshot)) {
         // A job carries no status code, so the same rule grades it on its
         // error and its duration - which is what the collector does with it
         // too.
         this.countTruncated(encodedJobSnapshot.t);
         encodedJobSnapshot.t = [];
+        keepsTree = false;
       }
       this._mainThreadBuffer.jobs.push(encodedJobSnapshot);
+      if (otlpExport === "capped") {
+        this.otlpTraceExporter?.exportJobSnapshot(jobSnapshot, keepsTree);
+      }
     }
   }
 
@@ -377,17 +432,14 @@ export class ObserveAgentSharedBuffer {
   private errorsOnly = false;
 
   /**
-   * Whether the collector is taking this app's telemetry - see `isIngesting`.
-   * False until it accepts a first batch: what has not been shown to reach
-   * NestJS Observe does not count as reaching it.
+   * How far this app's reporting to NestJS Observe has got - see
+   * `isReporting` and `isIngesting`. `off` until the worker starts with the
+   * application, `started` from then until the collector accepts a batch,
+   * and `ingesting` from that batch on. Refused credentials and a stopped
+   * worker set it back to `off`, and only an accepted batch moves it on
+   * from there.
    */
-  private ingesting = false;
-
-  /**
-   * When batches began failing to get in, since the last one that did; zero
-   * while they get in.
-   */
-  private failingSince = 0;
+  private reporting: "off" | "started" | "ingesting" = "off";
 
   /**
    * Requests and jobs that errors-only ingest withheld from the batch being
@@ -432,54 +484,110 @@ export class ObserveAgentSharedBuffer {
   }
 
   /**
-   * Whether the collector is taking this app's telemetry: from the first
-   * batch it accepts, until it refuses the app's credentials, the worker
-   * stops, or batches have kept failing to get in for
-   * `NOT_INGESTED_GRACE_MS` - and again from the next batch it accepts.
+   * Whether this app reports to NestJS Observe, as far as the agent can tell:
+   * from start-up, once its worker is running, until the collector refuses
+   * the app's credentials or the worker stops - and again from the next batch
+   * the collector accepts.
+   *
+   * Nothing has to get in first. A service's first requests are when a new
+   * instance joins the traces around it, and an agent set up to report -
+   * enabled, with credentials - almost always does. Credentials the collector
+   * refuses are learned from the first batch the worker sends, a flush
+   * interval into the app's traffic; until then they count as reporting.
+   *
+   * A batch that fails to get in for any other reason - a collector that is
+   * down or slow to answer, a 5xx, a 429 pause, however long - leaves it as
+   * it is: that is an outage at NestJS Observe, and the traces running through
+   * the services around this one must not break over it. Refused credentials
+   * are a verdict on this app, and a stopped worker sends nothing until a new
+   * one gets a batch in.
    *
    * OpenTelemetry interop runs on it (see `openTelemetry`): the agent reads
    * and sends `traceparent`, and follows an OpenTelemetry SDK in the process,
-   * only while it is also reporting to NestJS Observe. So an agent that sends
-   * Observe nothing - `enabled: false`, no credentials, credentials the
-   * collector refuses - never turns it on.
+   * only beside reporting to NestJS Observe. So an agent that sends Observe
+   * nothing - `enabled: false`, no credentials - never turns it on.
+   */
+  isReporting(): boolean {
+    return this.reporting !== "off";
+  }
+
+  /**
+   * Whether the collector takes this app's telemetry: from the first batch
+   * it accepts, until it refuses the app's credentials or the worker stops -
+   * and again from the next batch it accepts. What its replies grant, an
+   * OTLP export say, holds only while it does.
    */
   isIngesting(): boolean {
-    return this.ingesting;
+    return this.reporting === "ingesting";
+  }
+
+  /**
+   * The worker started with the application, set up to report: see
+   * `isReporting`. A worker restarted after a stop is not this - it has to
+   * get a batch in first - and a batch already taken stays taken.
+   */
+  recordStarted(): void {
+    if (this.reporting === "off") {
+      this.reporting = "started";
+    }
   }
 
   /** The collector accepted a batch, whatever it then kept of it. */
   recordAccepted(): void {
-    this.ingesting = true;
-    this.failingSince = 0;
+    this.reporting = "ingesting";
   }
 
   /** The collector refused the app's credentials. */
   recordRefused(): void {
-    this.ingesting = false;
-    this.failingSince = 0;
-  }
-
-  /**
-   * A batch did not get in - see `NotIngestedReason`. `pausedUntil` is when a
-   * paused worker sends again: nothing gets in before then, so a pause longer
-   * than the grace ends ingesting at once rather than after it.
-   */
-  recordFailed(pausedUntil = 0, now = Date.now()): void {
-    if (this.failingSince === 0) {
-      this.failingSince = now;
-    }
-    if (
-      Math.max(now, pausedUntil) - this.failingSince >=
-      NOT_INGESTED_GRACE_MS
-    ) {
-      this.ingesting = false;
-    }
+    this.reporting = "off";
   }
 
   /** The worker stopped; a restarted one has to get a batch in again. */
   recordStopped(): void {
-    this.ingesting = false;
-    this.failingSince = 0;
+    this.reporting = "off";
+  }
+
+  /**
+   * What the collector's last accepted reply granted `otlp` - see
+   * `OtlpExportGrant`. Nothing until one says otherwise: what this agent may
+   * export is the collector's to say, for the plan the app's account is on.
+   */
+  private otlpExport: OtlpExportGrant = "off";
+
+  /**
+   * Until when a `capped` grant holds (epoch ms), refreshed by every reply
+   * that repeats it.
+   *
+   * A capped export is what NestJS Observe keeps, and the agent learns what
+   * that is only from replies. With none coming - an account the collector
+   * refuses at its limit, an outage - it would fall back on exporting every
+   * span once `isDegraded` lapsed. So the grant lapses first: it is set just
+   * before the verdict for the same reply, on the same TTL. A `full` grant
+   * holds until a reply says otherwise, and export then runs for as long as
+   * `isIngesting` does.
+   */
+  private otlpExportCappedUntil = 0;
+
+  /** Records what the collector's last accepted reply granted `otlp`. */
+  setOtlpExport(grant: OtlpExportGrant, now = Date.now()): void {
+    this.otlpExport = grant;
+    this.otlpExportCappedUntil = grant === "capped" ? now + DEGRADED_TTL_MS : 0;
+  }
+
+  /**
+   * What `otlp` may export right now: the collector's grant, while the
+   * collector takes this app's telemetry (`isIngesting`) - export runs beside
+   * reporting to NestJS Observe, never instead of it - and `off` otherwise.
+   * Asked once per operation, as it is handed over.
+   */
+  otlpExportGrant(now = Date.now()): OtlpExportGrant {
+    if (!this.otlpTraceExporter?.enabled || !this.isIngesting()) {
+      return "off";
+    }
+    if (this.otlpExport === "capped" && now >= this.otlpExportCappedUntil) {
+      return "off";
+    }
+    return this.otlpExport;
   }
 
   /**
@@ -648,21 +756,82 @@ export class ObserveAgentSharedBuffer {
       this._awaitingFlushAck.add(metric);
     }
 
-    // Matched on the name as sent, which the encoder cuts to what the
-    // collector accepts. Matched on the metric's own, a metric whose name is
-    // cut would be buffered again on every change.
-    const encoded = CustomMetricsEncoder.encode(metric as CustomMetric);
-    const existingMetricIndex = this._mainThreadBuffer.custom.findIndex(
-      (m) => m.n === encoded.n && m.t === encoded.t,
-    );
-    if (existingMetricIndex !== -1) {
-      this._mainThreadBuffer.custom[existingMetricIndex] = {
-        ...this._mainThreadBuffer.custom[existingMetricIndex],
-        ...encoded,
-      };
-    } else {
-      this._mainThreadBuffer.custom.push(encoded);
+    // Encoded when the batch is written, not on every change: a metric is
+    // changed on the request path, and encoding one reads all of it - a
+    // summary sorts its sample once per quantile, a counter or gauge at its
+    // series cap copies a thousand series - so encoding on every change cost
+    // the main thread more the fuller the window got, for an entry the next
+    // change replaced.
+    this._metricsToEncode.add(metric);
+  }
+
+  /**
+   * Encodes every metric changed in the window into the batch's `custom`
+   * section, once each.
+   *
+   * At most `MAX_BATCH_ITEMS` entries: the collector refuses a batch with
+   * more, and everything else of the window with it. A metric left out is
+   * not marked as delivered, so a counter's increase or a summary's window
+   * rides the next batch the metric changes in.
+   */
+  private placeChangedMetrics(): void {
+    const custom = this._mainThreadBuffer?.custom;
+    if (!custom) {
+      return;
     }
+
+    const placed = new Map<string, number>();
+    custom.forEach((encoded, index) =>
+      placed.set(sentMetricKey(encoded), index),
+    );
+
+    for (const metric of this._metricsToEncode) {
+      let encoded: EncodedCustomMetric;
+      try {
+        encoded = CustomMetricsEncoder.encode(metric as CustomMetric);
+      } catch (error) {
+        // One metric the encoder cannot read - a label name that is not a
+        // string at run time - is left out rather than costing the batch,
+        // and is not marked as delivered.
+        if (metric instanceof Counter || metric instanceof Summary) {
+          this._awaitingFlushAck.delete(metric);
+        }
+        this.reportUnencodableMetric(metric, error);
+        continue;
+      }
+      const key = sentMetricKey(encoded);
+      const existing = placed.get(key);
+      if (existing !== undefined) {
+        custom[existing] = { ...custom[existing], ...encoded };
+      } else if (custom.length < MAX_BATCH_ITEMS) {
+        placed.set(key, custom.length);
+        custom.push(encoded);
+      } else if (metric instanceof Counter || metric instanceof Summary) {
+        this._awaitingFlushAck.delete(metric);
+      }
+    }
+  }
+
+  /** Once for the process: the same metric fails the same way every window. */
+  private reportUnencodableMetric(
+    metric: Counter<any> | Gauge<any> | Summary<any>,
+    error: unknown,
+  ): void {
+    if (this.hasReportedUnencodableMetric) {
+      return;
+    }
+    this.hasReportedUnencodableMetric = true;
+    let reason: string;
+    try {
+      reason = error instanceof Error ? error.message : String(error);
+    } catch {
+      reason = "an unprintable error";
+    }
+    // Typed as a string, and as unchecked at run time as what failed.
+    const name: unknown = metric.name;
+    this.logger.warn(
+      `Custom metric "${typeof name === "string" ? name.slice(0, 100) : typeof name}" could not be encoded and is left out of the batch. Later metrics that cannot be encoded are not reported: ${reason}`,
+    );
   }
 
   /**
@@ -761,6 +930,9 @@ export class ObserveAgentSharedBuffer {
   encodeAndWrite() {
     this.withholdLogs();
 
+    this.placeChangedMetrics();
+    this._metricsToEncode.clear();
+
     if (this.options.debug) {
       if (this._mainThreadBuffer?.snapshots) {
         this.logger.debug(
@@ -774,14 +946,8 @@ export class ObserveAgentSharedBuffer {
       }
     }
 
-    const json = JSON.stringify(this._mainThreadBuffer);
-    const jsonBytes = this.encoder.encode(json);
+    const jsonBytes = this.encodeToFit();
     const jsonLength = jsonBytes.length;
-
-    if (jsonLength > SHARED_BUFFER_SIZE - 8) {
-      // 8 bytes reserved for the lock and length
-      throw new Error("Payload too large for shared buffer");
-    }
 
     // Offset 4 for the lock value
     const view = new DataView(this._sharedBuffer, 4, 4);
@@ -803,8 +969,126 @@ export class ObserveAgentSharedBuffer {
     this._awaitingFlushAck.clear();
   }
 
+  /**
+   * The batch as the bytes written to the shared slot, which they have to fit.
+   *
+   * `maxTracesPerBatch` bounds how many operations a batch holds, not how
+   * large each is, and parts of one are as long as a client made them - a
+   * URL, the text of an error. One entry can also hold what `JSON.stringify`
+   * refuses: a tag of a type nothing checked at run time. Either way the whole
+   * batch was thrown away, with every other request, job, log line and metric
+   * of the window. Such a batch is now sent without the entries that keep it
+   * from being written, so they cost only themselves.
+   *
+   * A batch that fits is serialised once, as before; only one that does not
+   * has its entries measured.
+   */
+  private encodeToFit(): Uint8Array {
+    // 8 bytes reserved for the lock and length
+    const capacity = SHARED_BUFFER_SIZE - 8;
+    const whole = this.encodeWithin(capacity);
+    if (whole instanceof Uint8Array) {
+      return whole;
+    }
+
+    const dropped = this.dropEntriesToFit(capacity);
+    const fitted = this.encodeWithin(capacity);
+    if (!(fitted instanceof Uint8Array)) {
+      // What is left is in a section no entry can be taken out of.
+      throw fitted ?? new Error("Payload too large for shared buffer");
+    }
+    this.logger.warn(
+      `A telemetry batch could not be written whole - it came to more than the ${capacity} bytes one flush carries, or held a value that cannot be serialised - and was sent without ${dropped} of its entries: any that cannot be serialised, then the largest.`,
+    );
+    return fitted;
+  }
+
+  /**
+   * The batch as bytes; nothing when it comes to more than `capacity`, and
+   * what `JSON.stringify` threw when it cannot be serialised at all.
+   */
+  private encodeWithin(capacity: number): Uint8Array | Error | undefined {
+    let json: string;
+    try {
+      json = JSON.stringify(this._mainThreadBuffer);
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+    // Each character is a byte at least, so a longer one is known not to fit.
+    if (json.length > capacity) {
+      return undefined;
+    }
+    const bytes = this.encoder.encode(json);
+    return bytes.length > capacity ? undefined : bytes;
+  }
+
+  /**
+   * Takes request snapshots, job snapshots and log entries out of the batch -
+   * any that cannot be serialised, then the largest - until what is left
+   * comes to at most `capacity` bytes, and returns how many went. Metrics are
+   * left in: a metric's window closes once the batch is written, so one taken
+   * out here would be lost rather than carried to the next.
+   */
+  private dropEntriesToFit(capacity: number): number {
+    const batch = this._mainThreadBuffer;
+    if (!batch) {
+      return 0;
+    }
+
+    const dropped = new Set<unknown>();
+    const sized: Array<{ entry: unknown; bytes: number }> = [];
+    for (const entry of [
+      ...batch.snapshots,
+      ...(batch.jobs ?? []),
+      ...(batch.logs ?? []),
+    ]) {
+      try {
+        // One more for the comma that follows it.
+        sized.push({
+          entry,
+          bytes: Buffer.byteLength(JSON.stringify(entry)) + 1,
+        });
+      } catch {
+        dropped.add(entry);
+      }
+    }
+    sized.sort((a, b) => b.bytes - a.bytes);
+
+    let total = 0;
+    try {
+      total = Buffer.byteLength(
+        JSON.stringify({ ...batch, snapshots: [], jobs: [], logs: [] }),
+      );
+    } catch {
+      // Left to the encode that follows, which reports it.
+    }
+    for (const { bytes } of sized) {
+      total += bytes;
+    }
+    for (const { entry, bytes } of sized) {
+      if (total <= capacity) {
+        break;
+      }
+      dropped.add(entry);
+      total -= bytes;
+    }
+
+    if (dropped.size > 0) {
+      const kept = (entry: unknown) => !dropped.has(entry);
+      batch.snapshots = batch.snapshots.filter(kept);
+      if (batch.jobs) {
+        batch.jobs = batch.jobs.filter(kept);
+      }
+      if (batch.logs) {
+        batch.logs = batch.logs.filter(kept);
+      }
+    }
+    return dropped.size;
+  }
+
   resetMainThreadBuffer() {
     this._mainThreadBuffer = null;
+    this._metricsToEncode.clear();
     this.withheldSnapshots = 0;
     this.withheldJobs = 0;
   }

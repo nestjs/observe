@@ -12,11 +12,13 @@ import { NestFactory } from "@nestjs/core";
 import { IoAdapter } from "@nestjs/platform-socket.io";
 import { WsAdapter } from "@nestjs/platform-ws";
 import {
+  ConnectedSocket,
   MessageBody,
   SubscribeMessage,
   WebSocketGateway,
   WsException,
 } from "@nestjs/websockets";
+import { EventEmitter } from "events";
 import { createServer, Server } from "http";
 import { connect } from "net";
 import pg from "pg";
@@ -26,7 +28,9 @@ import { WebSocket } from "ws";
 import { ObserveOptions } from "../interfaces/observe-options.interface.js";
 import { CompleteTraceEventNode } from "../interfaces/trace-events.interfaces.js";
 import { createObserveModule } from "../observe.module.js";
+import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
+import { nestMajor } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -57,6 +61,13 @@ const postgresReachable = await new Promise<boolean>((resolve) => {
 
 let downstreamUrl = "";
 let pool: pg.Pool | undefined;
+
+/** `hold` handlers still waiting: their trace, their socket, and their answer. */
+const holding: Array<{
+  traceId: string | null;
+  socket: EventEmitter;
+  answer: () => void;
+}> = [];
 
 @Injectable()
 class MembersOnlyGuard implements CanActivate {
@@ -143,6 +154,35 @@ class DeskGateway {
   @SubscribeMessage("sampled-out")
   sampledOut() {
     return { event: "sampled-out-done", data: null };
+  }
+
+  // Ends its own client's connection, as a logout or a kick does, and
+  // finishes after it: socket.io emits `disconnect` from inside `disconnect()`.
+  @SubscribeMessage("leave")
+  async leave(
+    @ConnectedSocket()
+    socket: EventEmitter & { disconnect?: () => void; close?: () => void },
+  ) {
+    if (typeof socket.disconnect === "function") {
+      socket.disconnect();
+    } else {
+      socket.close?.();
+    }
+    await Promise.resolve();
+    return { event: "left", data: true };
+  }
+
+  // Waits for what only its client could supply - an acknowledgement, the
+  // next frame - until the test answers for it.
+  @SubscribeMessage("hold")
+  hold(@ConnectedSocket() socket: EventEmitter) {
+    return new Promise((resolve) => {
+      holding.push({
+        traceId: this.tracer.currentTraceId(),
+        socket,
+        answer: () => resolve({ event: "held", data: true }),
+      });
+    });
   }
 }
 
@@ -246,7 +286,7 @@ async function bootApp(platform: Platform, ws: ObserveOptions["ws"]) {
   const port = await freePort();
   await app.listen(port);
   const client = await connectClient(platform, port);
-  return { app, collected, client, sampled };
+  return { app, collected, client, sampled, port };
 }
 
 const spansOf = (
@@ -274,6 +314,12 @@ describe.each<Platform>(["ws", "socket.io"])(
   (platform) => {
     let downstream: Server;
 
+    // Nest 12's exception filter sends a native WebSocket client the
+    // `exception` message; Nest 11's emits it on the server's own socket
+    // object, which a `ws` client never hears. The cases that wait for it run
+    // on socket.io there - what the agent reports is the same on both.
+    const itHearingExceptions = it.skipIf(platform === "ws" && nestMajor < 12);
+
     beforeAll(async () => {
       downstream = createServer((_req, res) => {
         res.setHeader("content-type", "application/json");
@@ -296,11 +342,14 @@ describe.each<Platform>(["ws", "socket.io"])(
       let collected: CollectedSnapshots;
       let client: TestClient;
       let sampled: Array<{ protocol: string; attributes: unknown }>;
+      let port: number;
+      let registry: OperationTraceRegistry;
 
       beforeAll(async () => {
-        ({ app, collected, client, sampled } = await bootApp(platform, {
+        ({ app, collected, client, sampled, port } = await bootApp(platform, {
           setAttributes: (message) => ({ pattern: message.pattern }),
         }));
+        registry = app.get(OperationTraceRegistry, { strict: false });
         // After the app: the agent patches the driver from its constructor.
         if (postgresReachable) {
           pool = new pg.Pool({ ...PG, max: 2 });
@@ -320,24 +369,27 @@ describe.each<Platform>(["ws", "socket.io"])(
           (item) => item.operationId === `DeskGateway:${pattern}`,
         );
 
-      it("reports a WsException with its payload, counted as unhandled: it is not an IntrinsicException, which is the line the agent draws", async () => {
-        const exception = client.next("exception");
-        client.send("refuse");
+      itHearingExceptions(
+        "reports a WsException with its payload, counted as unhandled: it is not an IntrinsicException, which is the line the agent draws",
+        async () => {
+          const exception = client.next("exception");
+          client.send("refuse");
 
-        // Nest's filter still tells the client.
-        expect(await exception).toMatchObject({ message: "not today" });
-        const snapshot = await snapshotOf("refuse");
-        expect(snapshot.protocol).toBe("ws");
-        expect(snapshot.error).toMatchObject({
-          cls: "WsException",
-          message: "not today",
-        });
-        expect(snapshot.traces[0]).toMatchObject({
-          className: "DeskGateway",
-          methodKey: "refuse",
-        });
-        expect(snapshot.attributes?.statusCode).toBe(500);
-      });
+          // Nest's filter still tells the client.
+          expect(await exception).toMatchObject({ message: "not today" });
+          const snapshot = await snapshotOf("refuse");
+          expect(snapshot.protocol).toBe("ws");
+          expect(snapshot.error).toMatchObject({
+            cls: "WsException",
+            message: "not today",
+          });
+          expect(snapshot.traces[0]).toMatchObject({
+            className: "DeskGateway",
+            methodKey: "refuse",
+          });
+          expect(snapshot.attributes?.statusCode).toBe(500);
+        },
+      );
 
       it("reports an intrinsic exception thrown by a handler as handled, under its own 4xx", async () => {
         client.send("decline");
@@ -400,21 +452,24 @@ describe.each<Platform>(["ws", "socket.io"])(
         });
       });
 
-      it("reports a message a guard refused, with the guard as the root span and the handler never run", async () => {
-        const exception = client.next("exception");
-        client.send("vault", "stranger");
+      itHearingExceptions(
+        "reports a message a guard refused, with the guard as the root span and the handler never run",
+        async () => {
+          const exception = client.next("exception");
+          client.send("vault", "stranger");
 
-        expect(await exception).toMatchObject({ message: "members only" });
-        const snapshot = await snapshotOf("vault");
-        expect(snapshot.traces[0]).toMatchObject({
-          className: "MembersOnlyGuard",
-          methodKey: "canActivate",
-        });
-        expect(
-          spansOf(snapshot.traces as CompleteTraceEventNode[], "DeskGateway"),
-        ).toEqual([]);
-        expect((snapshot.error as { cls?: string })?.cls).toBe("WsException");
-      });
+          expect(await exception).toMatchObject({ message: "members only" });
+          const snapshot = await snapshotOf("vault");
+          expect(snapshot.traces[0]).toMatchObject({
+            className: "MembersOnlyGuard",
+            methodKey: "canActivate",
+          });
+          expect(
+            spansOf(snapshot.traces as CompleteTraceEventNode[], "DeskGateway"),
+          ).toEqual([]);
+          expect((snapshot.error as { cls?: string })?.cls).toBe("WsException");
+        },
+      );
 
       it("reports a message a guard let through, guard first and handler after", async () => {
         const reply = client.next("vault-open");
@@ -507,6 +562,50 @@ describe.each<Platform>(["ws", "socket.io"])(
           attributes: { gateway: "DeskGateway", pattern: "sampled-out" },
         });
       });
+
+      it("drops the traces of a client's waiting handlers when it leaves, watching it with one listener however many it sends", async () => {
+        holding.length = 0;
+        const leaving = await connectClient(platform, port);
+        const leftAt = platform === "ws" ? "close" : "disconnect";
+
+        leaving.send("hold");
+        await waitFor(() => holding.length === 1, 3_000, "a handler to wait");
+        const { socket } = holding[0];
+        const listeners = socket.listenerCount(leftAt);
+        leaving.send("hold");
+        leaving.send("hold");
+        await waitFor(() => holding.length === 3, 3_000, "three handlers");
+
+        expect(socket.listenerCount(leftAt)).toBe(listeners);
+        const traceIds = holding.map(({ traceId }) => traceId as string);
+        expect(traceIds.every((traceId) => registry.hasTrace(traceId))).toBe(
+          true,
+        );
+
+        leaving.close();
+        await waitFor(
+          () => traceIds.every((traceId) => !registry.hasTrace(traceId)),
+          3_000,
+          "the traces to be dropped",
+        );
+
+        // Not reported either when the handlers settle after all: an
+        // abandoned trace stays abandoned.
+        for (const { answer } of holding) {
+          answer();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(collected.operationIds).not.toContain("DeskGateway:hold");
+      });
+
+      it("still reports a handler that ends its own client's connection", async () => {
+        const leaving = await connectClient(platform, port);
+
+        leaving.send("leave");
+
+        await expect(snapshotOf("leave")).resolves.toBeDefined();
+        leaving.close();
+      });
     });
 
     describe("with ws.ignore rejecting every message", () => {
@@ -525,23 +624,26 @@ describe.each<Platform>(["ws", "socket.io"])(
         await app?.close();
       });
 
-      it("switches gateway tracing off: handlers answer, fail and call out as before, and nothing is reported", async () => {
-        const reply = client.next("looked-up");
-        client.send("lookup");
-        expect(await reply).toBe("looked-up");
+      itHearingExceptions(
+        "switches gateway tracing off: handlers answer, fail and call out as before, and nothing is reported",
+        async () => {
+          const reply = client.next("looked-up");
+          client.send("lookup");
+          expect(await reply).toBe("looked-up");
 
-        const exception = client.next("exception");
-        client.send("refuse");
-        expect(await exception).toMatchObject({ message: "not today" });
+          const exception = client.next("exception");
+          client.send("refuse");
+          expect(await exception).toMatchObject({ message: "not today" });
 
-        const whoami = client.next("you-are");
-        client.send("whoami");
-        // Still a trace id of its own, for logs - just no trace.
-        expect(await whoami).toEqual(expect.any(String));
+          const whoami = client.next("you-are");
+          client.send("whoami");
+          // Still a trace id of its own, for logs - just no trace.
+          expect(await whoami).toEqual(expect.any(String));
 
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(collected.items).toEqual([]);
-      });
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          expect(collected.items).toEqual([]);
+        },
+      );
     });
   },
 );

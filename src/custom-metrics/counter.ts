@@ -1,5 +1,10 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
-import { admitsFinite } from "./finite-value.util.js";
+import { admitsFinite, admitsReading } from "./finite-value.util.js";
+import {
+  admitsLabelValues,
+  isLabelSet,
+  MAX_SERIES_KEY_LENGTH,
+} from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -25,19 +30,14 @@ export function stringifyLabel(label: Record<string, string | number>): string {
  * flushed for the life of the process. That is correct for a counter and fatal
  * for one labelled with something unbounded - a user id, a request id, a raw
  * URL - which grows this object forever inside the *host application's* memory
- * and adds a row per series to every flush. Summaries need no such cap; their
- * windows are cleared on each flush.
+ * and adds a row per series to every flush. A summary's labels go when its
+ * window does, on each flush written - but a flush that is never written, by
+ * an agent switched off or without credentials, never clears one, so a
+ * summary that declared no labels is held to the same number per window.
  *
  * A thousand is far above a sensible label set and far below a leak.
  */
 export const MAX_SERIES_PER_METRIC = 1_000;
-
-/**
- * The longest series key - the serialised label combination - the collector
- * accepts. A longer one is not truncated there: the whole batch it rides in is
- * refused, logs and spans included.
- */
-const MAX_SERIES_KEY_LENGTH = 255;
 
 /**
  * Whether a metric may record under `key`: a series it already has, or a new
@@ -101,6 +101,9 @@ export class Counter<TLabel extends string = typeof DEFAULT_LABEL>
 
   /** Whether a non-finite value has already been reported, likewise. */
   private readonly nonFinite = { warned: false };
+
+  /** Whether a label value no key can be made from has been reported. */
+  private readonly labelValues = { warned: false };
 
   /**
    * The name of the counter.
@@ -317,38 +320,64 @@ export class Counter<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot increment a counter with labels without specifying a label. For example, use `counter.increment({ route: '/login' })`.",
       );
     }
 
-    if (typeof labelOrValue === "object") {
+    if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
+      }
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const incrementValue = value ?? 1;
+      if (!admitsFinite(this.name, incrementValue, this.nonFinite)) {
+        return;
+      }
+      const reading =
+        (this.value[stringifiedLabel] ?? this._initialValue) + incrementValue;
       if (
-        !admitsFinite(this.name, incrementValue, this.nonFinite) ||
+        !this.admitsNewReading(stringifiedLabel, reading) ||
         !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
       ) {
         return;
       }
-      this.value[stringifiedLabel] =
-        (this.value[stringifiedLabel] ?? this._initialValue) + incrementValue;
+      this.value[stringifiedLabel] = reading;
     } else {
       const incrementValue = labelOrValue ?? 1;
       if (!admitsFinite(this.name, incrementValue, this.nonFinite)) {
         return;
       }
-      this.value[DEFAULT_LABEL] =
+      const reading =
         (this.value[DEFAULT_LABEL] ?? this._initialValue) + incrementValue;
+      if (!this.admitsNewReading(DEFAULT_LABEL, reading)) {
+        return;
+      }
+      this.value[DEFAULT_LABEL] = reading;
     }
     this._lastUpdated = Date.now();
 
     if (this._onChange) {
       this._onChange(this);
     }
+  }
+
+  /**
+   * Whether `key` may move to `reading`. The reading and its increase since
+   * the last flush both go on the wire, and the increase can leave the
+   * doubles while the reading stays in them: a counter taken down to -1e308,
+   * flushed, then brought back up to 1e308 is 2e308 above its baseline.
+   */
+  private admitsNewReading(key: string, reading: number): boolean {
+    return admitsReading(
+      this.name,
+      reading,
+      this.nonFinite,
+      this._lastFlushedValue[key] ?? 0,
+    );
   }
 
   private validateLabels(labeledValue: Record<TLabel, string | number>): void {

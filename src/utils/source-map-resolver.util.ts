@@ -36,6 +36,12 @@ interface LoadedMap {
   tracer: TraceMap;
   /** Directory the map lives in, for resolving relative `sources` entries. */
   mapDir: string;
+  /**
+   * `sourcesContent` entries already split into lines, by source. Kept so a
+   * file's lines are one array for as long as its map is cached: the
+   * redacted copy of a source is cached against that array.
+   */
+  contentLines: Map<string, string[] | undefined>;
 }
 
 /**
@@ -91,6 +97,7 @@ function readMapFor(file: string): LoadedMap | null {
     return {
       tracer: new TraceMap(JSON.parse(rawMap)),
       mapDir,
+      contentLines: new Map(),
     };
   } catch {
     return null;
@@ -141,14 +148,19 @@ export function resolveOriginalPosition(
   // `sourcesContent` is the reliable path: the original text is embedded in the
   // map, so it works even when the source tree is absent at runtime (a container
   // shipping only dist, for instance).
-  const embedded = sourceContentFor(map.tracer, position.source);
+  let content = map.contentLines.get(position.source);
+  if (!map.contentLines.has(position.source)) {
+    const embedded = sourceContentFor(map.tracer, position.source);
+    content = embedded ? embedded.split("\n") : undefined;
+    map.contentLines.set(position.source, content);
+  }
 
   return {
     file: position.source.startsWith("/")
       ? position.source
       : resolve(map.mapDir, position.source),
     line: position.line,
-    content: embedded ? embedded.split("\n") : undefined,
+    content,
   };
 }
 

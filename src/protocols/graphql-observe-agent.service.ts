@@ -15,6 +15,7 @@ import {
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
+import { setAgentHook } from "../utils/shared-hook-slot.util.js";
 import {
   parseGraphQLOperation,
   toResolveInfoLike,
@@ -26,6 +27,12 @@ import {
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
+import {
+  endOperation,
+  OPERATION_STATE_KEY,
+  OperationState as OperationLifetime,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /**
  * Protocol recorded for a GraphQL operation that arrived over something other
@@ -53,10 +60,25 @@ interface ResolverHandler {
 
 /** The `ResolverDecoratorHost` surface this service uses, structurally typed. */
 interface RequestHookHost {
-  setOnRequestStartHook?: (
-    hook: (ctx: GqlRequestStartContext) => unknown,
-  ) => void;
-  setOnRequestEndHook?: (hook: (ctx: GqlRequestEndContext) => void) => void;
+  setOnRequestStartHook?: (hook: RequestStartHook) => void;
+  getOnRequestStartHook?: () => RequestStartHook | undefined;
+  setOnRequestEndHook?: (hook: RequestEndHook) => void;
+  getOnRequestEndHook?: () => RequestEndHook | undefined;
+}
+
+type RequestStartHook = (ctx: GqlRequestStartContext) => unknown;
+type RequestEndHook = (ctx: GqlRequestEndContext) => void;
+
+/**
+ * Where the start hook the host is given keeps both sides' state, on what it
+ * returns: this service's, and whatever the application's own start hook
+ * returned, each handed back to the end hook it belongs to.
+ */
+const SHARED_STATE = Symbol("nestjs.observe.graphqlRequestState");
+
+interface SharedState {
+  observe: OperationState | undefined;
+  application: unknown;
 }
 
 interface GqlRequestStartContext {
@@ -68,8 +90,17 @@ interface GqlRequestStartContext {
 
 interface GqlRequestEndContext extends GqlRequestStartContext {
   /** `GraphQLError`s, structurally: the `graphql` package is an optional peer. */
-  errors?: readonly { message?: string; originalError?: unknown }[];
+  errors?: readonly GqlError[];
   state?: unknown;
+}
+
+/** A `GraphQLError`, as much of it as is read here. */
+interface GqlError {
+  message?: string;
+  originalError?: unknown;
+  /** Where in the response it belongs; absent before execution begins. */
+  path?: unknown;
+  extensions?: { code?: unknown };
 }
 
 /**
@@ -89,6 +120,8 @@ interface OperationState {
   /** Whether this service opened the trace, and therefore has to ship it. */
   ownsTrace: boolean;
   context: unknown;
+  /** Closed already: refused by the application's start hook. */
+  ended?: boolean;
 }
 
 /**
@@ -106,7 +139,8 @@ interface OperationState {
  * document is processed, `setOnRequestEndHook` once it has been, right before
  * the response goes out. Whatever the start hook returns is handed back as
  * `state`, which is what lets one span be opened in the first and closed in the
- * second. This service claims both and gives each operation a span.
+ * second. This service uses both and gives each operation a span, beside any
+ * hooks the application sets there - see `composeStartHook`.
  *
  * The span goes into the trace the HTTP agent already opened whenever there is
  * one, which keeps the shape a reader expects: one snapshot per HTTP request,
@@ -214,9 +248,91 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       return;
     }
 
-    host.setOnRequestStartHook((ctx) => this.onRequestStart(ctx));
-    host.setOnRequestEndHook((ctx) => this.onRequestEnd(ctx));
+    if (this.isPatched) {
+      // The other attempt landed while this one waited for the import.
+      return;
+    }
+    // The host's hooks are public API, and the application's to set as well:
+    // a check that refuses a document by throwing from the start hook, an
+    // audit record written in the end hook. Shared, so neither replaces the
+    // other, whichever is set first. The getters hand the application its own
+    // hooks - Nest calls the hooks through `onRequestStart` and
+    // `onRequestEnd`, never through them.
+    setAgentHook<RequestStartHook>(
+      host,
+      "setOnRequestStartHook",
+      (ctx) => this.onRequestStart(ctx),
+      (application, agent) => this.composeStartHook(application, agent),
+      { getter: "getOnRequestStartHook", repointGetter: true },
+    );
+    setAgentHook<RequestEndHook>(
+      host,
+      "setOnRequestEndHook",
+      (ctx) => this.onRequestEnd(ctx),
+      composeEndHook,
+      { getter: "getOnRequestEndHook", repointGetter: true },
+    );
     this.isPatched = true;
+  }
+
+  /**
+   * The start hook the host is given: this service's part first, so the span
+   * covers the application's hook, then the application's, whose result is
+   * kept for its own end hook.
+   *
+   * An application's start hook that throws refuses the document: the driver
+   * answers with the error and calls no end hook. The span is closed here
+   * then, with the application's error, so the refusal is recorded as a
+   * failed operation. A start hook that returns a promise gets one back, and
+   * only then - a driver that awaits the hook awaits it, and one that does
+   * not hands it to the end hook as the state, which is why the pair is also
+   * kept on the promise itself. Its rejection closes the span the same way,
+   * and travels on in the promise returned, to a driver that awaits it.
+   */
+  private composeStartHook(
+    application: RequestStartHook | undefined,
+    agent: RequestStartHook,
+  ): RequestStartHook {
+    const refuse = (state: OperationState | undefined, error: unknown) =>
+      this.closeRefused(state, error);
+    return function (this: unknown, ctx) {
+      const observe = agent.call(this, ctx) as OperationState | undefined;
+      let returned: unknown;
+      try {
+        returned = application?.call(this, ctx);
+      } catch (error) {
+        refuse(observe, error);
+        throw error;
+      }
+      if (!isThenable(returned)) {
+        return toSharedState({ observe, application: returned });
+      }
+      const settled = Promise.resolve(returned).then(
+        (value) => toSharedState({ observe, application: value }),
+        (error: unknown) => {
+          refuse(observe, error);
+          throw error;
+        },
+      );
+      // Handled here, as a driver that does not await it never does: its
+      // rejection would otherwise be one only the agent made, beside the
+      // application's own promise, which the application may well handle.
+      // A driver that awaits it still sees the rejection.
+      settled.catch(() => undefined);
+      return Object.defineProperty(settled, SHARED_STATE, {
+        value: { observe, application: returned } satisfies SharedState,
+      });
+    };
+  }
+
+  private closeRefused(state: OperationState | undefined, error: unknown) {
+    if (!state) {
+      return;
+    }
+    this.endOperation(
+      state,
+      error ?? new Error("Refused by a GraphQL request start hook"),
+    );
   }
 
   /**
@@ -302,6 +418,18 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     if (!state) {
       return;
     }
+    this.endOperation(state, this.toSpanError(ctx.errors));
+  }
+
+  /** Closes the operation's span once, and ships a trace this service opened. */
+  private endOperation(
+    state: OperationState,
+    error: Error | string | object | undefined,
+  ): void {
+    if (state.ended) {
+      return;
+    }
+    state.ended = true;
 
     if (state.store) {
       // Handing the request back whatever owned it before this operation. The
@@ -320,10 +448,13 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       state.className,
       state.methodKey,
       state.spanId,
-      this.toSpanError(ctx.errors),
+      error,
     );
 
     if (state.ownsTrace) {
+      endOperation(
+        state.store?.get(OPERATION_STATE_KEY) as OperationLifetime | undefined,
+      );
       this.endOperationTrace(state.traceId, state.context);
     }
   }
@@ -394,6 +525,8 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     );
     const store = new Map<KeyOf<Store>, any>();
     store.set(this.options.traceIdKey, traceId);
+    // Ended with the operation's trace: see `liveTraceId`.
+    openOperation(store);
     this.asyncLocalStorage.enterWith(store);
 
     this.applyAttributes(info, ctx.context);
@@ -505,6 +638,9 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
    * `GraphQLError` wrapping it, because that is the error the registry
    * classifies: an `IntrinsicException` a handler raised on purpose reads as
    * handled, and it stops being recognisable once GraphQL has wrapped it.
+   *
+   * An error graphql refused the request with is recorded by its class and
+   * code alone - see `toRefusal`.
    */
   private toSpanError(
     errors: GqlRequestEndContext["errors"],
@@ -513,7 +649,17 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     if (!first) {
       return undefined;
     }
-    return (first.originalError as Error | undefined) ?? first;
+    const original = first.originalError as
+      | (Error & { nodes?: unknown })
+      | undefined;
+    const error = original ?? first;
+    // No path: raised by parsing, validation or the coercion of variables,
+    // before any resolver ran. A path, and an original error pointing at
+    // syntax of its own: an argument refused as its field was executed. A
+    // resolver's own error points at none.
+    return first.path == null || original?.nodes != null
+      ? toRefusal(first, error)
+      : error;
   }
 
   private lookupResolverHandler(
@@ -600,4 +746,90 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       "graphql",
     );
   }
+}
+
+/**
+ * The end hook the host is given: the application's first, with what its own
+ * start hook returned, then this service's, whatever the application's did,
+ * so the span covers both and is closed either way.
+ */
+function composeEndHook(
+  application: RequestEndHook | undefined,
+  agent: RequestEndHook,
+): RequestEndHook {
+  return function (this: unknown, ctx) {
+    const shared = readSharedState(ctx.state);
+    try {
+      application?.call(
+        this,
+        shared ? { ...ctx, state: shared.application } : ctx,
+      );
+    } finally {
+      agent.call(this, { ...ctx, state: shared?.observe });
+    }
+  };
+}
+
+function toSharedState(shared: SharedState): object {
+  return { [SHARED_STATE]: shared };
+}
+
+/**
+ * The pair the start hook kept, from its result as the driver hands it on:
+ * the object it returned, the promise it returned to a driver that does not
+ * await it, or what that promise resolved to for one that does. Nothing for
+ * a state no start hook of ours produced.
+ */
+function readSharedState(state: unknown): SharedState | undefined {
+  return typeof state === "object" && state !== null
+    ? (state as { [SHARED_STATE]?: SharedState })[SHARED_STATE]
+    : undefined;
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+/**
+ * What a request graphql refused is recorded with: the error's class and its
+ * code, `GRAPHQL_VALIDATION_FAILED` or `BAD_USER_INPUT`, and nothing graphql
+ * worded. graphql words these errors around the value it refused - `String
+ * cannot represent a non string value: 489213`, `found String "..."` - which
+ * the recorded document shows blanked, and which no rule can blank in prose:
+ * a string is printed there unescaped. The stack is the message again, then
+ * frames of graphql and the server, not of the application.
+ */
+function toRefusal(first: GqlError, error: object): Error {
+  const code =
+    first.extensions?.code ??
+    (error as { extensions?: { code?: unknown } }).extensions?.code;
+  const message =
+    typeof code === "string" && /^[A-Z][A-Z0-9_]*$/.test(code)
+      ? code
+      : "GraphQL request error";
+  const refusal: Error =
+    error instanceof Error
+      ? (Object.create(Object.getPrototypeOf(error) as object) as Error)
+      : new Error();
+  const name = (error as { constructor?: { name?: unknown } }).constructor
+    ?.name;
+  // What the registry classifies a failure by: its class, kept above, and
+  // the status an `HttpException` thrown by a custom scalar answers with.
+  const status = (error as { status?: unknown }).status;
+  if (typeof status === "number") {
+    Object.defineProperty(refusal, "status", { value: status });
+  }
+  Object.defineProperties(refusal, {
+    message: { value: message, configurable: true, writable: true },
+    stack: {
+      value: `${typeof name === "string" && name ? name : "Error"}: ${message}`,
+      configurable: true,
+      writable: true,
+    },
+  });
+  return refusal;
 }

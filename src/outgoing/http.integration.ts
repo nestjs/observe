@@ -43,8 +43,9 @@ export interface OutgoingHttpOptions {
    * same process: its instrumentations write the header on the calls they
    * cover, and a request takes only one.
    *
-   * Only with `openTelemetry` on, and only while the agent is reporting to
-   * NestJS Observe; otherwise no `traceparent` is sent.
+   * Only with `openTelemetry` on, and only beside reporting to NestJS
+   * Observe - from start-up, through outages, until the collector refuses
+   * the app's credentials; otherwise no `traceparent` is sent.
    * @default true, with `openTelemetry` on
    */
   traceContext?: boolean;
@@ -86,12 +87,14 @@ interface NodeClientRequest {
 /**
  * Spans for outbound HTTP, from the diagnostics channels Node publishes on its
  * own: `undici` - which is also what the global `fetch` runs on - and the
- * `node:http` client that axios, got and most SDKs sit on. Nothing is patched,
- * so there is no HTTP client to keep up with.
+ * `node:http` client that axios, got and most SDKs sit on. No HTTP client is
+ * patched, so there is none to keep up with.
  *
  * The handlers run synchronously inside the call that makes the request, which
  * is what puts the span under the right parent; the span is then carried to
- * the completion events on the request object itself.
+ * the completion events on the request object itself. An undici request a
+ * pool queued, or a redirect it follows, is created later, from a socket's
+ * events: `patchUndiciDispatch` puts it back in its caller's context first.
  *
  * Returns the function that removes every subscription.
  */
@@ -106,10 +109,12 @@ export function subscribeOutgoingHttp(
   getRedactor: () => LogRedactor | null = () => null,
   /**
    * Whether calls carry W3C Trace Context now: with `openTelemetry` on and
-   * `traceContext` not off, while the collector takes this app's telemetry.
-   * Off unless given.
+   * `traceContext` not off, while the agent reports to NestJS Observe (see
+   * `ObserveAgentSharedBuffer.isReporting`). Off unless given.
    */
   traceContextOn: () => boolean = () => false,
+  /** `http.queryParamsObfuscateRegex`, global: held to every recorded URL. */
+  obfuscateUrl?: RegExp,
 ): () => void {
   const spans = new WeakMap<object, OpenOutgoingSpan>();
   /**
@@ -139,7 +144,7 @@ export function subscribeOutgoingHttp(
   // Only while `traceContextOn` says so, and then left to an OpenTelemetry
   // SDK in this process when it propagates W3C Trace Context - see
   // `openTelemetryWritesTraceparent`. Both asked per call: interop pauses
-  // while the collector is not taking telemetry, and an SDK may be
+  // while the collector refuses the app's credentials, and an SDK may be
   // registered after the application starts.
   const sendsTraceContext = () =>
     traceContextOn() && !openTelemetryWritesTraceparent();
@@ -159,7 +164,7 @@ export function subscribeOutgoingHttp(
       `${method} ${host}`,
       {
         "http.method": method,
-        "http.url": redactUrlQuery(url, getRedactor()),
+        "http.url": redactUrlQuery(url, getRedactor(), obfuscateUrl),
       },
       presetSpanId,
     );
@@ -201,11 +206,14 @@ export function subscribeOutgoingHttp(
       sendsTraceContext() &&
       !hasUndiciHeader(request.headers, TRACEPARENT_HEADER)
     ) {
+      // Sampled when the operation is recorded, as for node:http, not when
+      // this call got a span: one that opened as many spans as it may is
+      // still recorded, and its callee must not drop the trace.
       const span = spans.get(request);
       const headers = traceContextHeaders(
         trace,
         span?.spanId,
-        span !== undefined,
+        recorder.isRecording(),
       );
       request.addHeader(TRACEPARENT_HEADER, headers.traceparent);
       if (

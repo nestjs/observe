@@ -7,18 +7,30 @@ import {
   ObserveModuleOptionsWithDefaults,
 } from "../interfaces/index.js";
 import {
+  JOB_TRACE_CONTEXT_OPTION_KEY,
   JOB_TRACE_OPTION_KEY,
+  TRACE_CONTEXT_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { REQUEST_ID_PATTERN } from "../utils/default-trace-id-generator.util.js";
+import { handedOnTraceContext } from "../utils/trace-context.util.js";
+import {
+  continueHandedOnTrace,
+  traceparentToHandOn,
+} from "../utils/trace-handoff.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import {
   deferTraceCompletion,
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
+import {
+  endOperation,
+  liveTraceId,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /** What a queue driver knows about the run it is about to start. */
 export interface JobRunDescriptor {
@@ -31,6 +43,63 @@ export interface JobRunDescriptor {
 }
 
 type JobStatus = NonNullable<JobSnapshot["status"]>;
+
+/** The later of the two ends of the range a `Date` can hold, in ms. */
+const MAX_DATE_TIMESTAMP = 8.64e15;
+
+/** What a queue driver read back of a job's times. */
+interface JobTimes {
+  /** When the job was created. */
+  timestamp?: unknown;
+  /** When the worker took it, set just before the processor runs. */
+  processedOn?: unknown;
+  /** The delay still pending, which BullMQ and Bull reset on promotion. */
+  delay?: unknown;
+  opts?: { delay?: unknown };
+}
+
+/**
+ * When a job was enqueued, and how long it waited for a worker once it could
+ * run - left out when its times are not ones a `Date` can hold.
+ *
+ * Job fields are read back from Redis, which anything with access to it can
+ * write, and BullMQ takes a caller's `timestamp` option unchecked:
+ * `new Date(8.64e15 + 1).toISOString()` throws, and adding an object-valued
+ * `delay` to a number throws too. Both ran before the processor, so the
+ * worker failed a job that completes without the agent.
+ *
+ * `timestamp` is when the job was created, not when it became runnable, so for
+ * a delayed job the gap between the two is a schedule the caller asked for -
+ * not a queue that fell behind. Counting it would report a job dated a week
+ * out as a week of backlog and drag `job_wait_p95` with it. The delay is read
+ * off the options when the job's own reads 0: it is reset as a delayed job is
+ * promoted, so by the time a worker holds the job it says 0 whatever was
+ * asked for. `||`, not `??`, for that reason.
+ */
+export function readJobTimes(job: JobTimes): Partial<JobSnapshot> {
+  const { timestamp } = job;
+  if (!isDateTimestamp(timestamp)) {
+    return {};
+  }
+  // Falling back to now() keeps the measurement honest if it is missing.
+  const startedAt = isDateTimestamp(job.processedOn)
+    ? job.processedOn
+    : Date.now();
+  const asked = job.delay || job.opts?.delay;
+  const delay = typeof asked === "number" && Number.isFinite(asked) ? asked : 0;
+  return {
+    enqueuedAt: new Date(timestamp).toISOString(),
+    waitDuration: Math.max(0, startedAt - (timestamp + delay)),
+  };
+}
+
+function isDateTimestamp(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Math.abs(value) <= MAX_DATE_TIMESTAMP
+  );
+}
 
 /** The slice of a queue's prototype the enqueue patch touches. */
 interface QueuePrototypeLike {
@@ -153,12 +222,17 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
    * under the one request that happened to register the schedule, for as long
    * as the schedule lives. Those runs are cron firings, and each mints its own
    * id like any other.
+   *
+   * With OpenTelemetry interop on, a W3C `traceparent` goes beside the id, for
+   * an OpenTelemetry SDK in the worker's process to continue - see
+   * `traceparentToHandOn`.
    */
   private stampTraceId(opts: unknown): Record<string, unknown> | undefined {
-    const traceId = this.asyncLocalStorage
-      .getStore()
-      ?.get(this.options.traceIdKey);
-    if (typeof traceId !== "string") {
+    const store = this.asyncLocalStorage.getStore();
+    // A job a finished operation's timer enqueues, past the grace period,
+    // is no part of that operation's trace.
+    const traceId = liveTraceId(store, this.options.traceIdKey);
+    if (traceId === undefined) {
       return undefined;
     }
     if (opts !== undefined && (typeof opts !== "object" || opts === null)) {
@@ -168,7 +242,33 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
     if (current["repeat"] || current[JOB_TRACE_OPTION_KEY] !== undefined) {
       return undefined;
     }
-    return { ...current, [JOB_TRACE_OPTION_KEY]: traceId };
+    const stamped: Record<string, unknown> = {
+      ...current,
+      [JOB_TRACE_OPTION_KEY]: traceId,
+    };
+    if (
+      this.openTelemetryInteropOn() &&
+      current[JOB_TRACE_CONTEXT_OPTION_KEY] === undefined
+    ) {
+      stamped[JOB_TRACE_CONTEXT_OPTION_KEY] = traceparentToHandOn(
+        store,
+        traceId,
+      );
+    }
+    return stamped;
+  }
+
+  /**
+   * Whether OpenTelemetry interop runs now: `openTelemetry` on, beside
+   * reporting to NestJS Observe - see `ObserveAgentSharedBuffer.isReporting`.
+   * Asked as a job is enqueued and again as it starts, by each side for
+   * itself.
+   */
+  private openTelemetryInteropOn(): boolean {
+    return (
+      this.options.openTelemetry === true &&
+      this.observeAgentSharedBuffer.isReporting()
+    );
   }
 
   /**
@@ -223,9 +323,10 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
    * Runs one job under a trace.
    *
    * `invoke` is handed `settle` for drivers whose handlers finish through a
-   * callback; pass `settlesItself` for those, and a plain return is then not
-   * read as completion. Promise-returning and throwing handlers are settled
-   * here either way.
+   * callback; pass `settlesItself` for those, and what the handler returns,
+   * a promise included, is then not read as the outcome. A throwing handler
+   * is settled here either way, and a promise goes back to the driver as the
+   * handler returned it.
    */
   run<T>(
     job: JobRunDescriptor,
@@ -247,8 +348,14 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       return invoke(() => undefined);
     }
 
-    const hasOuterContext = outerStore?.has(this.options.traceIdKey);
-
+    // Any other run opens a store and a trace of its own, whatever store it
+    // starts in. A trace id there is no proof that an operation is still open
+    // around the run: a store outlives its operation in whatever the
+    // operation left running - the timer chain of a cron job a request
+    // rescheduled, a Redis connection a request opened - and a run read as
+    // nested in it used to run in an id-less store, unreported, with
+    // `TracerService.createSpan()` throwing in its handler.
+    //
     // The same map `run` is given, rather than `getStore()` inside the
     // callback: identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
@@ -256,23 +363,31 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       store.set(ACTIVE_JOB_KEY as KeyOf<Store>, activeJob);
     }
     return this.asyncLocalStorage.run(store, () => {
-      if (hasOuterContext) {
-        // If the outer context already has a trace ID
-        // ignore the inner context
-        if (this.options.debug) {
-          this.logger.debug(
-            `Outer context already has a trace ID. Skipping inner context for job "${job.name}" job.id: ${job.id}`,
-          );
-        }
-        return invoke(() => undefined);
-      }
-
       // The registry key is always this run's own. The inherited id may belong
       // to a request still open in this process, and a retry reuses it.
       const registryKey = uuidv7();
-      const traceId = this.readInheritedTraceId(job.opts) ?? registryKey;
+      const inheritedTraceId = this.readInheritedTraceId(job.opts);
+      const traceId = inheritedTraceId ?? registryKey;
       store.set(this.options.traceIdKey, traceId);
       store.set(TRACE_REGISTRY_KEY as KeyOf<Store>, registryKey);
+      // Ended as the run settles, recorded or not: see `liveTraceId`.
+      const operation = openOperation(store);
+
+      // With OpenTelemetry interop on, the job runs in the W3C trace context
+      // it was enqueued in, for an OpenTelemetry SDK in this process - see
+      // `continueHandedOnTrace`. Recorded or not, as an outbound call carries
+      // the trace on for an unrecorded request.
+      const handedOn =
+        inheritedTraceId !== undefined && this.openTelemetryInteropOn()
+          ? job.opts?.[JOB_TRACE_CONTEXT_OPTION_KEY]
+          : undefined;
+      // And the job's span goes under the span that handed it on, for `otlp`,
+      // while the calls it makes carry the caller's decision on - as a
+      // request's do with the `traceparent` it arrived with.
+      const traceContext = handedOnTraceContext(handedOn, traceId);
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY, traceContext);
+      }
 
       const context: JobContext = {
         queueName: job.queueName,
@@ -293,7 +408,27 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         // The trace id stays in the store so logs and jobs enqueued from here
         // still correlate; nothing is registered under the registry key, so
         // its spans have no trace to join.
-        return invoke(() => undefined);
+        const end = () => endOperation(operation);
+        let result: T;
+        try {
+          result =
+            handedOn === undefined
+              ? invoke(end)
+              : continueHandedOnTrace(handedOn, traceId, () => invoke(end));
+        } catch (error) {
+          end();
+          throw error;
+        }
+        if (!settlesItself) {
+          // Its driver takes the promise as the outcome and consumes it, so
+          // watching it here changes nothing about how a rejection surfaces.
+          if (result instanceof Promise) {
+            result.then(end, end);
+          } else {
+            end();
+          }
+        }
+        return result;
       }
 
       this.operationTraceRegistry.startTrace(
@@ -304,14 +439,22 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
           ...job.metadata,
         } as JobSnapshot,
         traceId,
+        traceContext,
       );
 
-      let settled = false;
+      let outcome: JobStatus | undefined;
+      // The promise a callback-style handler returned, which its driver
+      // drops - see where it is handed back, below.
+      let dropped: Promise<unknown> | undefined;
       const settle = (status: JobStatus) => {
-        if (settled) {
+        if (outcome) {
           return;
         }
-        settled = true;
+        outcome = status;
+        endOperation(operation);
+        if (status === "failed") {
+          dropped?.then(undefined, ignoreRejection);
+        }
         deferTraceCompletion(
           async () => {
             this.operationTraceRegistry.endTrace(registryKey, { status });
@@ -340,17 +483,44 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       };
 
       try {
-        const returnValue = invoke(settle);
+        const returnValue =
+          handedOn === undefined
+            ? invoke(settle)
+            : continueHandedOnTrace(handedOn, traceId, () => invoke(settle));
         if (returnValue instanceof Promise) {
-          return returnValue
-            .then((ret) => {
-              settle("completed");
-              return ret;
-            })
-            .catch((error: Error) => {
-              settle("failed");
-              throw error;
-            }) as T;
+          // Handed back as the handler returned it, never as a promise
+          // chained onto it: a chained promise has none of the members of the
+          // handler's own (Bull calls `cancel()` on it when a job times out,
+          // and hands it to `active` listeners), and it rejects on its own.
+          if (settlesItself) {
+            // Bull drops what a callback-style processor returns, and `done`
+            // is the outcome. One that reports its failure through `done` and
+            // returns the promise it handled that way -
+            // `redis.hincrby(key, field, n, done)` - left a chained rejection
+            // nobody listened to, and the `unhandledRejection` ended a worker
+            // that carries on without the agent.
+            //
+            // So it is not watched either: watching marks it handled, and an
+            // `async (job, done)` processor that throws before it calls
+            // `done` has to raise `unhandledRejection` as it does without the
+            // agent. Only once `done` has reported a failure is the rejection
+            // marked handled: an instrumented provider's `@Process()` method
+            // hands back a promise chained onto its method's, and that one
+            // rejects again after the method's own was handled.
+            dropped = returnValue;
+            if (outcome === "failed") {
+              returnValue.then(undefined, ignoreRejection);
+            }
+          } else {
+            // A driver that takes the promise as the outcome consumes it, so
+            // the run is settled from a side branch. Attached before the
+            // driver's own reactions, it still settles the run first.
+            returnValue.then(
+              () => settle("completed"),
+              () => settle("failed"),
+            );
+          }
+          return returnValue;
         }
 
         if (!settlesItself) {
@@ -364,3 +534,6 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
     });
   }
 }
+
+/** Marks a rejection handled, where it has already been reported. */
+function ignoreRejection(): void {}

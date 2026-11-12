@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { OutgoingSpanRecorder } from "./outgoing-span.recorder.js";
 import { patchMethod } from "./patch-method.util.js";
 import { describeSqlStatement } from "./sql-statement.util.js";
@@ -15,12 +16,20 @@ interface PgModule {
  * up in; `Pool#query` is patched as well because it reaches the client from
  * inside the pool's checkout callback, which for a queued checkout runs in
  * whichever request released the connection - the span has to be opened
- * before that hop, in the caller's own context. The pool's span then covers
- * the client call it leads to.
+ * before that hop, in the caller's own context. `Pool#connect` hands the
+ * checkout back to that context, so the pool's span covers the client call
+ * it leads to.
  */
 export function patchPg(pg: PgModule, recorder: OutgoingSpanRecorder): boolean {
   const wrap = (covers: boolean) => (original: (...args: any[]) => any) =>
     function (this: unknown, ...args: any[]) {
+      const last = args.length - 1;
+      // pg answers from the connection's socket, whose events fire in the
+      // context of the call that opened it - another request's. Bound first,
+      // so a call that is not recorded keeps its own context too.
+      if (typeof args[last] === "function") {
+        args[last] = AsyncResource.bind(args[last]);
+      }
       const config = args[0];
       const text: unknown = typeof config === "string" ? config : config?.text;
       // A submittable - a cursor, a query stream - reports completion
@@ -38,7 +47,6 @@ export function patchPg(pg: PgModule, recorder: OutgoingSpanRecorder): boolean {
       }
 
       let hasCallback = false;
-      const last = args.length - 1;
       if (typeof args[last] === "function") {
         const callback = args[last];
         hasCallback = true;
@@ -46,16 +54,27 @@ export function patchPg(pg: PgModule, recorder: OutgoingSpanRecorder): boolean {
           span.end(error);
           return callback.call(this, error, ...rest);
         };
-      } else if (typeof config?.callback === "function") {
-        const callback = config.callback;
+      } else if (!covers && typeof config?.callback === "function") {
+        // Only a client calls a config's `callback`. A pool answers through
+        // its promise and hands the client a callback of its own, which pg
+        // stores on the config: one a pool has run before carries a
+        // `callback` that is not the caller's, and that nothing calls again.
+        const callback = AsyncResource.bind(config.callback);
         hasCallback = true;
-        args[0] = {
-          ...config,
-          callback(this: unknown, error: unknown, ...rest: any[]) {
-            span.end(error);
-            return callback.call(this, error, ...rest);
+        // Derived from the caller's config rather than copied from it: a
+        // statement object (sql-template-tag, sql-template-strings) keeps
+        // `text` on its prototype, where a spread does not reach.
+        args[0] = Object.create(config, {
+          callback: {
+            value(this: unknown, error: unknown, ...rest: any[]) {
+              span.end(error);
+              return callback.call(this, error, ...rest);
+            },
+            writable: true,
+            enumerable: true,
+            configurable: true,
           },
-        };
+        });
       }
 
       try {
@@ -71,5 +90,19 @@ export function patchPg(pg: PgModule, recorder: OutgoingSpanRecorder): boolean {
 
   const client = patchMethod(pg.Client?.prototype, "query", wrap(false));
   const pool = patchMethod(pg.Pool?.prototype, "query", wrap(true));
+  // A queued checkout is handed its client by whichever call releases one:
+  // bound, it runs where it was asked for - under the pool's span and its
+  // cover, or under no trace at all - not in the releasing request.
+  patchMethod(
+    pg.Pool?.prototype,
+    "connect",
+    (original) =>
+      function (this: unknown, ...args: any[]) {
+        if (typeof args[0] === "function") {
+          args[0] = AsyncResource.bind(args[0]);
+        }
+        return original.apply(this, args);
+      },
+  );
   return client || pool;
 }

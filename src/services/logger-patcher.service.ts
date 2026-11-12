@@ -9,6 +9,7 @@ import {
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 @Injectable()
 export class LoggerPatcherService implements OnModuleInit {
@@ -70,8 +71,10 @@ export class LoggerPatcherService implements OnModuleInit {
         errorStack?: unknown;
       },
     ) {
-      const store = asyncLocalStorage.getStore();
-      const requestId = store?.get(options.traceIdKey);
+      const requestId = liveTraceId(
+        asyncLocalStorage.getStore(),
+        options.traceIdKey,
+      );
       const jsonLogObject = originalGetJsonLogObject.call(
         this,
         message,
@@ -94,8 +97,10 @@ export class LoggerPatcherService implements OnModuleInit {
       ...args: Parameters<typeof originalFormatMessage>
     ) {
       const output: string = originalFormatMessage.apply(this, args);
-      const store = asyncLocalStorage.getStore();
-      const requestId = store?.get(options.traceIdKey);
+      const requestId = liveTraceId(
+        asyncLocalStorage.getStore(),
+        options.traceIdKey,
+      );
       if (!requestId) {
         return output;
       }

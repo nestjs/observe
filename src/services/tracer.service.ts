@@ -18,6 +18,7 @@ import {
 } from "../observe.constants.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 /**
  * Longest operation id the collector stores, and span label a job's names
@@ -42,6 +43,18 @@ function describeUnusableName(value: unknown): string {
       : `a value of type ${typeof value}`;
 }
 
+/**
+ * Most metrics reported, counters, gauges and summaries together.
+ *
+ * A metric is kept for the life of the process and puts an entry of its own
+ * in every batch it changes in, and the collector refuses a batch whose
+ * `custom` section holds more than 5,000 - every request, error, job and log
+ * of the window with it. A name built from what a client sent made one per
+ * request. A fixed set of names is far below this; what varies belongs in a
+ * label, whose series each metric already bounds.
+ */
+const MAX_METRICS = 1_000;
+
 @Injectable()
 export class TracerService<
   Store extends object = Record<string | symbol, unknown>,
@@ -57,6 +70,9 @@ export class TracerService<
   private hasReportedUnusableOperationId = false;
   private hasReportedUnusableJobName = false;
   private readonly runner: JobTraceRunner<Record<string | symbol, unknown>>;
+  private hasReportedMetricLimit = false;
+  private hasReportedUncapturedError = false;
+  private hasReportedErrorOutsideContext = false;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -226,6 +242,12 @@ export class TracerService<
   /**
    * Captures an error and associates it with the current trace.
    * This method should be called within an async context where the AsyncLocalStorage is active.
+   *
+   * The details of at most 20 errors are recorded per trace; the span an
+   * error is captured on after that is marked as failed, and its tags are
+   * still recorded.
+   *
+   * Called outside any async context, it records nothing and says so once.
    */
   async captureError(
     error: Error,
@@ -233,9 +255,12 @@ export class TracerService<
   ) {
     const store = this.als.getStore();
     if (!store) {
-      throw new Error(
-        'AsyncLocalStorage is not initialized. Ensure that you are using the "captureError" method within an async context.',
-      );
+      // Reporting an error must not raise one. A handler that reports a
+      // failure from a `catch` and answers with a fallback failed over the
+      // report instead, and one that did not await it ended the process -
+      // wherever the context was lost, by the agent or by the application.
+      this.reportErrorOutsideContext();
+      return;
     }
 
     const traceId =
@@ -251,12 +276,50 @@ export class TracerService<
       return;
     }
     const callerId = store.get(CALLER_METADATA_KEY) as string | undefined;
-    this.operationTraceRegistry.captureError(
-      traceId,
-      callerId,
-      error,
-      tags ?? {},
-      this.reportedTraceId(store, traceId),
+    try {
+      this.operationTraceRegistry.captureError(
+        traceId,
+        callerId,
+        error,
+        tags ?? {},
+        this.reportedTraceId(store, traceId),
+      );
+    } catch (failure) {
+      // For the same reason: a handler that reports a failure and answers
+      // with a fallback must not answer 500 over the report, nor - when it
+      // does not await this call - take the process down with it.
+      this.reportUncapturedError(failure);
+    }
+  }
+
+  /** Said once: a call site outside any context is outside it every time. */
+  private reportErrorOutsideContext(): void {
+    if (this.hasReportedErrorOutsideContext) {
+      return;
+    }
+    this.hasReportedErrorOutsideContext = true;
+    this.logger.warn(
+      'captureError was called outside an async context, so the error is not recorded. Ensure that you are using the "captureError" method within an async context. Later calls outside one are not reported.',
+    );
+  }
+
+  /**
+   * A failure to record an error comes from the same call site on every
+   * request, so it is reported once rather than once per request.
+   */
+  private reportUncapturedError(failure: unknown): void {
+    if (this.hasReportedUncapturedError) {
+      return;
+    }
+    this.hasReportedUncapturedError = true;
+    let reason: string;
+    try {
+      reason = failure instanceof Error ? failure.message : String(failure);
+    } catch {
+      reason = "an unprintable error";
+    }
+    this.logger.warn(
+      `captureError could not record an error, and the operation goes on without it. Later failures are not reported: ${reason}`,
     );
   }
 
@@ -301,11 +364,14 @@ export class TracerService<
       if (attributes?.labels) {
         overridableRef.labels = attributes.labels;
       }
+      // `value` holds one reading per label, so the seed goes to the default
+      // one; a labelled metric has no unlabelled reading to seed.
       if (
         attributes?.initialValue !== undefined &&
+        !existingRef.labels &&
         existingRef.getValue() === 0
       ) {
-        overridableRef["value"] = attributes.initialValue;
+        overridableRef.value.default = attributes.initialValue;
       }
       return existingRef;
     }
@@ -315,6 +381,9 @@ export class TracerService<
       attributes?.initialValue,
       attributes?.labels,
     );
+    if (!this.admitsMetric(name)) {
+      return counter;
+    }
     this.registerCounterChangeHandler(counter);
     this.counters.set(name, counter);
     return counter;
@@ -365,11 +434,14 @@ export class TracerService<
       if (attributes?.labels) {
         overridableRef.labels = attributes.labels;
       }
+      // `value` holds one reading per label, so the seed goes to the default
+      // one; a labelled metric has no unlabelled reading to seed.
       if (
         attributes?.initialValue !== undefined &&
+        !existingRef.labels &&
         existingRef.getValue() === 0
       ) {
-        overridableRef["value"] = attributes.initialValue;
+        overridableRef.value.default = attributes.initialValue;
       }
       if (attributes?.kind) {
         overridableRef.kind = attributes.kind;
@@ -378,6 +450,9 @@ export class TracerService<
       return existingRef;
     }
     const gauge = new Gauge<TLabel>(name, attributes ?? {});
+    if (!this.admitsMetric(name)) {
+      return gauge;
+    }
     this.registerGaugeChangeHandler(gauge);
     this.gauges.set(name, gauge);
     return gauge;
@@ -429,6 +504,9 @@ export class TracerService<
       return existingRef;
     }
     const summary = new Summary<TLabel>(name, attributes ?? {});
+    if (!this.admitsMetric(name)) {
+      return summary;
+    }
     this.registerSummaryChangeHandler(summary);
     this.summaries.set(name, summary);
     return summary;
@@ -445,9 +523,9 @@ export class TracerService<
    * propagate an id that simply isn't there yet.
    */
   currentTraceId(): string | null {
-    const store = this.als.getStore();
-    const traceId = store?.get(this.options.traceIdKey);
-    return typeof traceId === "string" ? traceId : null;
+    // Null once the operation is over, past a grace period: a timer the
+    // operation left armed is outside any trace in flight.
+    return liveTraceId(this.als.getStore(), this.options.traceIdKey) ?? null;
   }
 
   /**
@@ -569,6 +647,28 @@ export class TracerService<
   ): string {
     const traceId = store.get(this.options.traceIdKey);
     return typeof traceId === "string" ? traceId : registryKey;
+  }
+
+  /**
+   * Whether a metric not yet registered is, under `MAX_METRICS`. One that is
+   * not is still handed to the caller, so the code around it runs as it
+   * would, but it is neither reported nor kept: each call gets a new one.
+   * Reported once, as it comes from the same call site every time.
+   */
+  private admitsMetric(name: string): boolean {
+    if (
+      this.counters.size + this.gauges.size + this.summaries.size <
+      MAX_METRICS
+    ) {
+      return true;
+    }
+    if (!this.hasReportedMetricLimit) {
+      this.hasReportedMetricLimit = true;
+      this.logger.warn(
+        `Metric "${name.slice(0, 100)}" is not reported: at most ${MAX_METRICS} metrics are. Name metrics from a fixed set, and put a value that varies - an id, a client's input - in a label. Later metrics past this limit are not reported either, nor logged.`,
+      );
+    }
+    return false;
   }
 
   private registerCounterChangeHandler<TLabel extends string>(

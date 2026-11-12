@@ -1,5 +1,6 @@
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
+import { types } from "node:util";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import {
@@ -66,30 +67,144 @@ function isFrameworkNoise(instance: object): boolean {
  * `MongoClient.startSession` spans are not.
  *
  * Matched by name and shape only: the driver is an optional peer, never
- * imported here, and an application may carry more than one copy of it.
+ * imported here, and an application may carry more than one copy of it. The
+ * name is looked for on every class up the prototype chain, so a provider
+ * class that extends either one - `class MongoService extends MongoClient` -
+ * is left alone too, for the same reason.
  */
 function isMongoDriverHandle(instance: object): boolean {
   const candidate = instance as {
-    constructor?: { name?: unknown };
     startSession?: unknown;
     db?: unknown;
     collection?: unknown;
     databaseName?: unknown;
   };
-  switch (candidate.constructor?.name) {
-    case "MongoClient":
-      return (
-        typeof candidate.startSession === "function" &&
-        typeof candidate.db === "function"
-      );
-    case "Db":
-      return (
-        typeof candidate.collection === "function" &&
-        typeof candidate.databaseName === "string"
-      );
-    default:
-      return false;
+  for (
+    let proto = Object.getPrototypeOf(instance) as {
+      constructor?: { name?: unknown };
+    } | null;
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto) as typeof proto
+  ) {
+    const name = Object.hasOwn(proto, "constructor")
+      ? proto.constructor?.name
+      : undefined;
+    if (
+      name === "MongoClient" &&
+      typeof candidate.startSession === "function" &&
+      typeof candidate.db === "function"
+    ) {
+      return true;
+    }
+    if (
+      name === "Db" &&
+      typeof candidate.collection === "function" &&
+      typeof candidate.databaseName === "string"
+    ) {
+      return true;
+    }
   }
+  return false;
+}
+
+/**
+ * Library classes traced only in part, each with a method only it has, which
+ * tells it from an application's own class of the same name - `ValidationPipe`
+ * is what Nest's documentation calls the pipe it has readers write themselves,
+ * and plenty of applications have a `ConfigService` of their own.
+ *
+ * - Nest's validating pipes keep only `validate`. `ValidationPipe` runs once
+ *   per handler argument, and for each one `transform`, `toValidate` and
+ *   `transformPrimitive` were spans, usually of a few microseconds and each
+ *   one billed, on runs that mostly validate nothing: 82% of runs across the
+ *   hosted platform on 2026-11-06, which made it the busiest class after
+ *   `pg`, and 404,552 of 404,652 on one REST app.
+ * - `@nestjs/config`'s `ConfigService` keeps what an application calls. Each
+ *   `get` made four or five more spans of its private helpers - 2.7M of its
+ *   4.6M a day, in 220 projects.
+ *
+ * Folding cannot reach any of them (`collapseRepeatedSpans`), because each
+ * repeats only a few times under its parent.
+ *
+ * By name, because `StandardSchemaValidationPipe` is not in every supported
+ * `@nestjs/common` and an application may carry a second copy of a package.
+ * A class that stops matching is simply traced like any other.
+ */
+const PARTLY_TRACED_CLASSES = new Map<
+  string,
+  { marker: string; traced: ReadonlySet<string> }
+>([
+  [
+    "ValidationPipe",
+    { marker: "flattenValidationErrors", traced: new Set(["validate"]) },
+  ],
+  [
+    "StandardSchemaValidationPipe",
+    { marker: "formatIssueMessages", traced: new Set(["validate"]) },
+  ],
+  [
+    "ParseFilePipe",
+    { marker: "validateFilesOrFile", traced: new Set(["validate"]) },
+  ],
+  [
+    "ConfigService",
+    {
+      marker: "getFromValidatedEnv",
+      traced: new Set(["get", "getOrThrow", "set", "setEnvFilePaths"]),
+    },
+  ],
+]);
+
+/** The methods a prototype's class keeps traced, if it is one of those. */
+function partlyTracedMethodsOf(proto: object): ReadonlySet<string> | null {
+  const candidate = proto as Record<string, unknown>;
+  const entry = PARTLY_TRACED_CLASSES.get(
+    (candidate.constructor as { name?: string } | undefined)?.name ?? "",
+  );
+  return entry !== undefined && typeof candidate[entry.marker] === "function"
+    ? entry.traced
+    : null;
+}
+
+/** Whether an instance is one of those classes, or extends one. */
+function extendsPartlyTracedClass(instance: object): boolean {
+  for (
+    let proto = Object.getPrototypeOf(instance);
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto)
+  ) {
+    if (partlyTracedMethodsOf(proto) !== null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a method is one of those classes' internals, and so makes no span.
+ *
+ * Asked of the class that holds the method, so what an application adds to or
+ * overrides in a subclass is still traced. An instance's own function - the
+ * `exceptionFactory` a constructor assigns - goes by the instance's class.
+ */
+function isLibraryInternal(
+  target: object,
+  methodName: string | symbol,
+): boolean {
+  let holder: object | null = target;
+  while (holder !== null && !Object.hasOwn(holder, methodName)) {
+    holder = Object.getPrototypeOf(holder);
+  }
+  if (holder === null) {
+    return false;
+  }
+  const traced = partlyTracedMethodsOf(
+    holder === target ? Object.getPrototypeOf(target) : holder,
+  );
+  return (
+    traced !== null &&
+    !(typeof methodName === "string" && traced.has(methodName))
+  );
 }
 
 interface TracedCallSpec {
@@ -108,6 +223,12 @@ interface TracedCallSpec {
    */
   isActive: () => boolean;
   setActive: (active: boolean) => void;
+
+  /**
+   * Whether the original callable is a native `async` function - the one
+   * kind whose promise nothing but the caller can hold. See `callTraced`.
+   */
+  isAsync: boolean;
 
   /** Invokes the original callable, participating in the trace. */
   call: (thisArg: unknown, args: unknown[]) => unknown;
@@ -134,7 +255,9 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
   },
 ) {
   /**
-   * Builds the tracing wrapper shared by methods and standalone functions.
+   * Builds the tracing wrapper shared by methods and standalone functions:
+   * called with the receiver and the arguments of the call it stands in for,
+   * as the `apply` trap that dispatches to it is handed them.
    *
    * Every function this creates is named `<className>.<methodName>`, so the
    * frames instrumentation contributes to a stack trace read like the call the
@@ -149,6 +272,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // "Object.<name>".
     const call = spec.call;
     const callUntraced = spec.callUntraced;
+    const isAsync = spec.isAsync;
 
     const endStep = (requestId: string, stepId: string) =>
       operationTraceRegistry.internalEndTraceStep(
@@ -200,18 +324,24 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
               ignoreFailure(() => recordError(requestId, stepId, err));
               throw err;
             };
-            // A plain native promise is swapped for a chained one, just as
-            // the caller's own `.then` would: a rejection the caller drops
-            // still raises `unhandledRejection`, as without the span.
-            if (isPlainPromise(result)) {
+            // The promise of a native `async` method is swapped for a chained
+            // one, just as the caller's own `.then` would: nothing but the
+            // caller can hold it, so a rejection the caller drops still
+            // raises `unhandledRejection`, as without the span.
+            if (isAsync) {
               return result.then(settled, failed);
             }
-            // A promise carrying more than its value (`json()` on a `got`
-            // request, `kill()` on an `execa` child, a subclass and its own
-            // members) is handed back as-is, or the caller loses all that.
-            // It is watched on a side branch instead, the way
-            // `OutgoingSpanRecorder.endWhenSettled` watches outgoing calls.
-            // Watching marks it handled, so a rejection the caller drops no
+            // Any other promise is handed back as-is and watched on a side
+            // branch, the way `OutgoingSpanRecorder.endWhenSettled` watches
+            // outgoing calls. It may be held elsewhere - a `.catch` the method
+            // attached itself, an in-flight promise callers share, the
+            // callback ioredis answers a command through - and a chained copy
+            // rejected where those handlers do not reach: dropped by the
+            // caller, it was an unhandled rejection, and under Node's default
+            // it ended a process that handled the failure. Handed back, it
+            // also keeps what it carries beyond its value (`json()` on a
+            // `got` request, `kill()` on an `execa` child, a subclass).
+            // Watching marks it handled, so a rejection nobody handles no
             // longer raises `unhandledRejection`; the span still records it.
             result.then(settled, (err) =>
               ignoreFailure(() => recordError(requestId, stepId, err)),
@@ -224,55 +354,65 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           recordError(requestId, stepId, err);
           // Re-throw the error to maintain original behavior
           throw err;
-        } finally {
-          spec.setActive(false);
         }
       },
     );
 
-    // A function expression, not an arrow: the wrapper has to forward whatever
-    // `this` the caller invoked it with.
-    return named(frameName, function (this: unknown, ...args: unknown[]) {
+    // The receiver the call was made with is handed on, not read off `this`:
+    // the wrapper is called as a plain function, so V8 prints its frame as
+    // top-level, under the name above.
+    return named(frameName, (thisArg: unknown, args: unknown[]) => {
       // Already tracing this callable, invoke it as-is
       if (spec.isActive()) {
-        return callUntraced(this, args);
+        return callUntraced(thisArg, args);
       }
 
       const store = als.getStore();
       const requestId =
         store?.get(TRACE_REGISTRY_KEY) ?? store?.get(options.traceIdKey);
       if (!requestId) {
-        return callUntraced(this, args);
+        return callUntraced(thisArg, args);
       }
+      // Cleared in the frame that set it, whatever throws in between: opening
+      // the step, copying the store and entering it can each run out of
+      // stack, and a flag left set sent every later call of this method, from
+      // any request, down the untraced path until the process restarted.
       spec.setActive(true);
+      try {
+        const callerId = store?.get(CALLER_METADATA_KEY) as string | undefined;
+        const newStepId = operationTraceRegistry.internalStartTraceStep(
+          requestId,
+          className,
+          methodName,
+          callerId,
+        );
 
-      const callerId = store?.get(CALLER_METADATA_KEY) as string | undefined;
-      const newStepId = operationTraceRegistry.internalStartTraceStep(
-        requestId,
-        className,
-        methodName,
-        callerId,
-      );
-
-      // No step means the registry holds no snapshot for this trace id: the
-      // request was dropped by `http.ignore` or sampled out, but its store
-      // still carries the id - log correlation needs it there. Nothing was
-      // opened, so nothing must be closed; without this bail-out every
-      // provider call on an ignored route logged a registry error.
-      if (newStepId === undefined) {
-        try {
-          return callUntraced(this, args);
-        } finally {
-          spec.setActive(false);
+        // No step means the registry holds no snapshot for this trace id -
+        // the request was dropped by `http.ignore` or sampled out, but its
+        // store still carries the id, which log correlation needs there - or
+        // the operation has opened as many spans as one may. Nothing was
+        // opened, so nothing must be closed; without this bail-out every
+        // provider call on an ignored route logged a registry error.
+        if (newStepId === undefined) {
+          return callUntraced(thisArg, args);
         }
-      }
 
-      // Everything the caller's context holds, with this span as the caller
-      // of whatever it calls. A copy, so the caller's context still names the
-      // caller once this call returns.
-      const spanStore = new Map(store);
-      spanStore.set(CALLER_METADATA_KEY, newStepId);
-      return als.run(spanStore, callTraced, this, args, requestId, newStepId);
+        // Everything the caller's context holds, with this span as the caller
+        // of whatever it calls. A copy, so the caller's context still names
+        // the caller once this call returns.
+        const spanStore = new Map(store);
+        spanStore.set(CALLER_METADATA_KEY, newStepId);
+        return als.run(
+          spanStore,
+          callTraced,
+          thisArg,
+          args,
+          requestId,
+          newStepId,
+        );
+      } finally {
+        spec.setActive(false);
+      }
     });
   };
 
@@ -300,6 +440,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       spanId: `${className}#${methodName}`,
       isActive: () => active,
       setActive: (value) => (active = value),
+      isAsync: types.isAsyncFunction(fn),
       call: invoke,
       callUntraced: invoke,
     });
@@ -310,7 +451,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // `apply` is trapped, so `new fn()` still constructs the original.
     return new Proxy(fn, {
       apply: named(frameName, (_target, thisArg, args) =>
-        Reflect.apply(tracedFn, thisArg, args),
+        tracedFn(thisArg, args),
       ),
     });
   };
@@ -334,6 +475,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     let hasPrivateMembers: boolean;
     let slotBacked: boolean;
     let bareBuiltIn: boolean;
+    let partlyTraced: boolean;
     try {
       // Inspected here, inside the guard, for the same reason as the checks
       // below: reading a provider's constructor can run a trap that throws.
@@ -343,6 +485,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       hasPrivateMembers = usesNativePrivateMembers(instance);
       slotBacked = isSlotBackedBuiltIn(instance);
       bareBuiltIn = slotBacked && isNativeFunction(instance.constructor);
+      partlyTraced = extendsPartlyTracedClass(instance);
     } catch {
       // Reading the prototype ran a trap that threw (nestjs-cls proxy
       // providers do this outside a CLS context). An instance that cannot be
@@ -369,12 +512,21 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // constructors and callable objects.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     const passedThrough = new WeakSet<Function>();
-    return new Proxy(instance, {
+    const proxy: object = new Proxy(instance, {
       // Runs for every property read through the proxy - each `this.field`
       // and `this.dependency.method` inside a traced call - so the common
-      // answers come first: a value that is no method, then a method already
-      // wrapped.
+      // answers come first: a read by something other than the proxy, a value
+      // that is no method, then a method already wrapped.
       get: (target, prop, receiver) => {
+        // An object that inherits from the proxy - what a traced method
+        // derives from `this` with `Object.create(this)`, as pino's
+        // `logger.child()` does - reads its property as it would without the
+        // proxy, accessors against itself, and calls its methods with itself
+        // as `this`. Wrapped and cached, the first such object to read a
+        // method was the `this` of every later call of it, from any request.
+        if (receiver !== proxy) {
+          return Reflect.get(target, prop, receiver);
+        }
         const attributeValue = Reflect.get(target, prop);
         if (typeof attributeValue !== "function" || prop === "constructor") {
           return attributeValue;
@@ -401,7 +553,10 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           // mid-trace). This subsumes the Axios special case that used to sit
           // here: an Axios instance is a bound `request` carrying its API as
           // own properties.
-          !isCallableObject(attributeValue);
+          !isCallableObject(attributeValue) &&
+          // Handed out as it is, so it still runs against the proxy: the
+          // `this.validate()` inside `transform` comes back through here.
+          !(partlyTraced && isLibraryInternal(target, prop));
         if (!shouldProxy) {
           // Remembered, as a wrapped method is: telling them apart reads the
           // function's source and its prototype's keys, which a Mongoose
@@ -420,18 +575,19 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         const originalMethod = requiresRawReceiver
           ? attributeValue
           : Reflect.get(target, prop, receiver);
-        const tracedReceiver = requiresRawReceiver ? target : receiver;
+        const tracedReceiver = requiresRawReceiver ? target : proxy;
         // The wrapper is made once per method of this instance and cached
         // below, so a flag of its own guards exactly that callable - checked
         // and flipped on every traced call, where a lookup keyed by instance
         // and name used to be.
         let active = false;
-        const proxyFn = createTracedWrapper({
+        const tracedFn = createTracedWrapper({
           className,
           methodName,
           spanId: generateSpanId(target, methodName),
           isActive: () => active,
           setActive: (value) => (active = value),
+          isAsync: types.isAsyncFunction(originalMethod),
           // Traced calls run against the proxy so that a method calling into
           // itself (`this.other()`) is instrumented as a nested step - except
           // for private-member classes, whose brand checks only the raw
@@ -444,34 +600,44 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           ),
         });
 
-        // V8 hard-codes the type name of a stack frame to "Proxy" whenever the
-        // frame's receiver is a proxy, and no trap can override that. The
-        // wrapper never reads `this`, so handing it out with the receiver
-        // detached costs nothing and makes V8 treat its frame as top-level -
-        // printing the "<Class>.<method>" name above on its own.
-        const boundFn = proxyFn.bind(undefined);
+        // A method read off the provider is not always called on it. ioredis
+        // copies a client's custom commands onto every `Pipeline` it makes
+        // (`this[name] = redis[name]`), and each queues on the `this` it is
+        // called with: run against the client regardless, a command written
+        // into `multi()` was sent at once, outside the transaction. Called on
+        // another object, the method runs as it would without the proxy -
+        // against that object, untraced. Called on the provider, or on
+        // nothing, it is traced against the receiver chosen above.
+        //
+        // Bound, so V8 prints the trap's frame as top-level, under its name:
+        // called as the handler's `apply`, it would carry "[as apply]".
+        const apply = named(
+          frameName,
+          (_target: unknown, thisArg: unknown, args: unknown[]) =>
+            thisArg === proxy ||
+            thisArg === target ||
+            thisArg === undefined ||
+            thisArg === null
+              ? tracedFn(thisArg, args)
+              : Reflect.apply(originalMethod, thisArg, args),
+        ).bind(undefined);
 
-        // `bind` renames the function to "bound <name>" and drops metadata;
-        // restore both so the wrapper stays indistinguishable from the original
-        // to anything reflecting over it (DI, decorators, arity checks).
-        Object.defineProperty(boundFn, "name", {
-          value: originalMethod.name,
-          configurable: true,
-        });
-        Object.defineProperty(boundFn, "length", {
-          value: originalMethod.length,
-          configurable: true,
-        });
+        // A proxy of the method itself, so `name`, `length` and everything
+        // else read off it are the original's, to anything reflecting over it
+        // (DI, decorators, arity checks). Metadata is held by identity, so it
+        // is copied onto the proxy.
+        const wrapped = new Proxy(originalMethod, { apply });
         const metadataKeys = Reflect.getMetadataKeys(originalMethod);
         for (const key of metadataKeys) {
           const metadata = Reflect.getMetadata(key, originalMethod);
-          Reflect.defineMetadata(key, metadata, boundFn);
+          Reflect.defineMetadata(key, metadata, wrapped);
         }
 
-        methodRefsCache.set(attributeValue, boundFn);
-        return boundFn;
+        methodRefsCache.set(attributeValue, wrapped);
+        return wrapped;
       },
     });
+    return proxy;
   };
 
   return (instance: unknown) => {
@@ -483,22 +649,6 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     }
     return instance;
   };
-}
-
-/**
- * Whether a promise is a bare native one: no subclass, no members of its own.
- * Such a promise carries nothing but its value, so a chained promise can stand
- * in for it without the caller noticing.
- *
- * Symbol keys do not count: before Node 24, `AsyncLocalStorage` stamps its
- * own (`async_id_symbol`, `kResourceStore`, ...) on every promise created in
- * a context, which every traced call runs in.
- */
-function isPlainPromise(promise: Promise<unknown>): boolean {
-  return (
-    Object.getPrototypeOf(promise) === Promise.prototype &&
-    Object.getOwnPropertyNames(promise).length === 0
-  );
 }
 
 /** Runs span bookkeeping whose failure must not reach the caller. */
@@ -533,27 +683,68 @@ function named<T extends AnyFunction>(name: string, fn: T): T {
  * Only the topmost match is rewritten. Every wrapper on the way out relabels
  * its own frame, and inner calls unwind before outer ones, so two classes that
  * happen to share a method name each end up with the right label.
+ *
+ * An error with a long `name` and `message` is left as it is - see
+ * `MAX_RELABELLED_HEADER_LENGTH`.
  */
 function relabelProxyFrame(
   err: unknown,
   className: string,
   methodName: string,
 ): void {
-  if (!(err instanceof Error) || typeof err.stack !== "string") {
-    return;
-  }
-  // `async` prefixes the type name on frames resumed from an await.
-  const frame = new RegExp(
-    `(\\n\\s*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
-  );
-  if (!frame.test(err.stack)) {
-    return;
-  }
+  // The label is cosmetic, so nothing here may take the place of the error
+  // the method threw: a `stack` that is a getter can throw on being read, as
+  // a read-only one throws on being written.
   try {
-    err.stack = err.stack.replace(frame, `$1${className}.${methodName}`);
+    // Measured first: reading `stack` is what writes it out.
+    if (
+      !(err instanceof Error) ||
+      stackHeaderLength(err) > MAX_RELABELLED_HEADER_LENGTH
+    ) {
+      return;
+    }
+    const stack: unknown = err.stack;
+    if (typeof stack !== "string") {
+      return;
+    }
+    // `async` prefixes the type name on frames resumed from an await. Spaces
+    // and tabs only after the newline, not `\s`: a newline matched there too,
+    // and a message of newlines then rescanned the run after each one.
+    const frame = new RegExp(
+      `(\\n[ \\t]*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
+    );
+    if (!frame.test(stack)) {
+      return;
+    }
+    err.stack = stack.replace(frame, `$1${className}.${methodName}`);
   } catch {
-    // Some errors ship a read-only `stack`; the label is cosmetic, so leaving
-    // it as-is beats masking the original failure.
+    // Left as it is.
+  }
+}
+
+/**
+ * The longest `name` plus `message` of an error whose stack is relabelled.
+ *
+ * V8 writes an error's stack out when it is first read, opening it with the
+ * two. Until then a message that quotes the request - `Unknown id ${id}` - is
+ * a reference to the text it quotes, however long, and the frames are held in
+ * a compact form. Searching the stack writes all of it out, and the copy stays
+ * on the error as long as anything holds it: one call per element of a
+ * client's array, each failing with a long quote, then held by
+ * `Promise.allSettled`, held a copy each. The label is cosmetic, so an error
+ * past this keeps `Proxy.` rather than cost that.
+ */
+const MAX_RELABELLED_HEADER_LENGTH = 1024;
+
+function stackHeaderLength(err: Error): number {
+  try {
+    return (
+      (typeof err.name === "string" ? err.name.length : 0) +
+      (typeof err.message === "string" ? err.message.length : 0)
+    );
+  } catch {
+    // A getter that throws; leave such an error alone.
+    return Infinity;
   }
 }
 
@@ -725,11 +916,52 @@ function declaresPrivateMembers(ctor: Function): boolean {
 /**
  * The class name that labels an instance's spans. A null-prototype object or
  * an ES module namespace has no `constructor`, and some objects hold a
- * non-function there. Both fall back to `Object`.
+ * non-function there. Both fall back to `Object`. An `ioredis` client is
+ * named for what it is - see `ioredisClassNameOf`.
  */
 function classNameOf(instance: object): string {
   const ctor: unknown = Reflect.get(instance, "constructor");
-  return typeof ctor === "function" ? ctor.name : FALLBACK_CLASS_NAME;
+  if (typeof ctor !== "function") {
+    return FALLBACK_CLASS_NAME;
+  }
+  return (
+    (ctor.name === "EventEmitter" && ioredisClassNameOf(instance)) || ctor.name
+  );
+}
+
+/**
+ * `Redis` or `Cluster` for an `ioredis` client, null for anything else.
+ *
+ * Both classes take `EventEmitter`'s methods by copying the own properties of
+ * its prototype onto theirs, `constructor` included, so a client's
+ * `constructor` is `EventEmitter` and every command would be labelled
+ * `EventEmitter.get`. Both extend ioredis's `Commander`, whose prototype keeps
+ * its own `constructor`, and a client has `sendCommand`.
+ *
+ * Matched by name and shape only, as `isMongoDriverHandle` is: ioredis is an
+ * application's dependency, never imported here, and an application may carry
+ * more than one copy of it - BullMQ and Bull bring their own.
+ */
+function ioredisClassNameOf(instance: object): string | null {
+  try {
+    const candidate = instance as {
+      sendCommand?: unknown;
+      isCluster?: unknown;
+    };
+    const base = Object.getPrototypeOf(Object.getPrototypeOf(instance)) as {
+      constructor?: { name?: unknown };
+    } | null;
+    if (
+      base?.constructor?.name !== "Commander" ||
+      typeof candidate.sendCommand !== "function"
+    ) {
+      return null;
+    }
+    return candidate.isCluster === true ? "Cluster" : "Redis";
+  } catch {
+    // A prototype or a property that cannot be read names nothing.
+    return null;
+  }
 }
 
 function generateSpanId(instance: object, methodKey: string): string {

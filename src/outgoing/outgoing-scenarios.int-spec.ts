@@ -210,6 +210,18 @@ class LedgerService {
     return tag;
   }
 
+  async heldCheckout(tag: string) {
+    // Holds the one connection and releases it from its own code: a pool
+    // query queued behind it is handed the connection inside this request.
+    const client = await narrowPool.connect();
+    try {
+      await client.query(`SELECT pg_sleep(0.2), '${tag}' AS tag`);
+    } finally {
+      client.release();
+    }
+    return tag;
+  }
+
   // --- outbound HTTP --------------------------------------------------------
   async fetchStatus(path: string, headers?: Record<string, string>) {
     const response = await fetch(`${downstreamUrl}${path}`, { headers });
@@ -539,6 +551,23 @@ describe("ObserveModule: outgoing span scenarios", () => {
         expect(second.pg).toHaveLength(1);
         expect(first.snapshot.traceId).toBe("queued-trace-1");
         expect(second.snapshot.traceId).toBe("queued-trace-2");
+      });
+
+      it("keeps a queued pool query out of the request that releases its connection", async () => {
+        const holder = run("heldCheckout", {
+          arg: "holder",
+          traceId: "held-trace-1",
+        });
+        // The holder checks the connection out first; the query queues.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        const queued = run("queuedCheckout", {
+          arg: "queued",
+          traceId: "held-trace-2",
+        });
+        const [first, second] = await Promise.all([holder, queued]);
+
+        expect(first.pg).toHaveLength(1);
+        expect(second.pg).toHaveLength(1);
       });
 
       it("runs a query issued outside any trace untouched, and reports nothing for it", async () => {

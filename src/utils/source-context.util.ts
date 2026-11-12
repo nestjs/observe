@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync } from "fs";
 import { resolve, sep } from "path";
+import { fileURLToPath } from "url";
 import { resolveOriginalPosition } from "./source-map-resolver.util.js";
 
 /**
@@ -45,6 +46,43 @@ const MAX_FRAMES = 20;
  */
 const sourceCache = new Map<string, string[] | null>();
 
+export interface SourceRedactor {
+  redactSource(lines: string[]): string[];
+}
+
+/** Each redactor's copy of a cached source, held as long as the source is. */
+const redactedSources = new WeakMap<
+  SourceRedactor,
+  WeakMap<string[], string[]>
+>();
+
+/**
+ * The whole file redacted, rather than the frame cut from it. A rule that
+ * knows a secret by both its ends - a PEM key's BEGIN and END lines - finds
+ * neither in a frame whose edge falls inside the key, and the lines between
+ * would ship as they are. Cached against the source's own array, which the
+ * file and source-map caches keep stable, so each file is redacted once.
+ */
+function redactedSource(
+  source: string[],
+  redactor: SourceRedactor | undefined,
+): string[] {
+  if (!redactor) {
+    return source;
+  }
+  let byRedactor = redactedSources.get(redactor);
+  if (!byRedactor) {
+    byRedactor = new WeakMap();
+    redactedSources.set(redactor, byRedactor);
+  }
+  let redacted = byRedactor.get(source);
+  if (!redacted) {
+    redacted = redactor.redactSource(source);
+    byRedactor.set(source, redacted);
+  }
+  return redacted;
+}
+
 /** What opens every V8 frame line. */
 const FRAME_PREFIX = /^\s*at\s+/;
 
@@ -57,7 +95,15 @@ const MAX_FRAME_LINE_LENGTH = 1024;
 const MAX_FRAME_LINES = 100;
 
 interface ParsedFrame {
+  /** As the frame spelt it, which is what a code frame reports. */
   file: string;
+  /**
+   * The same file, resolved, which is what it is looked up by. A frame's path
+   * is copied off a stack that a driver can take from a server's reply, and
+   * `/app/dist/./main.js`, `/app/dist/././main.js`, ... each held a copy of
+   * the whole file - and of its parsed source map - in caches keyed by spelling.
+   */
+  path: string;
   line: number;
   column: number;
 }
@@ -125,11 +171,21 @@ function frameLines(stack: string, message: string | undefined): string[] {
   if (message === "") {
     headerEnd = stack.indexOf("\n");
   } else {
-    const at = stack.indexOf(message);
-    if (at === -1 || stack.lastIndexOf("\n", at) !== -1) {
-      return [];
-    }
-    headerEnd = at + message.length;
+    // A match that starts on the first line and runs to the end of a line
+    // has one possible place: the message's first line has to end where the
+    // stack's first line does. That steps over a match inside the name -
+    // `UnauthorizedException: Unauthorized` - and it is computed rather than
+    // searched for. Neither string is bounded here, nor certain to be what
+    // V8 wrote - a driver can copy both off a server's reply - and visiting
+    // every match on a first line that repeats the message was quadratic.
+    const stackLineEnd = stack.indexOf("\n");
+    const messageLineEnd = message.indexOf("\n");
+    const at =
+      stackLineEnd - (messageLineEnd === -1 ? message.length : messageLineEnd);
+    headerEnd =
+      at >= 0 && at < stackLineEnd && stack.startsWith(message, at)
+        ? at + message.length
+        : -1;
   }
   if (headerEnd === -1 || stack[headerEnd] !== "\n") {
     return [];
@@ -155,7 +211,7 @@ function frameLines(stack: string, message: string | undefined): string[] {
  * with no position quadratic to reject - seconds of event loop for a 100KB
  * line, and the line came from whoever wrote the error message.
  */
-function parseFrameLine(raw: string): ParsedFrame | undefined {
+function parseFrameLine(raw: string): Omit<ParsedFrame, "path"> | undefined {
   if (raw.length > MAX_FRAME_LINE_LENGTH) {
     return undefined;
   }
@@ -190,6 +246,23 @@ function parseFrameLine(raw: string): ParsedFrame | undefined {
   };
 }
 
+/**
+ * A frame's file as a path. V8 names an ES module's file by its URL -
+ * `at run (file:///app/dist/main.js:3:9)` - which is the same file as the
+ * path a CommonJS frame carries. `undefined` for a URL that names no local
+ * file.
+ */
+function toFilePath(file: string): string | undefined {
+  if (!file.startsWith("file://")) {
+    return file;
+  }
+  try {
+    return fileURLToPath(file);
+  } catch {
+    return undefined;
+  }
+}
+
 function parseFrames(
   stack: string,
   message: string | undefined,
@@ -202,8 +275,9 @@ function parseFrames(
       continue;
     }
 
-    const { file, line, column } = parsed;
-    if (isIgnored(file)) {
+    const { line, column } = parsed;
+    const file = toFilePath(parsed.file);
+    if (file === undefined || isIgnored(file)) {
       continue;
     }
 
@@ -217,12 +291,23 @@ function parseFrames(
       continue;
     }
 
-    frames.push({ file, line, column });
+    frames.push({ file, path: resolve(file), line, column });
   }
 
   return frames;
 }
 
+function rememberSource(file: string, lines: string[] | null): void {
+  if (sourceCache.size >= MAX_CACHED_FILES) {
+    const oldest = sourceCache.keys().next().value;
+    if (oldest !== undefined) {
+      sourceCache.delete(oldest);
+    }
+  }
+  sourceCache.set(file, lines);
+}
+
+/** The lines of `file`, a resolved path. */
 function readSource(file: string): string[] | null {
   if (sourceCache.has(file)) {
     return sourceCache.get(file)!;
@@ -236,8 +321,17 @@ function readSource(file: string): string[] | null {
     // resolved path has to clear the same gate. The root is resolved too: a
     // working directory reached through a link is otherwise outside itself.
     const real = realpathSync(file);
-    if (isReadableSourcePath(real, realpathSync(process.cwd()))) {
+    if (real !== file && sourceCache.has(real)) {
+      // Another name for a file already read - a directory link inside the
+      // application, which can even lead back to where it sits and so spell
+      // one file endlessly. It shares that file's lines rather than holding
+      // a copy of its own.
+      lines = sourceCache.get(real)!;
+    } else if (isReadableSourcePath(real, realpathSync(process.cwd()))) {
       lines = readFileSync(real, "utf8").split("\n");
+      if (real !== file) {
+        rememberSource(real, lines);
+      }
     }
   } catch {
     // Unreadable for any reason - bundled away, permissions, deleted since
@@ -245,13 +339,7 @@ function readSource(file: string): string[] | null {
     lines = null;
   }
 
-  if (sourceCache.size >= MAX_CACHED_FILES) {
-    const oldest = sourceCache.keys().next().value;
-    if (oldest !== undefined) {
-      sourceCache.delete(oldest);
-    }
-  }
-  sourceCache.set(file, lines);
+  rememberSource(file, lines);
   return lines;
 }
 
@@ -282,6 +370,11 @@ export function collectCodeFrames(
      * a stack that came off an error.
      */
     message?: string;
+    /**
+     * Redacts the source before a frame is cut from it - see
+     * `redactedSource`.
+     */
+    redactor?: SourceRedactor;
   } = {},
 ): CodeFrame[] | undefined {
   if (!stack) {
@@ -315,12 +408,13 @@ export function collectCodeFrames(
 
     for (const frame of frames) {
       let file = frame.file;
+      let path = frame.path;
       let line = frame.line;
       let source: string[] | null = null;
 
       if (options.sourceMaps) {
         const original = resolveOriginalPosition(
-          frame.file,
+          frame.path,
           frame.line,
           frame.column,
         );
@@ -339,6 +433,7 @@ export function collectCodeFrames(
             continue;
           }
           file = original.file;
+          path = resolve(original.file);
           line = original.line;
           // Prefer the map's embedded copy - it is the source this build was
           // compiled from, and it works when the source tree is not deployed.
@@ -346,7 +441,7 @@ export function collectCodeFrames(
         }
       }
 
-      source ??= readSource(file);
+      source ??= readSource(path);
       if (!source) {
         continue;
       }
@@ -364,7 +459,10 @@ export function collectCodeFrames(
         file,
         line,
         firstLine,
-        lines: source.slice(firstLine - 1, lastLine),
+        lines: redactedSource(source, options.redactor).slice(
+          firstLine - 1,
+          lastLine,
+        ),
       });
     }
 

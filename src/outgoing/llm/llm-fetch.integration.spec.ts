@@ -1,9 +1,13 @@
 import { AsyncLocalStorage } from "async_hooks";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { createObserveModule } from "../../observe.module.js";
 import { OperationTraceRegistry } from "../../services/operation-trace.registry.js";
 import { testObserveOptions } from "../../testing/observe-harness.js";
 import { OutgoingObserveAgentService } from "../outgoing-observe-agent.service.js";
 import {
+  activateLlmFetchObserver,
+  attachLlmSpan,
   installLlmFetchObserver,
   llmCallsOff,
   uninstallLlmFetchObserver,
@@ -22,6 +26,193 @@ beforeEach(() => {
 afterEach(() => {
   uninstallLlmFetchObserver();
   globalThis.fetch = realFetch;
+});
+
+describe("a model reply read through the agent", () => {
+  const url = "https://api.openai.com/v1/chat/completions";
+  const encode = (text: string) => new TextEncoder().encode(text);
+
+  /** Answers every call with `reply`, under a span that is held and tagged. */
+  const answerWith = (reply: () => Response) => {
+    const tags: unknown[] = [];
+    const released = vi.fn();
+    globalThis.fetch = async () => {
+      attachLlmSpan({
+        spanId: "1",
+        end: () => undefined,
+        tag: (extra) => void tags.push(extra),
+        hold: () => released,
+      });
+      return reply();
+    };
+    installLlmFetchObserver();
+    const stop = activateLlmFetchObserver({
+      isRecording: () => true,
+    } as never);
+    return { tags, released, stop };
+  };
+
+  const settledWithin = <T>(promise: Promise<T>, ms: number) =>
+    Promise.race([
+      promise.then(
+        () => "fulfilled",
+        (error: Error) => `rejected: ${error.message}`,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), ms)),
+    ]);
+
+  // A call aborted, or a connection reset, while nothing is reading: plain
+  // fetch fails the body at once, and a stream piped on - `Readable.fromWeb`
+  // under a deadline - relies on `reader.closed` to hang up.
+  it("fails the body as soon as the provider's stream fails, not at the next read", async () => {
+    let provider!: ReadableStreamDefaultController<Uint8Array>;
+    const { released, stop } = answerWith(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              start: (controller) => void (provider = controller),
+              pull: (controller) =>
+                controller.enqueue(encode('data: {"a":1}\n')),
+            },
+            { highWaterMark: 0 },
+          ),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    try {
+      const response = await globalThis.fetch(url, { body: "{}" });
+      const reader = response.body!.getReader();
+      await reader.read();
+
+      provider.error(new Error("This operation was aborted"));
+
+      expect(await settledWithin(reader.closed, 200)).toBe(
+        "rejected: This operation was aborted",
+      );
+      expect(released).toHaveBeenCalledTimes(1);
+    } finally {
+      stop();
+    }
+  });
+});
+
+describe("a model reply the Response constructor refuses", () => {
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  // What `fetch` takes off the wire and `new Response()` will not: a status
+  // past 599, a reason phrase with a control character or past Latin-1.
+  it.each([
+    ["a status past 599", { status: 999 }],
+    ["a reason phrase past Latin-1", { statusText: "Acc\ufffds refus\ufffd" }],
+    ["a control character", { statusText: "OK\u0001" }],
+  ])("hands back the reply as it came, for %s", async (_name, line) => {
+    const tags: unknown[] = [];
+    const released = vi.fn();
+    globalThis.fetch = async () => {
+      attachLlmSpan({
+        spanId: "1",
+        end: () => undefined,
+        tag: (extra) => void tags.push(extra),
+        hold: () => released,
+      });
+      const reply = new Response('{"usage":{"prompt_tokens":1}}', {
+        headers: { "content-type": "application/json" },
+      });
+      for (const [key, value] of Object.entries(line)) {
+        Object.defineProperty(reply, key, { value });
+      }
+      return reply;
+    };
+    installLlmFetchObserver();
+    const stop = activateLlmFetchObserver({
+      isRecording: () => true,
+    } as never);
+    try {
+      const response = await globalThis.fetch(url, { body: "{}" });
+
+      expect({
+        status: response.status,
+        statusText: response.statusText,
+      }).toMatchObject(line);
+      expect(await response.text()).toBe('{"usage":{"prompt_tokens":1}}');
+      expect(released).toHaveBeenCalledTimes(1);
+      expect(tags).toEqual([{ "llm.provider": "openai" }]);
+    } finally {
+      stop();
+    }
+  });
+});
+
+describe("a model reply the application drops", () => {
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+
+  /** A provider reply that never ends, and remembers being cancelled. */
+  const provider = (cancelled: unknown[], released: () => void) => {
+    globalThis.fetch = async () => {
+      attachLlmSpan({
+        spanId: "1",
+        end: () => undefined,
+        hold: () => released,
+      });
+      return new Response(
+        new ReadableStream(
+          {
+            pull: (controller) => controller.enqueue(bytes("{")),
+            cancel: (reason) => void cancelled.push(reason),
+          },
+          { highWaterMark: 0 },
+        ),
+        { headers: { "content-type": "application/json" } },
+      );
+    };
+    installLlmFetchObserver();
+    return activateLlmFetchObserver({ isRecording: () => true } as never);
+  };
+
+  const collect = async (until: () => boolean) => {
+    for (let attempt = 0; attempt < 20 && !until(); attempt++) {
+      gc();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  const bytes = (text: string) => new TextEncoder().encode(text);
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  it("cancels the provider's stream once nothing can read it any more", async () => {
+    const cancelled: unknown[] = [];
+    const released = vi.fn();
+    const stop = provider(cancelled, released);
+    try {
+      // Read a little, then dropped: an abandoned stream, a lost race.
+      await (async () => {
+        const response = await globalThis.fetch(url, { body: "{}" });
+        await response.body!.getReader().read();
+      })();
+      await collect(() => cancelled.length > 0);
+    } finally {
+      stop();
+    }
+    expect(cancelled).toHaveLength(1);
+    expect(released).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a stream the caller still holds alone", async () => {
+    const cancelled: unknown[] = [];
+    const stop = provider(cancelled, vi.fn());
+    try {
+      const response = await globalThis.fetch(url, { body: "{}" });
+      const body = response.body!;
+      await collect(() => false);
+      expect(cancelled).toEqual([]);
+      await body.cancel("done");
+      expect(cancelled).toEqual(["done"]);
+    } finally {
+      stop();
+    }
+  });
 });
 
 describe("llmCallsOff", () => {

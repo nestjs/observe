@@ -30,10 +30,13 @@ jobs:
         # being flagged. It is tested precisely because dropping below it is
         # the regression nobody notices locally.
         node: ["20.19", "22", "24"]
-    # The queue suites need a real Redis, and the query-span suites a real
-    # Postgres, MySQL and MongoDB. Each skips itself when its server does not
-    # answer - which, without these, would be every CI run.
-    services:
+    # The queue suites need a real Redis, the query-span suites a real
+    # Postgres, MySQL and MongoDB, the Jaeger export suite a Jaeger, and the
+    # kafkajs and amqplib instrumentation suites a Kafka and a RabbitMQ. Each
+    # skips itself when its server does not answer - which, without these,
+    # would be every CI run. Anchored for the older-Nest job below, which
+    # needs the same servers.
+    services: &services
       mysql:
         image: mysql:8
         env:
@@ -80,6 +83,57 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      jaeger:
+        # OTLP/HTTP in on 4318, and on 16686 the query API the suite reads
+        # each trace back from. The health check asks what the suite asks
+        # before it runs, so a healthy container is one it will not skip.
+        image: jaegertracing/jaeger:2.22.0
+        ports:
+          - 4318:4318
+          - 16686:16686
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:16686/api/v3/services"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      kafka:
+        # One KRaft node, broker and controller both. A client is sent on to
+        # the address a broker advertises, so it advertises the one the
+        # suite reaches it on. The health check is a JVM each time, hence
+        # the longer interval.
+        image: apache/kafka:3.9.2
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+      rabbitmq:
+        # The health check asks what the suite asks: whether AMQP's port
+        # takes a connection. Not `rabbitmq-diagnostics`: run as root before
+        # the server is up, it writes an Erlang cookie the server, run as
+        # `rabbitmq`, then cannot read, and the broker exits at boot.
+        image: rabbitmq:3
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "bash -c '</dev/tcp/127.0.0.1/5672'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
@@ -172,3 +226,47 @@ jobs:
             }
             console.log("require(esm) OK on node " + process.version);
           '
+
+  # The job above runs the suites on the Nest the devDependencies pin, the
+  # newest. This runs them on older ones the peer ranges promise: the first
+  # Nest 12, and the newest Nest 11. There the framework hooks the SDK
+  # feature-tests for are missing, so the code paths that must work without
+  # them run - the ones the newest Nest never takes. Cases that need a newer
+  # framework gate themselves on the installed major (src/testing/nest-version.ts).
+  #
+  # 12.0.1, not 12.0.0: 12.0.0 went out with Nest 11's peer ranges and was
+  # replaced within the half hour, so no install that reads peers can have it.
+  #
+  # Next to the "backward compatibility with Nest 11" step, not instead of it:
+  # that one installs the packed tarball as a consumer would, peers read
+  # strictly. This one runs the repository's suites from source.
+  #
+  # No lint, type-check or build: they check the source against the pinned
+  # Nest, which the job above does.
+  test-older-nest:
+    name: test (node ${{ matrix.node }}, nest ${{ matrix.nest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22"]
+        nest: ["12.0.1", "11.2.8"]
+    services: *services
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci --legacy-peer-deps
+
+      # The framework packages move as one set and the script fails on a mixed
+      # one: microservices 12.3.3 beside core 12.0.1 installs cleanly and then
+      # crashes at runtime.
+      - run: node scripts/use-nest.cjs ${{ matrix.nest }}
+
+      - run: npm test
+
+      - run: npm run test:int

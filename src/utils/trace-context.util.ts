@@ -88,8 +88,11 @@ export function readTraceContext(
     return undefined;
   }
   const context: TraceContext = {
-    traceId,
-    parentSpanId,
+    // Copied: a capture is a slice of the header, and would keep all of it
+    // alive for as long as the context - in the OTLP retry queue, that can
+    // be long. A version past 00 may carry anything after its flags.
+    traceId: copyOf(traceId),
+    parentSpanId: copyOf(parentSpanId),
     sampled: (parseInt(flags, 16) & 0x01) === 0x01,
   };
   const traceState = fitTraceState(headers?.["tracestate"]);
@@ -113,8 +116,10 @@ function fitTraceState(value: unknown): string | undefined {
   if (!trimmed || !TRACE_STATE_PATTERN.test(trimmed)) {
     return undefined;
   }
+  // Copied, here and below: what `trim` and `split` give back are slices of
+  // the value, however long it was.
   if (trimmed.length <= MAX_TRACE_STATE_LENGTH) {
-    return trimmed;
+    return copyOf(trimmed);
   }
   let fitted = "";
   for (const entry of trimmed.split(",")) {
@@ -128,7 +133,16 @@ function fitTraceState(value: unknown): string | undefined {
     }
     fitted = next;
   }
-  return fitted || undefined;
+  return fitted ? copyOf(fitted) : undefined;
+}
+
+/**
+ * `text`, which is printable ASCII, as a string that shares no memory with
+ * what it was cut from. V8 keeps a substring as a slice of its source, so a
+ * 32-character trace id would otherwise hold a header of any length.
+ */
+function copyOf(text: string): string {
+  return Buffer.from(text, "latin1").toString("latin1");
 }
 
 /**
@@ -180,6 +194,40 @@ export function inboundTraceId(
 }
 
 /**
+ * The W3C trace context a queue job or a microservice message runs in -
+ * `inboundTraceContext`'s counterpart for work handed on with a `traceparent`
+ * (see `traceparentToHandOn`), whose span the exporter puts under it. That is
+ * the span an OpenTelemetry SDK in this process has open for the work, when
+ * it is in that trace - an instrumentation that covers the hop opens one:
+ * `bullmq-otel` for a job, the SDK's gRPC, Kafka or RabbitMQ instrumentation
+ * for a message - else the `traceparent` itself.
+ *
+ * Only a `traceparent` in the trace `traceId` - the Observe trace id the work
+ * runs under - maps onto, as `continueHandedOnTrace` takes it: job options and
+ * packet metadata are writable by anything that reaches Redis or the socket.
+ *
+ * And only a sampled one, which a request's `traceparent` need not be. The
+ * agent hands work on unsampled when the operation that sent it was not
+ * recorded, naming a span that exists nowhere; or its caller sampled the
+ * trace out, and nothing upstream exports it. Either way there is no parent
+ * to put the work's span under, so it stays as it was without one.
+ */
+export function handedOnTraceContext(
+  traceparent: unknown,
+  traceId: string,
+): TraceContext | undefined {
+  const handedOn =
+    typeof traceparent === "string"
+      ? readTraceContext({ traceparent })
+      : undefined;
+  if (!handedOn?.sampled || handedOn.traceId !== w3cTraceIdOf(traceId)) {
+    return undefined;
+  }
+  const active = traceContextOfSpan(activeOpenTelemetrySpanContext());
+  return active?.traceId === handedOn.traceId ? active : handedOn;
+}
+
+/**
  * An OpenTelemetry span context as the trace context an operation runs in,
  * the span becoming the operation's parent - or `undefined` for one the spec
  * would not accept, such as the all-zero context of a span never started.
@@ -197,8 +245,10 @@ function traceContextOfSpan(
     return undefined;
   }
   const context: TraceContext = {
-    traceId: spanContext.traceId,
-    parentSpanId: spanContext.spanId,
+    // Copied: the SDK's ids for a span with a remote parent are substrings
+    // of the carrier its propagator read, and would keep all of it alive.
+    traceId: copyOf(spanContext.traceId),
+    parentSpanId: copyOf(spanContext.spanId),
     sampled: (spanContext.traceFlags & 0x01) === 0x01,
   };
   let traceState: string | undefined;

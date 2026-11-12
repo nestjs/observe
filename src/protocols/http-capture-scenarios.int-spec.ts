@@ -20,11 +20,12 @@ import {
   FastifyAdapter,
   NestFastifyApplication,
 } from "@nestjs/platform-fastify";
-import { NestNodeApplication, NodeAdapter } from "@nestjs/platform-node";
+import type { NestNodeApplication } from "@nestjs/platform-node";
 import request from "supertest";
 import { RequestSnapshotEncoder } from "../encoders/request-snapshot.encoder.js";
 import { ObserveOptions } from "../interfaces/observe-options.interface.js";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -138,7 +139,7 @@ async function bootApp(
   } else if (platform === "node") {
     const nodeApp = await NestFactory.create<NestNodeApplication>(
       CaptureScenariosModule as Type<unknown>,
-      new NodeAdapter(),
+      await createNodeAdapter(),
       { instrument: ObserveInstrument, logger: false },
     );
     nodeApp.useBodyParser("text", { type: "text/plain" });
@@ -184,7 +185,7 @@ async function bootApp(
  * each adapter actually leaves there for a string, a buffer, a form, and a
  * body nobody parsed.
  */
-describe.each<Platform>(["express", "fastify", "node"])(
+describe.each<Platform>(onPlatforms(["express", "fastify", "node"]))(
   "ObserveModule: request capture scenarios (%s)",
   (platform) => {
     describe("with headers, body and a slow threshold configured", () => {

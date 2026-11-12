@@ -43,6 +43,9 @@ describe("llmProviderForHost", () => {
   it("leaves every other host alone, unless the application names it", () => {
     expect(llmProviderForHost("api.stripe.com")).toBeUndefined();
     expect(llmProviderForHost("openai.com.evil.example")).toBeUndefined();
+    for (const inherited of ["constructor", "__proto__", "toString"]) {
+      expect(llmProviderForHost(inherited), inherited).toBeUndefined();
+    }
     const extra = new Set(["llm-gateway.internal:4000"]);
     expect(llmProviderForHost("llm-gateway.internal:4000", extra)).toBe(
       "custom",
@@ -60,6 +63,41 @@ describe("model from the request", () => {
     expect(modelFromRequestBody(bytes(body))).toBe("gpt-4.1-mini");
     expect(modelFromRequestBody(undefined)).toBeUndefined();
     expect(modelFromRequestBody(new FormData())).toBeUndefined();
+  });
+
+  // A tool call's input or a tool result is part of the prompt, and may hold
+  // a key of the same name: what it says is not the model, and not the
+  // agent's to report.
+  it("reads only the outermost object's model, never one in the prompt", () => {
+    const converse = JSON.stringify({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { toolResult: { content: [{ json: { model: "secret device" } }] } },
+          ],
+        },
+      ],
+    });
+    expect(modelFromRequestBody(converse)).toBeUndefined();
+    expect(
+      modelFromRequestBody(
+        JSON.stringify({
+          messages: [{ role: "user", content: { model: "secret" } }],
+          system: "a } that closes nothing, a { that opens nothing",
+          model: "claude-sonnet-4-5",
+        }),
+      ),
+    ).toBe("claude-sonnet-4-5");
+    expect(
+      modelFromRequestBody(
+        JSON.stringify({ prompt: '"model":"secret"', model: "gpt-4.1" }),
+      ),
+    ).toBe("gpt-4.1");
+    expect(modelFromRequestBody('say "model": "secret"')).toBeUndefined();
+    expect(
+      modelFromRequestBody(JSON.stringify({ model: 4, input: { model: "x" } })),
+    ).toBeUndefined();
   });
 
   it("reads the model out of the path for Gemini, Vertex and Bedrock", () => {
@@ -168,10 +206,53 @@ describe("JsonUsageReader", () => {
     });
   });
 
+  it("takes the model of a body too large to keep from its outermost object only", () => {
+    const reader = new JsonUsageReader();
+    feed(
+      reader,
+      JSON.stringify({
+        output: [
+          { type: "function_call", arguments: { model: "secret text" } },
+          { type: "message", text: "x".repeat(3 * 1024 * 1024) },
+        ],
+        usage: { input_tokens: 5, output_tokens: 6 },
+      }),
+      256 * 1024,
+    );
+    expect(reader.finish()).toEqual({ inputTokens: 5, outputTokens: 6 });
+  });
+
   it("gives up quietly on a body that is not JSON", () => {
     const reader = new JsonUsageReader();
     feed(reader, "<html>bad gateway</html>");
     expect(reader.finish()).toEqual({});
+  });
+
+  // A chunk kept as it was handed over costs a few hundred bytes of heap on
+  // top of its own: a body a byte at a time would be held a hundred times
+  // over. What the reader keeps are copies, bounded by the bytes counted.
+  it.each([
+    ["one byte at a time", 1],
+    ["in pieces", 7],
+  ])("keeps a copy of a body arriving %s, not the chunks", (_name, size) => {
+    const reader = new JsonUsageReader();
+    const encoded = bytes(
+      JSON.stringify({
+        model: "gpt-4o-2024-08-06",
+        choices: [{ message: { content: "hello é ✓" } }],
+        usage: { prompt_tokens: 11, completion_tokens: 2 },
+      }),
+    );
+    for (let offset = 0; offset < encoded.byteLength; offset += size) {
+      const chunk = encoded.slice(offset, offset + size);
+      reader.push(chunk);
+      chunk.fill(0);
+    }
+    expect(reader.finish()).toEqual({
+      model: "gpt-4o-2024-08-06",
+      inputTokens: 11,
+      outputTokens: 2,
+    });
   });
 });
 
@@ -285,6 +366,26 @@ describe("SseUsageReader", () => {
       model: "m1",
       inputTokens: 1,
       outputTokens: 2,
+    });
+  });
+
+  it("reads a stream arriving one byte at a time, characters split and all", () => {
+    const reader = new SseUsageReader();
+    feed(
+      reader,
+      [
+        `data: {"model":"modèle-✓","text":"héllo"}`,
+        ``,
+        `data: {"text":"wörld ✓"}\r`,
+        ``,
+        `data: {"usage":{"prompt_tokens":3,"completion_tokens":4}}`,
+      ].join("\n"),
+      1,
+    );
+    expect(reader.finish()).toEqual({
+      model: "modèle-✓",
+      inputTokens: 3,
+      outputTokens: 4,
     });
   });
 });

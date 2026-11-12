@@ -24,11 +24,12 @@ import {
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
-import { redactUrlQuery } from "../utils/redact-url-query.js";
+import { redactUrlQuery, toGlobalRegExp } from "../utils/redact-url-query.js";
 import { openTelemetryTraceIdGenerator } from "../utils/default-trace-id-generator.util.js";
 import { usesDefaultTraceIdGenerator } from "../utils/trace-id-generator-origin.util.js";
 import { inboundTraceContext } from "../utils/trace-context.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
+import { setAgentHook, shareHookSlot } from "../utils/shared-hook-slot.util.js";
 import {
   deferTraceCompletion,
   generateTraceIdSafely,
@@ -36,13 +37,11 @@ import {
   setAttributesSafely,
   shouldIgnoreSafely,
 } from "./deferred-trace-completion.js";
-
-/**
- * How long an aborted request's handler gets to finish its spans before the
- * trace is dropped from the registry. Generous next to a typical handler, tiny
- * next to a leak that never frees.
- */
-const ABORTED_TRACE_EVICTION_GRACE_MS = 30_000;
+import {
+  endOperation,
+  OperationState,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /** The adapter hooks requests are traced through, all added in Nest 11.1.4. */
 const REQUEST_HOOKS = [
@@ -59,6 +58,46 @@ interface IncomingHttpRequest {
   headers?: Record<string, string | string[] | undefined>;
 }
 
+type RequestHook = (
+  req: any,
+  res: any,
+  done: (err?: Error) => unknown,
+) => unknown;
+type ResponseHook = (req: any, res: any, done?: () => void) => unknown;
+type RouteTriggeredHook = (requestMethod: RequestMethod, path: string) => void;
+
+/**
+ * Takes the adapter's request and response hooks over as soon as there is an
+ * adapter, so that hooks the application sets on it from then on run beside
+ * the agent's rather than in their place: from a provider, from `main.ts`
+ * before `listen()`. They have no getter, so a hook set on the adapter before
+ * it reached Nest cannot be found, and stays the agent's to replace. Called
+ * from the instance decorator, the moment Nest creates the `HttpAdapterHost`,
+ * and again from the agent, for an application without the decorator. On
+ * `init$` rather than the adapter itself: `@nestjs/testing` attaches the
+ * adapter only once the testing module is compiled.
+ */
+export function shareHttpAdapterHooks(
+  httpAdapterHost: Pick<HttpAdapterHost, "httpAdapter" | "init$">,
+): void {
+  const share = () => {
+    try {
+      const { httpAdapter } = httpAdapterHost;
+      if (httpAdapter) {
+        shareHookSlot(httpAdapter, "setOnRequestHook");
+        shareHookSlot(httpAdapter, "setOnResponseHook");
+      }
+    } catch {
+      // An adapter that cannot be read is one there is nothing to share on.
+    }
+  };
+  try {
+    httpAdapterHost.init$?.subscribe(share);
+  } catch {
+    // Run from the instance decorator, which Nest 11 does not guard.
+  }
+}
+
 @Injectable()
 export class HttpObserveAgentService<Store extends Record<string, unknown>>
   implements OnModuleInit, OnModuleDestroy
@@ -66,6 +105,17 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
   private readonly logger = new Logger(HttpObserveAgentService.name);
   private warnedAboutHooks = false;
   private httpAdapterInitSubscription: Subscription | undefined;
+
+  /**
+   * The registry key each request was started under, by the request object -
+   * which every adapter hands to both of its hooks. The response hook cannot
+   * ask the async store: it runs from `finish`, in the async context of
+   * whatever ended the response, and that need not be the request's own. A
+   * request pipelined behind another has its `finish` emitted from the
+   * earlier one's; a stream piped into the response ends it where its source
+   * emits - for a pooled database connection, in the request that opened it.
+   */
+  private readonly registryKeys = new WeakMap<object, string>();
 
   /**
    * `http.queryParamsObfuscateRegex`, rebuilt with the global flag when it was
@@ -91,6 +141,8 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       this.options.http?.queryParamsObfuscateRegex,
     );
 
+    shareHttpAdapterHooks(this.httpAdapterHost);
+
     // The "setOnRouteTriggered" hook must be set immediately
     // to ensure that route metadata is captured correctly.
     const { httpAdapter } = this.httpAdapterHost;
@@ -98,8 +150,13 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       return;
     }
 
-    httpAdapter.setOnRouteTriggered(
-      (requestMethod: RequestMethod, path: string) => {
+    // Beside the application's, one set before (found through the getter,
+    // which Nest's router reads the hook from too, and is left to it) or
+    // after.
+    setAgentHook<RouteTriggeredHook>(
+      httpAdapter,
+      "setOnRouteTriggered",
+      (requestMethod, path) => {
         const store = this.asyncLocalStorage.getStore();
         if (!store) {
           return;
@@ -114,6 +171,8 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           path,
         );
       },
+      composeRouteTriggered,
+      { getter: "getOnRouteTriggered" },
     );
   }
 
@@ -135,43 +194,44 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       return;
     }
 
-    httpAdapter.setOnRequestHook(
-      (req: IncomingHttpRequest, res: unknown, done: () => void) => {
-        this.startHttpRequestTracing(req, res, done);
-      },
+    // Set beside the application's hooks, which `shareHttpAdapterHooks` has
+    // made the slots keep.
+    setAgentHook<RequestHook>(
+      httpAdapter,
+      "setOnRequestHook",
+      (req: IncomingHttpRequest, res, done) =>
+        this.startHttpRequestTracing(req, res, done),
+      composeRequestHook,
     );
-
-    // Fastify waits for `done` before it runs the next onResponse hook.
-    // Express does not pass one.
-    httpAdapter.setOnResponseHook(
-      (
-        req: unknown,
-        res: {
-          statusCode: number;
-        },
-        done?: () => void,
-      ) => {
-        this.endHttpRequestTracing(req, res);
-        done?.();
-      },
+    setAgentHook<ResponseHook>(
+      httpAdapter,
+      "setOnResponseHook",
+      (req, res: { statusCode: number }) =>
+        this.endHttpRequestTracing(req, res),
+      composeResponseHook,
     );
   }
 
+  /**
+   * Opens the request's trace and calls `done` inside its store, handing back
+   * what `done` returns: an application's request hook runs inside it, and
+   * the adapter waits on or fails the request by what that hook returns.
+   */
   startHttpRequestTracing(
     req: IncomingHttpRequest,
     res: unknown,
-    done: () => void,
-  ) {
+    done: () => unknown,
+  ): unknown {
     // The same map `run` is given, rather than `getStore()` inside the callback:
     // identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
-    this.asyncLocalStorage.run(store, () => {
-      // OpenTelemetry interop runs only while the collector takes this app's
-      // telemetry - see `ObserveAgentSharedBuffer.isIngesting`. Asked once
-      // per request, so a request is named and carried on one way throughout.
+    return this.asyncLocalStorage.run(store, () => {
+      // OpenTelemetry interop runs only beside reporting to NestJS Observe -
+      // see `ObserveAgentSharedBuffer.isReporting`. Asked once per request,
+      // so a request is named and carried on one way throughout.
       const openTelemetry =
         this.options.openTelemetry === true &&
-        this.observeAgentSharedBuffer.isIngesting();
+        this.observeAgentSharedBuffer.isReporting();
       const traceId = generateTraceIdSafely(
         openTelemetry && usesDefaultTraceIdGenerator(this.options)
           ? openTelemetryTraceIdGenerator
@@ -189,6 +249,10 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // lookups stay off a recorded request sharing its id.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
+      this.registryKeys.set(req, registryKey);
+      // Ended when the response closes, recorded or not, answered or
+      // aborted: see `liveTraceId`.
+      this.watchResponseClose(res, openOperation(store), registryKey);
 
       // With OpenTelemetry interop on, read whatever produced the trace id: a
       // `traceIdGenerator` of the application's own decides what Observe
@@ -196,12 +260,13 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // outbound calls carry that one on either way - for an unrecorded
       // request too, so the trace does not break here. An OpenTelemetry SDK
       // in this process has the say on which trace that is, when one runs -
-      // see `inboundTraceContext`.
-      if (openTelemetry) {
-        const traceContext = inboundTraceContext(req.headers);
-        if (traceContext) {
-          store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
-        }
+      // see `inboundTraceContext`. The registry keeps it beside the
+      // snapshot too, for `otlp`, which puts the operation's span under it.
+      const traceContext = openTelemetry
+        ? inboundTraceContext(req.headers)
+        : undefined;
+      if (traceContext) {
+        store.set(TRACE_CONTEXT_KEY as KeyOf<Store>, traceContext);
       }
 
       setAttributesSafely(
@@ -230,13 +295,11 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // disclosure either way. A configured regex still applies, on top rather
       // than instead - it exists for the keys only that deployment knows
       // about.
-      const redactedUrl = redactUrlQuery(
+      const originalUrl = redactUrlQuery(
         req.url,
         this.operationTraceRegistry.getRedactor(),
+        this.queryParamsObfuscateRegex,
       );
-      const originalUrl = this.queryParamsObfuscateRegex
-        ? redactedUrl.replaceAll(this.queryParamsObfuscateRegex, "[REDACTED]")
-        : redactedUrl;
 
       this.operationTraceRegistry.startTrace(
         registryKey,
@@ -249,22 +312,28 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           },
         },
         traceId,
+        traceContext,
       );
-      this.evictTraceOnClientAbort(res, registryKey);
-      done();
+      // Answered by the CORS layer before any route, and on Fastify before
+      // any middleware too: a preflight asked for has no span to keep it.
+      if (isPreflight(req)) {
+        this.operationTraceRegistry.keepWithoutSpans(registryKey);
+      }
+      return done();
     });
   }
 
   endHttpRequestTracing(req: unknown, res: { statusCode: number }): void {
-    const store = this.asyncLocalStorage.getStore();
-    if (!store) {
-      return;
-    }
-    // Only this execution's own key: a stale store left by a finished request
-    // must not complete a later one that reuses its id.
-    const registryKey = store.get(TRACE_REGISTRY_KEY);
+    // This request's own key, never the one in the async store: the store
+    // here is that of whatever ended the response, a finished request's or
+    // another one still running, and neither may be completed in this one's
+    // place, nor leave this one open.
+    const registryKey =
+      typeof req === "object" && req !== null
+        ? this.registryKeys.get(req)
+        : undefined;
     if (
-      typeof registryKey !== "string" ||
+      registryKey === undefined ||
       !this.operationTraceRegistry.hasTrace(registryKey)
     ) {
       return;
@@ -293,6 +362,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
             req,
             this.options.http?.capture,
             this.operationTraceRegistry.getRedactor(),
+            this.queryParamsObfuscateRegex,
           );
           if (captured) {
             (snapshot as RequestSnapshot).request = captured;
@@ -309,7 +379,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
   }
 
   /**
-   * Frees the trace when the client goes away before the response finishes.
+   * Ends the request's operation when its response closes - answered or
+   * aborted, recorded or not - and frees the trace when the client went away
+   * before the response finished.
    *
    * The adapter's response hook rides `res.on("finish")`, and an aborted
    * request never emits it - the socket emits `close` instead. Without this,
@@ -317,32 +389,41 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
    * of the process; on an ingest endpoint taking 16MB bodies over slow links,
    * aborts are routine, not exceptional.
    *
-   * On the normal path `close` follows `finish` with `writableFinished`
-   * already true, so this stays a no-op there - `endHttpRequestTracing` has
-   * either plucked the trace or is about to.
+   * Express and the Node adapter hand the request hook the Node response
+   * itself; Fastify hands it the reply, which is no emitter, with the Node
+   * response under it as `raw`.
    *
-   * Eviction is deferred, not immediate: Express does not cancel the handler
-   * on abort, so its spans are usually still closing when `close` fires. The
-   * grace period lets the handler drain first; `unref` keeps the timer from
-   * holding a shutting-down process open.
+   * On the normal path `close` follows `finish` with `writableFinished`
+   * already true, so the trace is left alone there - `endHttpRequestTracing`
+   * has either plucked it or is about to. A response that does not say is
+   * left alone too.
+   *
+   * Dropped at once, not after a grace period: an abandoned trace is never
+   * reported, and the registry already lets a handler that outlives its
+   * client end its spans on a trace that is gone. Held for 30 s, it was the
+   * client's to say how many such traces the process kept.
    */
-  private evictTraceOnClientAbort(res: unknown, traceId: string): void {
-    const response = res as {
-      on?: (event: string, listener: () => void) => void;
-      writableFinished?: boolean;
-    };
+  private watchResponseClose(
+    res: unknown,
+    operation: OperationState,
+    traceId: string,
+  ): void {
+    const given = res as { on?: unknown; raw?: unknown } | undefined;
+    const response = (typeof given?.on === "function" ? given : given?.raw) as
+      | {
+          on?: (event: string, listener: () => void) => void;
+          writableFinished?: boolean;
+        }
+      | undefined;
     if (typeof response?.on !== "function") {
       return;
     }
     response.on("close", () => {
-      if (response.writableFinished) {
-        return;
+      endOperation(operation);
+      // A request that was never recorded has nothing registered to drop.
+      if (response.writableFinished === false) {
+        this.operationTraceRegistry.abandonTrace(traceId);
       }
-      const timer = setTimeout(
-        () => this.operationTraceRegistry.abandonTrace(traceId),
-        ABORTED_TRACE_EVICTION_GRACE_MS,
-      );
-      timer.unref?.();
     });
   }
 
@@ -369,20 +450,9 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     return false;
   }
 
-  /**
-   * A CORS preflight, when `http.tracePreflights` has not asked for them.
-   *
-   * Recognised by what the CORS spec defines a preflight to be - `OPTIONS`
-   * with an `Access-Control-Request-Method` header - rather than by the
-   * method alone, so an application's own `OPTIONS` handler is still traced.
-   * Every adapter lower-cases header names.
-   */
+  /** A CORS preflight, when `http.tracePreflights` has not asked for them. */
   private isUntracedPreflight(req: IncomingHttpRequest): boolean {
-    return (
-      !this.options.http?.tracePreflights &&
-      req.method === "OPTIONS" &&
-      req.headers?.["access-control-request-method"] !== undefined
-    );
+    return !this.options.http?.tracePreflights && isPreflight(req);
   }
 
   private shouldIgnoreRequest(req: { url: string; method: string }): boolean {
@@ -399,7 +469,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       const blocklist = this.options.http.ignore;
       return blocklist.some((item) => {
         if (typeof item === "string") {
-          return req.url === item;
+          return matchesPath(item, req.url);
         }
         if (item instanceof RegExp) {
           return testIgnoreRegex(item, req.url);
@@ -408,7 +478,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           return (
             item.method === req.method &&
             (typeof item.path === "string"
-              ? req.url === item.path
+              ? matchesPath(item.path, req.url)
               : testIgnoreRegex(item.path, req.url))
           );
         }
@@ -418,6 +488,101 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     }
     return false;
   }
+}
+
+/**
+ * The request hook the adapter is given: the agent's outside, and the
+ * application's inside the agent's `done`, so it runs in the request's store
+ * - its log lines and calls carry the trace - and whatever it returns, a
+ * promise the adapter fails the request by, goes back to the adapter. It
+ * refuses a request with `done(err)`, by throwing or by answering it itself,
+ * as without the agent; the response hook still closes the trace.
+ */
+function composeRequestHook(
+  application: RequestHook | undefined,
+  agent: RequestHook,
+): RequestHook {
+  if (!application) {
+    return agent;
+  }
+  return function (this: unknown, req, res, done) {
+    return agent.call(this, req, res, () =>
+      application.call(this, req, res, done),
+    );
+  };
+}
+
+/**
+ * The response hook the adapter is given: the agent's first, whatever the
+ * application's does, then the application's, handed `done` - Fastify waits
+ * for it before its next `onResponse` hook, Express passes none - and
+ * returning what it returns.
+ */
+function composeResponseHook(
+  application: ResponseHook | undefined,
+  agent: ResponseHook,
+): ResponseHook {
+  return function (this: unknown, req, res, done) {
+    if (!application) {
+      agent.call(this, req, res);
+      return done?.();
+    }
+    let returned: unknown;
+    try {
+      agent.call(this, req, res);
+    } finally {
+      returned = application.call(this, req, res, done);
+    }
+    return returned;
+  };
+}
+
+/**
+ * How deep composed route hooks are running. The getter Nest's router reads
+ * the hook from hands an application the composed hook, and one chaining
+ * "the previous hook" calls it from inside the next composed one: there only
+ * the hook it wraps runs, as the agent's part already has.
+ */
+let routeTriggeredDepth = 0;
+
+/** The route hook the adapter is given: the agent's part, then the application's. */
+function composeRouteTriggered(
+  application: RouteTriggeredHook | undefined,
+  agent: RouteTriggeredHook,
+): RouteTriggeredHook {
+  return function (this: unknown, requestMethod, path) {
+    if (routeTriggeredDepth > 0) {
+      return application?.call(this, requestMethod, path);
+    }
+    routeTriggeredDepth++;
+    try {
+      agent.call(this, requestMethod, path);
+      return application?.call(this, requestMethod, path);
+    } finally {
+      routeTriggeredDepth--;
+    }
+  };
+}
+
+/**
+ * Whether a string entry of `http.ignore` names this request: the URL itself,
+ * or its path - the URL up to a `?` or `#`. `req.url` carries the query string
+ * on every adapter, so compared whole, an endpoint that takes its input there
+ * was never ignored, and `/health` was traced whenever a caller added one. An
+ * entry written with a query string still matches that URL exactly. Read in
+ * place, without cutting the URL, as this runs for every request.
+ */
+function matchesPath(literal: string, url: string): boolean {
+  if (url === literal) {
+    return true;
+  }
+  const next = url[literal.length];
+  return (
+    (next === "?" || next === "#") &&
+    url.startsWith(literal) &&
+    !literal.includes("?") &&
+    !literal.includes("#")
+  );
 }
 
 /**
@@ -434,12 +599,14 @@ function testIgnoreRegex(pattern: RegExp, value: string): boolean {
 }
 
 /**
- * Rebuilds a RegExp with the global flag when it lacks one, keeping the
- * original otherwise. `replaceAll` refuses a non-global pattern outright.
+ * A CORS preflight: what the CORS spec defines one to be - `OPTIONS` with an
+ * `Access-Control-Request-Method` header - rather than the method alone, so
+ * an application's own `OPTIONS` handler is still traced as a request. Every
+ * adapter lower-cases header names.
  */
-function toGlobalRegExp(pattern: RegExp | undefined): RegExp | undefined {
-  if (!pattern || pattern.global) {
-    return pattern;
-  }
-  return new RegExp(pattern.source, pattern.flags + "g");
+function isPreflight(req: IncomingHttpRequest): boolean {
+  return (
+    req.method === "OPTIONS" &&
+    req.headers?.["access-control-request-method"] !== undefined
+  );
 }

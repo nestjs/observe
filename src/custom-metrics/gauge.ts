@@ -1,6 +1,7 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
 import { admitsSeries, stringifyLabel } from "./counter.js";
-import { admitsFinite } from "./finite-value.util.js";
+import { admitsFinite, admitsReading } from "./finite-value.util.js";
+import { admitsLabelValues, isLabelSet } from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -24,6 +25,9 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
 
   /** Whether a non-finite value has already been reported, likewise. */
   private readonly nonFinite = { warned: false };
+
+  /** Whether a label value no key can be made from has been reported. */
+  private readonly labelValues = { warned: false };
 
   /**
    * The name of the gauge.
@@ -205,32 +209,43 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot increment a gauge with labels without specifying a label. For example, use `gauge.increment({ route: '/login' })`.",
       );
     }
 
-    if (typeof labelOrValue === "object") {
+    if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
+      }
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const incrementValue = value ?? 1;
+      if (!admitsFinite(this.name, incrementValue, this.nonFinite)) {
+        return;
+      }
+      const reading =
+        (this.value[stringifiedLabel] ?? this._initialValue) + incrementValue;
       if (
-        !admitsFinite(this.name, incrementValue, this.nonFinite) ||
+        !admitsReading(this.name, reading, this.nonFinite) ||
         !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
       ) {
         return;
       }
-      this.value[stringifiedLabel] =
-        (this.value[stringifiedLabel] ?? this._initialValue) + incrementValue;
+      this.value[stringifiedLabel] = reading;
     } else {
       const incrementValue = labelOrValue ?? 1;
       if (!admitsFinite(this.name, incrementValue, this.nonFinite)) {
         return;
       }
-      this.value[DEFAULT_LABEL] =
+      const reading =
         (this.value[DEFAULT_LABEL] ?? this._initialValue) + incrementValue;
+      if (!admitsReading(this.name, reading, this.nonFinite)) {
+        return;
+      }
+      this.value[DEFAULT_LABEL] = reading;
     }
     this._lastUpdated = Date.now();
     if (this._onChange) {
@@ -265,30 +280,41 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot decrement a gauge with labels without specifying a label. For example, use `gauge.decrement({ route: '/login' })`.",
       );
-    } else if (typeof labelOrValue === "object") {
+    } else if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
+      }
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const decrementValue = value ?? 1;
+      if (!admitsFinite(this.name, decrementValue, this.nonFinite)) {
+        return;
+      }
+      const reading =
+        (this.value[stringifiedLabel] ?? this._initialValue) - decrementValue;
       if (
-        !admitsFinite(this.name, decrementValue, this.nonFinite) ||
+        !admitsReading(this.name, reading, this.nonFinite) ||
         !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
       ) {
         return;
       }
-      this.value[stringifiedLabel] =
-        (this.value[stringifiedLabel] ?? this._initialValue) - decrementValue;
+      this.value[stringifiedLabel] = reading;
     } else {
       const decrementValue = labelOrValue ?? 1;
       if (!admitsFinite(this.name, decrementValue, this.nonFinite)) {
         return;
       }
-      this.value[DEFAULT_LABEL] =
+      const reading =
         (this.value[DEFAULT_LABEL] ?? this._initialValue) - decrementValue;
+      if (!admitsReading(this.name, reading, this.nonFinite)) {
+        return;
+      }
+      this.value[DEFAULT_LABEL] = reading;
     }
     this._lastUpdated = Date.now();
 
@@ -316,24 +342,22 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot set value of a gauge with labels without specifying a label. For example, use `gauge.setValue({ route: '/login' }, 42)`.",
       );
-    } else if (typeof labelOrValue === "object") {
+    } else if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
-
-      const stringifiedLabel = stringifyLabel(labelOrValue);
-      if (!(stringifiedLabel in this.value)) {
-        throw new Error(
-          `Label "${stringifiedLabel}" does not exist in the gauge. Available labels: ${Object.keys(
-            this.value,
-          ).join(", ")}.`,
-        );
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
       }
 
+      const stringifiedLabel = stringifyLabel(labelOrValue);
       const newValue = value ?? this._initialValue;
-      if (!admitsFinite(this.name, newValue, this.nonFinite)) {
+      if (
+        !admitsFinite(this.name, newValue, this.nonFinite) ||
+        !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
+      ) {
         return;
       }
       this.value[stringifiedLabel] = newValue;

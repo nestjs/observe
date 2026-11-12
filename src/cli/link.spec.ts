@@ -1,9 +1,12 @@
+import { execFileSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +14,7 @@ import { dirname, join } from "node:path";
 import * as ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { link, LinkDependencies } from "./link.js";
+import { ensureEnvIgnored, writeEnvFile } from "./project-files.js";
 
 const STARTED = {
   deviceCode: "device-code",
@@ -36,7 +40,10 @@ const LINKED = {
  */
 function harness(
   polls: Array<{ status: number; body: unknown } | "network">,
-  { installExit = 0 }: { installExit?: number } = {},
+  {
+    installExit = 0,
+    started = STARTED,
+  }: { installExit?: number; started?: Record<string, unknown> } = {},
 ) {
   const lines: string[] = [];
   const opened: string[] = [];
@@ -50,7 +57,7 @@ function harness(
     fetch: (async (url: string, init?: RequestInit) => {
       requests.push({ url, body: JSON.parse(init?.body as string) });
       if (url.endsWith("/cli-link/sessions")) {
-        return new Response(JSON.stringify(STARTED), { status: 201 });
+        return new Response(JSON.stringify(started), { status: 201 });
       }
       const reply = replies.shift() ?? {
         status: 400,
@@ -226,6 +233,209 @@ describe("npx @nestjs/observe link", () => {
     expect(h.lines.at(-1)).toBe(
       "  Start the app and it reports to NestJS Observe. In production, set OBSERVE_APP_KEY and OBSERVE_APP_SECRET in the environment instead.",
     );
+  });
+
+  // Whoever answers the link request picks the page, and the opener is
+  // started before anything is approved: only a web address is opened.
+  it.each([
+    ["a local file", "file:///etc/passwd"],
+    ["a script", "javascript:alert(1)"],
+    ["a path", "/etc/passwd"],
+    ["a Windows path", "C:\\Windows\\System32\\calc.exe"],
+    ["a scheme-less address", "observe.nestjs.com/link"],
+    ["a missing page", undefined],
+    ["a number", 42],
+  ])(
+    "opens, prints and polls nothing when the link page is %s",
+    async (_name, verificationUri) => {
+      const h = harness([{ status: 200, body: LINKED }], {
+        started: { ...STARTED, verificationUri },
+      });
+
+      expect(await run(h)).toBe(1);
+
+      expect(h.opened).toEqual([]);
+      expect(h.requests.map((request) => request.url)).toEqual([
+        "https://api.test/cli-link/sessions",
+      ]);
+      expect(h.lines.join("\n")).toContain("not a web address");
+      expect(h.lines.join("\n")).not.toContain(String(verificationUri));
+      expect(existsSync(join(cwd, ".env"))).toBe(false);
+    },
+  );
+
+  it("opens the link page as parsed, query and all", async () => {
+    const h = harness([{ status: 200, body: LINKED }], {
+      started: {
+        ...STARTED,
+        verificationUri: "https://observe.nestjs.com/link?from=cli&x=1 2",
+      },
+    });
+
+    expect(await run(h)).toBe(0);
+
+    expect(h.opened).toEqual([
+      "https://observe.nestjs.com/link?from=cli&x=1%202",
+    ]);
+    expect(h.lines).toContain(
+      "  Open      https://observe.nestjs.com/link?from=cli&x=1%202",
+    );
+  });
+
+  // The pair goes into .env between single quotes, and `--env-file .env`
+  // into every start script: a quote and a line break in it would be a line
+  // of the reply's own - `NODE_OPTIONS=--import data:...`, run on the next
+  // start. Refused, not escaped: no escape reads the same in Node's
+  // --env-file, dotenv and a shell.
+  it.each([
+    [
+      "a quote and a line break",
+      {
+        appKey:
+          "kK'\nNODE_OPTIONS='--import data:text/javascript,process.exit(7)'\n#",
+      },
+    ],
+    [
+      "a line break",
+      { appSecret: "s3cret\nDATABASE_URL=postgres://elsewhere" },
+    ],
+    ["a carriage return", { appKey: "kK\rX=1" }],
+    ["a quote", { appSecret: "it's" }],
+    ["a backslash", { appKey: "kK\\" }],
+    ["a space", { appSecret: "s3cr t" }],
+    ["an array", { appKey: ["kK$kK&kKkKkKkKkKk"] }],
+  ])("writes nothing when the pair holds %s", async (_name, override) => {
+    const before = read("package.json");
+    const h = harness([{ status: 200, body: { ...LINKED, ...override } }]);
+
+    expect(await run(h)).toBe(1);
+
+    expect(h.lines).toContain(
+      "https://api.test answered with something other than a key pair. Nothing was written.",
+    );
+    expect(existsSync(join(cwd, ".env"))).toBe(false);
+    expect(read("package.json")).toBe(before);
+  });
+
+  it("will not write a pair into .env that cannot stand between its quotes", () => {
+    expect(() => writeEnvFile(cwd, "kK'\nNODE_OPTIONS=x", "s")).toThrow(
+      TypeError,
+    );
+    expect(existsSync(join(cwd, ".env"))).toBe(false);
+  });
+
+  // A checkout's own files can be links to anywhere the person can write:
+  // the pair, the ignore rule and the scripts go into the project or nowhere.
+  it.each([[".env"], [".gitignore"], ["package.json"]])(
+    "turns the project away, before asking for a code, when %s leads out of it",
+    async (file) => {
+      const outside = mkdtempSync(join(tmpdir(), "observe-outside-"));
+      try {
+        const target = join(outside, "target");
+        writeFileSync(
+          target,
+          file === "package.json" ? read("package.json") : "THEIRS=1\n",
+        );
+        rmSync(join(cwd, file), { force: true });
+        symlinkSync(target, join(cwd, file));
+        const before = readFileSync(target, "utf8");
+        const h = harness([{ status: 200, body: LINKED }]);
+
+        expect(await run(h)).toBe(1);
+
+        expect(h.requests).toEqual([]);
+        expect(h.lines.join("\n")).toContain(`${file} leads out of`);
+        expect(readFileSync(target, "utf8")).toBe(before);
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  describe("in a git repository", () => {
+    // Git as installed, but none of this machine's own configuration.
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@example.com",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@example.com",
+        },
+        stdio: "ignore",
+      });
+
+    beforeEach(() => git("init", "-q"));
+
+    // An ignore rule does not apply to a file git already tracks: the
+    // secret would be in the next commit, whatever .gitignore says.
+    it.each([
+      [
+        "committed",
+        () => {
+          writeFileSync(join(cwd, ".gitignore"), "node_modules\n");
+          writeFileSync(join(cwd, ".env"), "PORT=3000\n");
+        },
+      ],
+      [
+        "force-added under an ignore rule",
+        () => writeFileSync(join(cwd, ".env"), "PORT=3000\n"),
+      ],
+    ])(
+      "turns the project away, before asking for a code, when .env is %s",
+      async (_name, prepare) => {
+        prepare();
+        git("add", "-f", ".env");
+        git("commit", "-q", "-m", "init");
+        const h = harness([{ status: 200, body: LINKED }]);
+
+        expect(await run(h)).toBe(1);
+
+        expect(h.requests).toEqual([]);
+        expect(h.lines.join("\n")).toContain(".env is tracked by git");
+        expect(read(".env")).toBe("PORT=3000\n");
+      },
+    );
+
+    it("links as usual when .env is not tracked", async () => {
+      writeFileSync(join(cwd, ".env"), "PORT=3000\n");
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+      expect(read(".env")).toContain("OBSERVE_APP_SECRET=");
+    });
+  });
+
+  // Git's reading of .gitignore: the last rule that matches decides, a `!`
+  // takes a file back out, and only trailing spaces are not part of a rule.
+  it.each([
+    [".env*\n!.env\n"],
+    ["/.env\n!/.env\n"],
+    [".env\n!.e?v\n"],
+    [".env\n![.]env\n"],
+    [" .env\n"],
+    [".env\t\n"],
+  ])("git-ignores .env when %j does not", (gitignore) => {
+    writeFileSync(join(cwd, ".gitignore"), gitignore);
+
+    expect(ensureEnvIgnored(cwd)).toBe(true);
+    expect(read(".gitignore").endsWith("\n.env\n")).toBe(true);
+  });
+
+  it.each([
+    [".env\n"],
+    ["node_modules\n.env*\n!.env.example\n"],
+    ["!.env\n.env  \n"],
+    [".env\n!dist/.env\n"],
+  ])("leaves %j alone: it already ignores .env", (gitignore) => {
+    writeFileSync(join(cwd, ".gitignore"), gitignore);
+
+    expect(ensureEnvIgnored(cwd)).toBe(false);
+    expect(read(".gitignore")).toBe(gitignore);
   });
 
   it("replaces an earlier pair and keeps the rest of .env", async () => {

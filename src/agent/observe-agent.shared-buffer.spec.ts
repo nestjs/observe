@@ -1,7 +1,11 @@
+import { Logger } from "@nestjs/common";
 import { Counter } from "../custom-metrics/counter.js";
 import { Gauge } from "../custom-metrics/gauge.js";
 import { Summary } from "../custom-metrics/summary.js";
-import type { EncodedCustomMetric } from "../encoders/custom-metrics.encoder.js";
+import {
+  CustomMetricsEncoder,
+  type EncodedCustomMetric,
+} from "../encoders/custom-metrics.encoder.js";
 import type { EncodedJobSnapshot } from "../encoders/job-snapshot.encoder.js";
 import type { EncodedRequestSnapshot } from "../encoders/request-snapshot.encoder.js";
 import {
@@ -1098,6 +1102,85 @@ describe("ObserveAgentSharedBuffer", () => {
     });
   });
 
+  describe("a batch that cannot be written whole", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    const request = (
+      traceId: string,
+      overrides: Partial<RequestSnapshot> = {},
+    ) =>
+      ({
+        traceId,
+        protocol: "http",
+        operationId: "/orders",
+        attributes: { method: "GET", statusCode: 200, originalUrl: "/orders" },
+        duration: 1,
+        traces: [],
+        ...overrides,
+      }) as RequestSnapshot;
+
+    const written = (buffer: ObserveAgentSharedBuffer) => {
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      return JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { snapshots: Array<{ ti: string }>; logs?: unknown[] };
+    };
+
+    it("is sent without its largest entries rather than not at all", () => {
+      const warn = vi
+        .spyOn(Logger.prototype, "warn")
+        .mockImplementation(() => undefined);
+      const buffer = createBuffer();
+      buffer.insertRequestSnapshot(request("bystander"));
+      // Past the 16 MB slot on its own: a URL, an error's text - anything a
+      // client sets the length of.
+      buffer.insertRequestSnapshot(
+        request("oversized", {
+          attributes: {
+            method: "GET",
+            statusCode: 200,
+            originalUrl: `/orders?q=${"x".repeat(17 * 1024 * 1024)}`,
+          },
+        }),
+      );
+      buffer.insertRequestSnapshot(request("later"));
+      buffer.pushLogs(logs(3));
+
+      expect(() => buffer.encodeAndWrite()).not.toThrow();
+
+      const batch = written(buffer);
+      expect(batch.snapshots.map((snapshot) => snapshot.ti)).toEqual([
+        "bystander",
+        "later",
+      ]);
+      expect(batch.logs).toHaveLength(3);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("was sent without 1 of its entries"),
+      );
+    });
+
+    it("is sent without an entry that cannot be serialised", () => {
+      vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      const buffer = createBuffer();
+      buffer.insertRequestSnapshot(request("bystander"));
+      // A tag nothing checked the type of at run time.
+      buffer.insertRequestSnapshot(
+        request("unserialisable", {
+          tags: { total: 1n } as unknown as RequestSnapshot["tags"],
+        }),
+      );
+
+      expect(() => buffer.encodeAndWrite()).not.toThrow();
+      expect(written(buffer).snapshots.map((snapshot) => snapshot.ti)).toEqual([
+        "bystander",
+      ]);
+    });
+  });
+
   describe("custom metrics", () => {
     afterEach(() => {
       vi.restoreAllMocks();
@@ -1115,12 +1198,185 @@ describe("ObserveAgentSharedBuffer", () => {
 
       // Matched against the name as sent, the second change updates the
       // first entry instead of buffering the metric twice.
-      const { custom } = batchOf(buffer) as unknown as {
-        custom: Array<{ n: string; v: Record<string, number> }>;
-      };
+      buffer.encodeAndWrite();
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const { custom } = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: Array<{ n: string; v: Record<string, number> }> };
       expect(custom).toHaveLength(1);
       expect(custom[0].n).toHaveLength(100);
       expect(custom[0].v).toEqual({ default: 2 });
+    });
+
+    it("encodes a counter and a gauge once per batch rather than on every change", () => {
+      const buffer = createBuffer();
+      // At the series cap, encoding a metric reads every one of its series:
+      // a change that re-encoded it cost the request thread the whole of it.
+      const counter = new Counter<"route">("http.hits", "", ["route"]);
+      const gauge = new Gauge("queue.depth");
+      const encode = vi.spyOn(CustomMetricsEncoder, "encode");
+
+      for (let hit = 0; hit < 100; hit++) {
+        counter.increment({ route: `/r/${hit % 10}` });
+        buffer.upsertCustomMetric(counter);
+        gauge.setValue(hit);
+        buffer.upsertCustomMetric(gauge);
+      }
+      expect(encode).not.toHaveBeenCalled();
+      expect(buffer.isBufferEmpty()).toBe(false);
+
+      buffer.encodeAndWrite();
+      expect(encode).toHaveBeenCalledTimes(2);
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toHaveLength(2);
+      expect(batch.custom.find((metric) => metric.n === "queue.depth")).toEqual(
+        expect.objectContaining({ v: { default: 99 } }),
+      );
+    });
+
+    it("writes no more metrics than the collector takes in one batch", () => {
+      const buffer = createBuffer();
+      const counters = Array.from(
+        { length: MAX_BATCH_ITEMS + 1 },
+        (_, index) => new Counter(`imported.${index}`),
+      );
+      for (const counter of counters) {
+        counter.increment();
+        buffer.upsertCustomMetric(counter);
+      }
+
+      buffer.encodeAndWrite();
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toHaveLength(MAX_BATCH_ITEMS);
+      expect(validateTelemetryPayload(batch)).toEqual([]);
+      // The one left out still holds its increase, for a later batch.
+      expect(counters.at(-1)!.getValue()).toBe(1);
+      buffer.resetMainThreadBuffer();
+      new DataView(buffer.sharedBuffer, 4, 4).setUint32(0, 0);
+      counters.at(-1)!.increment();
+      buffer.upsertCustomMetric(counters.at(-1)!);
+      buffer.encodeAndWrite();
+      const next = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(
+            buffer.sharedBuffer,
+            8,
+            new DataView(buffer.sharedBuffer, 4, 4).getUint32(0),
+          ),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(next.custom).toEqual([
+        expect.objectContaining({
+          n: `imported.${MAX_BATCH_ITEMS}`,
+          v: { default: 2 },
+        }),
+      ]);
+    });
+
+    it("writes the batch without a metric that cannot be encoded", () => {
+      const warn = vi
+        .spyOn(Logger.prototype, "warn")
+        .mockImplementation(() => undefined);
+      const buffer = createBuffer();
+      buffer.insertRequestSnapshot({
+        traceId: "bystander",
+        protocol: "http",
+        operationId: "/orders",
+        attributes: { method: "GET", statusCode: 200 },
+        duration: 1,
+        traces: [],
+      });
+      // A label name nothing checked at run time - `labels: [7]` - throws as
+      // the encoder cuts the labels. Encoded at the write, it threw there,
+      // and took every other entry of the window with it.
+      const encode = CustomMetricsEncoder.encode.bind(CustomMetricsEncoder);
+      vi.spyOn(CustomMetricsEncoder, "encode").mockImplementation((metric) => {
+        if (metric.name === "orders.broken") {
+          throw new TypeError("label.slice is not a function");
+        }
+        return encode(metric);
+      });
+      const broken = new Counter("orders.broken");
+      broken.increment();
+      buffer.upsertCustomMetric(broken);
+      const named = new Counter("orders.placed");
+      named.increment();
+      buffer.upsertCustomMetric(named);
+
+      expect(() => buffer.encodeAndWrite()).not.toThrow();
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as {
+        snapshots: Array<{ ti: string }>;
+        custom: EncodedCustomMetric[];
+      };
+      expect(batch.snapshots.map((snapshot) => snapshot.ti)).toEqual([
+        "bystander",
+      ]);
+      expect(batch.custom.map((metric) => metric.n)).toEqual(["orders.placed"]);
+      expect(warn).toHaveBeenCalledOnce();
+    });
+
+    it("encodes nothing of a batch that is dropped unwritten", () => {
+      const buffer = createBuffer();
+      const counter = new Counter("orders.placed");
+      const encode = vi.spyOn(CustomMetricsEncoder, "encode");
+
+      counter.increment();
+      buffer.upsertCustomMetric(counter);
+      // What a flush does when the agent sends nothing.
+      buffer.resetMainThreadBuffer();
+      buffer.encodeAndWrite();
+
+      expect(encode).not.toHaveBeenCalled();
+    });
+
+    it("encodes a summary once per batch rather than on every observation", () => {
+      const buffer = createBuffer();
+      const summary = new Summary("request.duration");
+      const encode = vi.spyOn(CustomMetricsEncoder, "encode");
+
+      for (let value = 1; value <= 100; value++) {
+        summary.observe(value);
+        buffer.upsertCustomMetric(summary);
+      }
+      expect(encode).not.toHaveBeenCalled();
+
+      buffer.encodeAndWrite();
+      expect(encode).toHaveBeenCalledTimes(1);
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toHaveLength(1);
+      expect(batch.custom[0]).toMatchObject({
+        n: "request.duration",
+        q50: { default: 50 },
+        q99: { default: 99 },
+        ct: { default: 100 },
+        mx: { default: 100 },
+      });
     });
   });
 });

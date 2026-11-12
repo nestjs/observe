@@ -46,6 +46,7 @@ const MAX_SPANS_SEARCHED = 200;
 const MAX_OBJECTIVES_PER_HANDLER = 10;
 const MAX_HANDLER_LENGTH = 255;
 const MAX_ROUTE_LENGTH = 255;
+const MAX_METHOD_LENGTH = 10;
 
 /** `@nestjs/common`'s METHOD_METADATA - what `@Get()`, `@Post()` and the rest write. */
 const METHOD_METADATA = "method";
@@ -239,6 +240,19 @@ export class ObjectivesRegistry implements OnModuleInit {
         this.refusedRoutes.add(route);
         this.logger.warn(
           `@Objective on ${handler} not declared for a route longer than ${MAX_ROUTE_LENGTH} characters.`,
+        );
+      }
+      return undefined;
+    }
+    // Only a handler routed for every method is declared under the request's
+    // own, and Node parses one longer than the collector takes: UNSUBSCRIBE.
+    // Nothing is stated, so the next request with an ordinary method declares
+    // the route as usual.
+    if (method !== undefined && method.length > MAX_METHOD_LENGTH) {
+      if (!this.refusedRoutes.has(route)) {
+        this.refusedRoutes.add(route);
+        this.logger.warn(
+          `@Objective on ${handler} not declared for a ${method} request: a method is at most ${MAX_METHOD_LENGTH} characters.`,
         );
       }
       return undefined;

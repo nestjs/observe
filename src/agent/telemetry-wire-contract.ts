@@ -592,7 +592,13 @@ export function createTelemetrySanitizer(
           usable = false;
         } else if (key in value) {
           // Explicit nulls fail the API's type checks even on optional
-          // fields; absent keys do not.
+          // fields; absent keys do not. Reported like every other removal:
+          // a repair that is not is a batch dropped rather than re-sent -
+          // and a non-finite number reaches here as the `null` that
+          // `JSON.stringify` made of it. `undefined` never reached the wire.
+          if (value[key] === null) {
+            problems.push(`${fieldPath}: null, removed`);
+          }
           delete value[key];
         }
         continue;

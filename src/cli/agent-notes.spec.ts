@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -31,6 +37,32 @@ describe("notes for coding agents", () => {
     expect(content.startsWith("# AGENTS.md\n\n")).toBe(true);
     expect(content).toContain(AGENT_NOTES_HEADING);
     expect(content).toContain("`ObserveModule` in `src/app.module.ts`");
+  });
+
+  // A checkout's AGENTS.md can be a link to anywhere the person can write.
+  it("leaves alone an AGENTS.md or CLAUDE.md that leads out of the project", () => {
+    const outside = mkdtempSync(join(tmpdir(), "observe-outside-"));
+    try {
+      writeFileSync(join(outside, "keys"), "ssh-ed25519 AAAA mine\n");
+      symlinkSync(join(outside, "keys"), join(cwd, "AGENTS.md"));
+      symlinkSync(join(outside, "keys"), join(cwd, "CLAUDE.md"));
+      symlinkSync(join(outside, "missing"), join(cwd, "AGENTS.local.md"));
+
+      expect(writeAgentNotes(cwd, "src/app.module.ts")).toEqual([]);
+
+      expect(readFileSync(join(outside, "keys"), "utf8")).toBe(
+        "ssh-ed25519 AAAA mine\n",
+      );
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("names a root module whose path would break out of its quotes generically", () => {
+    writeAgentNotes(cwd, "src/x`\n\n## Injected\n`app.module.ts");
+
+    expect(read("AGENTS.md")).not.toContain("## Injected");
+    expect(read("AGENTS.md")).toContain("`ObserveModule` in the root module");
   });
 
   it("appends to the project's own AGENTS.md and keeps it as it was", () => {

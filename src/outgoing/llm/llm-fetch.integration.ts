@@ -169,6 +169,21 @@ interface CallContext {
   requestModel: string | undefined;
 }
 
+/**
+ * Cancels a provider's stream once the stream handed to the caller in its
+ * place can no longer be read. undici does this for an unread response it
+ * created, but not for one whose body is locked, as the provider's is once
+ * it is read through here: a reply the application drops would otherwise
+ * hold its socket, its buffered body and its span for good.
+ */
+const abandonedBodies = new FinalizationRegistry<() => void>((release) => {
+  try {
+    release();
+  } catch {
+    /* thrown from here it would be an uncaught exception in the host */
+  }
+});
+
 async function observeCall(
   original: typeof fetch,
   input: Parameters<typeof fetch>[0],
@@ -223,6 +238,8 @@ async function observeCall(
       return;
     }
     tagged = true;
+    // Read to its end, failed or cancelled: nothing is left to release.
+    abandonedBodies.unregister(holder);
     let usage: LlmUsage = {};
     try {
       usage = reader.finish();
@@ -242,6 +259,21 @@ async function observeCall(
   const source = response.body.getReader();
   const body = new ReadableStream<Uint8Array>(
     {
+      start(controller) {
+        // Failed between two reads - the call's signal aborted, the
+        // connection reset: the caller hears of it now, as from plain
+        // `fetch`, not at a read that may never come. A stream piped on
+        // (`Readable.fromWeb`) stops reading while its buffer is full and
+        // waits on `closed` to hang up. A normal end or a cancel fulfils
+        // `closed`, and `error` does nothing to a stream already done.
+        // Held weakly: `source` is reachable from `abandonedBodies`, and so
+        // is what waits on it - a strong hold here would keep `body` alive.
+        const handle = new WeakRef(controller);
+        source.closed.catch((error: unknown) => {
+          finish();
+          handle.deref()?.error(error);
+        });
+      },
       async pull(controller) {
         let chunk: Awaited<ReturnType<typeof source.read>>;
         try {
@@ -270,7 +302,38 @@ async function observeCall(
     },
     { highWaterMark: 0 },
   );
-  return rewrap(response, body);
+  let wrapped: Response;
+  try {
+    wrapped = rewrap(response, body);
+  } catch {
+    // The `Response` constructor refuses what `fetch` takes off the wire: a
+    // status past 599, a reason phrase with a control character or past
+    // Latin-1. The caller gets the reply as it came, tagged without its
+    // usage. Nothing has been read from it - `pull` runs on demand - so its
+    // body is whole once the lock is given back. Tagged first: giving the
+    // lock back rejects `closed`, which `start` above would act on.
+    tagged = true;
+    source.releaseLock();
+    tag({}, stream);
+    return response;
+  }
+  // Watching `body`, not the response: a caller that keeps only the body,
+  // or a clone, can still read it. Nothing registered may reach `body`, or
+  // it would never be collected.
+  abandonedBodies.register(
+    body,
+    () => {
+      try {
+        finish();
+      } finally {
+        source
+          .cancel("Response object has been garbage collected")
+          .catch(() => undefined);
+      }
+    },
+    holder,
+  );
+  return wrapped;
 }
 
 /** The same response, reading through `body`. */

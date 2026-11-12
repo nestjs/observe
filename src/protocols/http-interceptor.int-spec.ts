@@ -10,10 +10,10 @@ import {
 } from "@nestjs/common";
 import { APP_INTERCEPTOR, NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
-import { NodeAdapter } from "@nestjs/platform-node";
 import { Observable } from "rxjs";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -62,7 +62,7 @@ type Platform = "express" | "node";
  * consumer), so the handler inherits the interceptor's span as its caller -
  * a span that has already completed by the time the handler starts.
  */
-describe.each<Platform>(["express", "node"])(
+describe.each<Platform>(onPlatforms(["express", "node"]))(
   "ObserveModule: HTTP collection with a global interceptor (%s)",
   (platform) => {
     let app: INestApplication;
@@ -71,7 +71,7 @@ describe.each<Platform>(["express", "node"])(
     beforeAll(async () => {
       app = await NestFactory.create(
         InterceptorTestModule,
-        platform === "node" ? new NodeAdapter() : new ExpressAdapter(),
+        platform === "node" ? await createNodeAdapter() : new ExpressAdapter(),
         { instrument: ObserveInstrument, logger: false },
       );
       collected = collectSnapshots(app);

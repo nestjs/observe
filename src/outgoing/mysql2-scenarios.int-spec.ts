@@ -1,9 +1,17 @@
-import { Controller, Get, Injectable, Module, Query } from "@nestjs/common";
+import {
+  ConflictException,
+  Controller,
+  Get,
+  Injectable,
+  Module,
+  Query,
+} from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { NestExpressApplication } from "@nestjs/platform-express";
 import mysql from "mysql2";
 import mysqlPromise from "mysql2/promise";
 import { connect } from "net";
+import { catchError, defer, Observable } from "rxjs";
 import request from "supertest";
 import { CompleteTraceEventNode } from "../interfaces/trace-events.interfaces.js";
 import { createObserveModule } from "../observe.module.js";
@@ -41,6 +49,13 @@ let promiseConnection: mysqlPromise.Connection;
 
 @Injectable()
 class WarehouseService {
+  /** A cold query: it runs when Nest subscribes, after this has returned. */
+  coldLookup(): Observable<unknown> {
+    return defer(() =>
+      promisePool.query("SELECT sku FROM missing_table_observe"),
+    );
+  }
+
   callbackPoolQuery() {
     return new Promise((resolve, reject) =>
       callbackPool.query("SELECT ? AS sku", ["a-1"], (error, rows) =>
@@ -132,6 +147,15 @@ class WarehouseService {
 class WarehouseController {
   constructor(private readonly warehouse: WarehouseService) {}
 
+  @Get("cold")
+  cold() {
+    return this.warehouse.coldLookup().pipe(
+      catchError(() => {
+        throw new ConflictException("already taken");
+      }),
+    );
+  }
+
   @Get("run")
   async run(@Query("scenario") scenario: string) {
     const method = (this.warehouse as unknown as Record<string, unknown>)[
@@ -219,6 +243,25 @@ describe.skipIf(!mysqlReachable)("ObserveModule: mysql2 scenarios", () => {
       spans: spansOf(service.children, "mysql2"),
     };
   };
+
+  it("does not make a query error the application answered the request's own", async () => {
+    await request(app.getHttpServer()).get("/cold").expect(409);
+    const snapshot = await waitForSnapshot(
+      collected,
+      (item) => item.operationId === "/cold",
+    );
+    const [query] = spansOf(
+      snapshot.traces as CompleteTraceEventNode[],
+      "mysql2",
+    );
+
+    expect(snapshot.attributes?.statusCode).toBe(409);
+    expect(JSON.stringify(snapshot.error ?? null)).not.toContain(
+      "missing_table_observe",
+    );
+    // The query's own span still records what failed.
+    expect(JSON.stringify(query.error)).toContain("missing_table_observe");
+  });
 
   it("records a callback-pool query once, and still calls back with the rows", async () => {
     const { body, spans } = await run("callbackPoolQuery");

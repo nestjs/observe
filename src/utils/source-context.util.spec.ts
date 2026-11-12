@@ -1,6 +1,9 @@
+import { UnauthorizedException } from "@nestjs/common";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, join, relative } from "path";
+import { pathToFileURL } from "url";
+import { LogRedactor } from "./log-redactor.js";
 import { collectCodeFrames } from "./source-context.util.js";
 import { resetSourceMapCache } from "./source-map-resolver.util.js";
 
@@ -100,6 +103,33 @@ describe("collectCodeFrames with source maps", () => {
     expect(frames).toHaveLength(1);
     expect(frames![0].lines[0]).toBe("const embedded = true;");
   });
+
+  it("parses a map once, however its compiled file is spelt", () => {
+    // A frame's path comes off a stack, which a driver can copy from a
+    // server's reply: `/app/dist/./main.js`, `/app/dist/././main.js`, ... are
+    // one file, and each spelling held a parsed copy of its map.
+    const compiled = compile("spelt", "./main.ts", ["const first = 1;\n"]);
+    // Built by hand: `join` would fold the dots away.
+    const spelt = (dots: number) =>
+      `${join(inside, "spelt")}${"/.".repeat(dots)}/main.js`;
+
+    const first = collectCodeFrames(stackAt(spelt(1)), { sourceMaps: true });
+    // Rewritten on disk: a spelling that parses the map again reads this.
+    writeFileSync(
+      `${compiled}.map`,
+      JSON.stringify({
+        version: 3,
+        sources: ["./main.ts"],
+        names: [],
+        mappings: "AAAA",
+        sourcesContent: ["const second = 2;\n"],
+      }),
+    );
+    const second = collectCodeFrames(stackAt(spelt(2)), { sourceMaps: true });
+
+    expect(first?.[0].lines[0]).toBe("const first = 1;");
+    expect(second?.[0].lines[0]).toBe("const first = 1;");
+  });
 });
 
 /**
@@ -161,10 +191,68 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     expect(collect(error)).toBeUndefined();
   });
 
+  it("reads the frames of an error whose name contains its message", () => {
+    // `UnauthorizedException: Unauthorized` - the message's first match on
+    // the stack is inside the name, not where the frames start.
+    expect(files(collect(new UnauthorizedException()))).toContain(
+      "source-context.util.spec.ts",
+    );
+  });
+
   it("reads the frames of an error with no message", () => {
     expect(collect(new Error())?.[0].file).toContain(
       "source-context.util.spec",
     );
+  });
+
+  it("reads the frames of an ES module, which name their file by URL", () => {
+    const module = join(inside, "module.mjs");
+    writeFileSync(module, 'throw new Error("boom");\n');
+
+    const frames = collectCodeFrames(
+      `Error: boom\n    at run (${pathToFileURL(module).href}:1:7)`,
+      { message: "boom" },
+    );
+
+    expect(frames).toEqual([
+      {
+        file: module,
+        line: 1,
+        firstLine: 1,
+        lines: ['throw new Error("boom");', ""],
+      },
+    ]);
+  });
+
+  it("redacts the whole file before cutting a frame out of it", () => {
+    // The frame starts inside the key: its BEGIN line is above the window and
+    // its END line below, so a frame redacted on its own shows neither.
+    const keyed = join(inside, "keyed.js");
+    writeFileSync(
+      keyed,
+      [
+        "const key = `-----BEGIN PRIVATE KEY-----",
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7",
+        "VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDu",
+        "-----END PRIVATE KEY-----`;",
+        'throw new Error("boom");',
+        "",
+      ].join("\n"),
+    );
+
+    const frames = collectCodeFrames(`Error: boom\n    at run (${keyed}:5:7)`, {
+      message: "boom",
+      linesOfContext: 2,
+      redactor: new LogRedactor(),
+    });
+
+    expect(frames?.[0].firstLine).toBe(3);
+    expect(frames?.[0].lines).toEqual([
+      "",
+      "`;",
+      'throw new Error("boom");',
+      "",
+    ]);
   });
 
   it("rejects a pathological line in linear time", () => {
@@ -175,6 +263,59 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     collectCodeFrames(`Error: boom\n${line}`);
 
     expect(performance.now() - startedAt).toBeLessThan(250);
+  });
+
+  it("reads the frames of an error whose message spans lines", () => {
+    expect(files(collect(new Error("first line\nsecond line")))).toContain(
+      "source-context.util.spec.ts",
+    );
+  });
+
+  it("reads nothing when the message starts below the stack's first line", () => {
+    const frames = collectCodeFrames(
+      `Error: something else\nboom\n    at run (${secret}:1:1)`,
+      { message: "boom" },
+    );
+
+    expect(frames).toBeUndefined();
+  });
+
+  it("finds where the frames start in linear time when the first line repeats the message", () => {
+    // A driver error can take its message and its stack from two places - a
+    // `MongoServerError` copies both off the server's reply - so neither has
+    // to be what V8 wrote. Visiting every match on the first line, each with a
+    // scan back to its start, was quadratic: ~4s for this input.
+    const stack = `${"a".repeat(75_000)}\n    at run (${secret}:1:1)`;
+    const startedAt = performance.now();
+
+    const frames = collectCodeFrames(stack, { message: "a" });
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(files(frames)).toEqual(["secrets.js"]);
+  });
+
+  it("reads a file once, however its frame spells it", () => {
+    // Every spelling of one file - dot segments, a directory link inside the
+    // application - held a full copy of it, read and split again.
+    const file = join(inside, "spelt.js");
+    writeFileSync(file, "const first = 1;\n");
+    const linked = join(inside, "linked");
+    symlinkSync(inside, linked);
+    const read = (path: string) =>
+      collectCodeFrames(`Error: boom\n    at run (${path}:1:1)`, {
+        message: "boom",
+      })?.[0];
+
+    const first = read(`${inside}/./spelt.js`);
+    // Rewritten on disk: a spelling that reads the file again sees this.
+    writeFileSync(file, "const second = 2;\n");
+
+    expect(first?.lines[0]).toBe("const first = 1;");
+    expect(read(`${inside}/././spelt.js`)?.lines[0]).toBe("const first = 1;");
+    expect(read(file)?.lines[0]).toBe("const first = 1;");
+    expect(read(join(linked, "spelt.js"))?.lines[0]).toBe("const first = 1;");
+    // Each frame is still reported as it was written.
+    expect(first?.file).toBe(`${inside}/./spelt.js`);
   });
 
   it("does not follow a symlink out of the working directory", () => {

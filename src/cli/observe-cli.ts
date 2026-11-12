@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 import { link } from "./link.js";
+import { openUrl } from "./open-url.js";
 import { loadTypeScript } from "./project-setup.js";
 
 const { version } = createRequire(import.meta.url)("../../package.json") as {
@@ -21,26 +22,6 @@ const USAGE = `Usage: npx @nestjs/observe link [--no-browser] [--cwd <dir>]
 Options:
   --no-browser    Print the link page instead of opening it.
   --cwd <dir>     The project directory (default: the current one).`;
-
-/**
- * Opens the link page in the default browser, best effort: a headless box or
- * a missing opener just means the person opens the printed URL themselves.
- */
-function openUrl(url: string) {
-  const [command, args] =
-    process.platform === "darwin"
-      ? ["open", [url]]
-      : process.platform === "win32"
-        ? ["cmd", ["/c", "start", "", url]]
-        : ["xdg-open", [url]];
-  try {
-    const child = spawn(command, args, { stdio: "ignore", detached: true });
-    child.on("error", () => undefined);
-    child.unref();
-  } catch {
-    // Printed above; nothing else to do.
-  }
-}
 
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;

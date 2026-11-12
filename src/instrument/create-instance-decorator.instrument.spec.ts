@@ -1,7 +1,10 @@
+import * as common from "@nestjs/common";
+import { ParseFilePipe, ParseIntPipe, ValidationPipe } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
-import { MongoClient } from "mongodb";
+import { Cluster, Redis } from "ioredis";
+import { Db, MongoClient } from "mongodb";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
 
@@ -201,6 +204,103 @@ describe("createInstanceDecorator", () => {
       expect(rootStep.stackAtRecord).toContain("UserService.fail");
     });
 
+    it("relabels frames in linear time when the message is mostly newlines", () => {
+      // `\s*` after the newline that opens a frame also matched newlines, so
+      // every newline of a message rescanned the run after it - quadratic,
+      // per traced frame, on text a client chose. ~1.3 s for this input.
+      class InnerService {
+        fail(input: string) {
+          throw new Error(`invalid: ${input}`);
+        }
+      }
+      class OuterService {
+        constructor(private readonly inner: InnerService) {}
+        fail(input: string) {
+          this.inner.fail(input);
+        }
+      }
+      const outer = decorate(
+        new OuterService(decorate(new InnerService()) as InnerService),
+      ) as OuterService;
+      const input = "\n".repeat(20_000);
+      const startedAt = performance.now();
+
+      expect(() => withTrace(() => outer.fail(input))).toThrow("invalid");
+
+      expect(performance.now() - startedAt).toBeLessThan(100);
+    });
+
+    it("does not write out the stack of an error with a long message", () => {
+      // V8 writes a stack out when it is first read, with the message the
+      // error has by then - so a stack that opens with a changed message was
+      // not read before the change. Read, each error held in a loop keeps a
+      // copy of the text its message quotes.
+      class LookupService {
+        find(name: string) {
+          throw new Error(`No user named "${name}"`);
+        }
+      }
+      const service = createInstanceDecorator(
+        als,
+        {
+          internalStartTraceStep: () => "step-1",
+          internalEndTraceStep: () => undefined,
+        } as unknown as OperationTraceRegistry,
+        { traceIdKey: TRACE_ID_KEY, skipInstrumentation: () => false },
+      )(new LookupService()) as LookupService;
+      const lookUp = (name: string) =>
+        withTrace(() => {
+          try {
+            service.find(name);
+          } catch (err) {
+            return err as Error;
+          }
+          throw new Error("find() did not throw");
+        });
+
+      const long = lookUp("a".repeat(2_000));
+      long.message = "changed";
+      expect(long.stack).toMatch(/^Error: changed\n/);
+
+      const short = lookUp("a");
+      short.message = "changed";
+      expect(short.stack).toMatch(/^Error: No user named "a"\n/);
+      expect(short.stack).not.toContain("Proxy.find");
+    });
+
+    it("throws the method's own error when its stack cannot be read", () => {
+      const thrown = new Error("upstream refused");
+      Object.defineProperty(thrown, "stack", {
+        get() {
+          throw new TypeError("stack getter failed");
+        },
+      });
+      class UpstreamService {
+        call() {
+          throw thrown;
+        }
+      }
+      const service = createInstanceDecorator(
+        als,
+        {
+          internalStartTraceStep: () => "step-1",
+          internalEndTraceStep: () => undefined,
+        } as unknown as OperationTraceRegistry,
+        { traceIdKey: TRACE_ID_KEY, skipInstrumentation: () => false },
+      )(new UpstreamService()) as UpstreamService;
+
+      let caught: unknown;
+      withTrace(() => {
+        try {
+          service.call();
+        } catch (err) {
+          caught = err;
+        }
+      });
+
+      expect(caught).toBe(thrown);
+    });
+
     it("keeps the original method name on the returned wrapper", () => {
       const service = decorate(new UserService()) as UserService;
 
@@ -270,6 +370,16 @@ describe("createInstanceDecorator", () => {
         withMember<P extends Promise<string>>(promise: P): P {
           return promise;
         }
+
+        async awaited(promise: Promise<string>): Promise<string> {
+          return promise;
+        }
+
+        /** Handles its own failure, so a caller may fire and forget. */
+        selfHandled(promise: Promise<string>): Promise<string> {
+          promise.catch(() => undefined);
+          return promise;
+        }
       }
 
       /** A promise in the style of a `got` request or a cancelable one. */
@@ -297,28 +407,68 @@ describe("createInstanceDecorator", () => {
         return reasons;
       };
 
-      it("chains a plain promise, as the caller's own `.then` would", async () => {
-        const original = Promise.resolve("p");
+      it("chains the promise of an async method, as the caller's own `.then` would", async () => {
         const service = decorate(new PromiseService()) as PromiseService;
 
-        const returned = withTrace(() => service.withMember(original));
+        const returned = withTrace(() => service.awaited(Promise.resolve("p")));
 
-        expect(returned).not.toBe(original);
         await expect(returned).resolves.toBe("p");
-        expect(endedSteps).toEqual([{ spanId: "PromiseService#withMember" }]);
+        expect(endedSteps).toEqual([{ spanId: "PromiseService#awaited" }]);
       });
 
-      it("lets a dropped rejection of a plain promise raise unhandledRejection", async () => {
+      it("lets a dropped rejection of an async method raise unhandledRejection", async () => {
         const failure = new Error("dropped");
         const service = decorate(new PromiseService()) as PromiseService;
 
         const unhandled = await captureUnhandledRejections(async () => {
-          void withTrace(() => service.withMember(Promise.reject(failure)));
+          void withTrace(() => service.awaited(Promise.reject(failure)));
           await settle();
         });
 
         expect(unhandled).toEqual([failure]);
         expect(endedSteps[0].error).toBe(failure);
+      });
+
+      it("returns the very promise a method that is not async returned", async () => {
+        const original = Promise.resolve("p");
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const returned = withTrace(() => service.withMember(original));
+
+        expect(returned).toBe(original);
+        await expect(returned).resolves.toBe("p");
+        await settle();
+        expect(endedSteps).toEqual([{ spanId: "PromiseService#withMember" }]);
+      });
+
+      it("raises no unhandledRejection when the method handled the rejection itself", async () => {
+        const failure = new Error("handled by the method");
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const unhandled = await captureUnhandledRejections(async () => {
+          void withTrace(() => service.selfHandled(Promise.reject(failure)));
+          await settle();
+        });
+
+        expect(unhandled).toEqual([]);
+        expect(endedSteps[0].error).toBe(failure);
+      });
+
+      it("raises no unhandledRejection when another caller handles a shared promise", async () => {
+        const failure = new Error("handled by another caller");
+        const inFlight = Promise.reject<string>(failure);
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const unhandled = await captureUnhandledRejections(async () => {
+          const handled = withTrace(() => service.withMember(inFlight)).catch(
+            (err: unknown) => err,
+          );
+          void withTrace(() => service.withMember(inFlight));
+          await expect(handled).resolves.toBe(failure);
+          await settle();
+        });
+
+        expect(unhandled).toEqual([]);
       });
 
       it("returns the very promise the method returned, members included", async () => {
@@ -351,15 +501,24 @@ describe("createInstanceDecorator", () => {
         expect(endedSteps[0].error).toBe(failure);
       });
 
-      describe.each([
-        ["a plain promise", <T>(promise: Promise<T>) => promise],
-        ["a promise with members", withMembers],
-      ])("for %s", (_label, shape) => {
+      describe.each<
+        [string, (service: PromiseService, promise: Promise<string>) => unknown]
+      >([
+        ["a plain promise", (service, promise) => service.withMember(promise)],
+        [
+          "a promise with members",
+          (service, promise) => service.withMember(withMembers(promise)),
+        ],
+        [
+          "the promise of an async method",
+          (service, promise) => service.awaited(promise),
+        ],
+      ])("for %s", (_label, callWith) => {
         it("hands the caller the original rejection and records it on the span", async () => {
           const failure = new Error("rejected");
           const service = decorate(new PromiseService()) as PromiseService;
           const returned = withTrace(() =>
-            service.withMember(shape(Promise.reject(failure))),
+            callWith(service, Promise.reject(failure)),
           );
 
           await expect(returned).rejects.toBe(failure);
@@ -376,7 +535,7 @@ describe("createInstanceDecorator", () => {
           });
           const service = decorate(new PromiseService()) as PromiseService;
 
-          void withTrace(() => service.withMember(shape(pending)));
+          void withTrace(() => callWith(service, pending));
           await settle();
           expect(endedSteps).toEqual([]);
 
@@ -390,7 +549,7 @@ describe("createInstanceDecorator", () => {
           const service = decorate(new PromiseService()) as PromiseService;
 
           const returned = withTrace(() =>
-            service.withMember(shape(Promise.resolve("p"))),
+            callWith(service, Promise.resolve("p")),
           );
 
           await expect(returned).resolves.toBe("p");
@@ -403,7 +562,7 @@ describe("createInstanceDecorator", () => {
           const service = decorate(new PromiseService()) as PromiseService;
 
           const returned = withTrace(() =>
-            service.withMember(shape(Promise.reject(failure))),
+            callWith(service, Promise.reject(failure)),
           );
 
           await expect(returned).rejects.toBe(failure);
@@ -527,6 +686,21 @@ describe("createInstanceDecorator", () => {
       await client.close();
     });
 
+    it("never instruments a provider class that extends MongoClient or Db", async () => {
+      // `class MongoService extends MongoClient`: proxied, a `Db` made at
+      // bootstrap held the raw client and a session started in a traced
+      // request the proxy, and the driver refused every explicit session.
+      class MongoService extends MongoClient {}
+      const client = new MongoService("mongodb://127.0.0.1:1");
+      class AppDb extends Db {}
+      const db = new AppDb(client, "app");
+
+      expect(decorate(client)).toBe(client);
+      expect(decorate(db)).toBe(db);
+
+      await client.close();
+    });
+
     it("still instruments a provider that is only called MongoClient or Db", () => {
       class MongoClient2 {
         connect() {
@@ -565,6 +739,123 @@ describe("createInstanceDecorator", () => {
       );
 
       expect(skipping(instance)).toBe(instance);
+    });
+  });
+
+  describe("when another object calls a provider's method", () => {
+    /**
+     * ioredis's `Pipeline` borrows a client's custom commands
+     * (`this[name] = redis[name]`), and each queues on the `this` it is
+     * called with. Run against the client regardless, a command written into
+     * `multi()` was sent at once, outside the transaction.
+     */
+    class Client {
+      readonly log: number[] = [];
+      reserve(quantity: number) {
+        this.log.push(quantity);
+        return this;
+      }
+      multi() {
+        return new Pipeline(this);
+      }
+    }
+    class Pipeline {
+      readonly log: number[] = [];
+      reserve: Client["reserve"];
+      constructor(client: Client) {
+        // oxlint-disable-next-line typescript/unbound-method -- borrowed, as ioredis's Pipeline borrows
+        this.reserve = client.reserve;
+      }
+    }
+
+    it.each([
+      ["inside a trace", withTrace],
+      ["outside a trace", <T>(fn: () => T) => fn()],
+    ])(
+      "runs a borrowed method against the object it is called on, %s",
+      (_, run) => {
+        const instance = new Client();
+        const client = decorate(instance) as Client;
+
+        const pipeline = run(() => {
+          const transaction = client.multi();
+          transaction.reserve(50);
+          return transaction;
+        });
+
+        expect(pipeline.log).toEqual([50]);
+        expect(instance.log).toEqual([]);
+      },
+    );
+
+    it("still traces the provider's own call of a method it lent", () => {
+      const client = decorate(new Client()) as Client;
+
+      withTrace(() => client.multi().reserve(1));
+      startedSteps = [];
+      withTrace(() => client.reserve(2));
+
+      expect(startedSteps).toEqual([
+        { className: "Client", methodName: "reserve" },
+      ]);
+    });
+
+    /**
+     * A traced call runs with the proxy as `this`, so what a method derives
+     * from `this` - `Object.create(this)`, as pino's `logger.child()` does -
+     * inherits from the proxy. The first such object to read a method became
+     * the `this` of every later call of it, from any request.
+     */
+    class Repo {
+      tenant = "none";
+      forTenant(tenant: string): Repo {
+        const scoped = Object.create(this) as Repo;
+        scoped.tenant = tenant;
+        return scoped;
+      }
+      list() {
+        return `invoices of ${this.tenant}`;
+      }
+      get label() {
+        return `repo of ${this.tenant}`;
+      }
+    }
+
+    it("runs an inherited method against the object that inherited it", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      expect(withTrace(() => repo.forTenant("acme").list())).toBe(
+        "invoices of acme",
+      );
+      expect(withTrace(() => repo.forTenant("globex").list())).toBe(
+        "invoices of globex",
+      );
+    });
+
+    it("runs it so outside a trace as well", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      const scoped = withTrace(() => repo.forTenant("acme"));
+
+      expect(scoped.list()).toBe("invoices of acme");
+    });
+
+    it("still traces the provider's own call once a derived object read the method", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      withTrace(() => repo.forTenant("acme").list());
+      startedSteps = [];
+      withTrace(() => repo.list());
+
+      expect(startedSteps).toEqual([{ className: "Repo", methodName: "list" }]);
+    });
+
+    it("reads an inherited getter against the object that inherited it", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      expect(withTrace(() => repo.forTenant("acme").label)).toBe(
+        "repo of acme",
+      );
     });
   });
 
@@ -776,6 +1067,332 @@ describe("createInstanceDecorator", () => {
     });
   });
 
+  describe("when opening a step throws", () => {
+    class EscapeService {
+      escape(text: string) {
+        return text.replace(/</g, "&lt;");
+      }
+    }
+
+    it("still traces the method's later calls", () => {
+      // A request nested a few levels past the deepest body an application
+      // accepts runs out of stack between setting the re-entrancy flag and
+      // entering the span: the flag stayed set, and the method was never
+      // traced again until the process restarted.
+      let overflow = true;
+      const started: string[] = [];
+      const registry = {
+        internalStartTraceStep: (_: string, __: string, methodName: string) => {
+          if (overflow) {
+            overflow = false;
+            throw new RangeError("Maximum call stack size exceeded");
+          }
+          started.push(methodName);
+          return `step-${started.length}`;
+        },
+        internalEndTraceStep: () => undefined,
+      } as unknown as OperationTraceRegistry;
+      const service = createInstanceDecorator(als, registry, {
+        traceIdKey: TRACE_ID_KEY,
+        skipInstrumentation: () => false,
+      })(new EscapeService()) as EscapeService;
+
+      expect(() => withTrace(() => service.escape("<a>"))).toThrow(RangeError);
+      expect(withTrace(() => service.escape("<b>"))).toBe("&lt;b>");
+
+      expect(started).toEqual(["escape"]);
+    });
+  });
+
+  describe("when decorating a pipe", () => {
+    class CreateOrderDto {}
+
+    /** The packages `ValidationPipe` would otherwise load, which it can be handed. */
+    const validationPipe = (validate: () => unknown[] = () => []) =>
+      new ValidationPipe({
+        transform: true,
+        validatorPackage: { validate } as never,
+        transformerPackage: {
+          plainToInstance: (_type: unknown, value: unknown) => value,
+          classToPlain: (value: unknown) => value,
+        } as never,
+      });
+
+    const steps = () =>
+      startedSteps.map((step) => `${step.className}.${step.methodName}`);
+
+    it("makes no span for a ValidationPipe run that validates nothing", async () => {
+      const pipe = decorate(validationPipe()) as ValidationPipe;
+
+      await expect(
+        withTrace(() =>
+          pipe.transform("7", { type: "param", metatype: Number, data: "id" }),
+        ),
+      ).resolves.toBe(7);
+      expect(steps()).toEqual([]);
+    });
+
+    it("traces only `validate` when a ValidationPipe validates", async () => {
+      const pipe = decorate(validationPipe()) as ValidationPipe;
+
+      await withTrace(() =>
+        pipe.transform(
+          { total: 1 },
+          { type: "body", metatype: CreateOrderDto },
+        ),
+      );
+      expect(steps()).toEqual(["ValidationPipe.validate"]);
+    });
+
+    it("still refuses what fails validation", async () => {
+      const pipe = decorate(
+        validationPipe(() => [
+          { property: "total", constraints: { isInt: "total must be an int" } },
+        ]),
+      ) as ValidationPipe;
+
+      await expect(
+        withTrace(() =>
+          pipe.transform({}, { type: "body", metatype: CreateOrderDto }),
+        ),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(steps()).toEqual(["ValidationPipe.validate"]);
+    });
+
+    it("traces only `validate` on ParseFilePipe", async () => {
+      const pipe = decorate(
+        new ParseFilePipe({
+          validators: [{ isValid: () => true } as never],
+        }),
+      ) as ParseFilePipe;
+
+      await withTrace(() => pipe.transform({ size: 1 }));
+      expect(steps()).toEqual(["ParseFilePipe.validate"]);
+    });
+
+    // Not in every supported @nestjs/common.
+    const { StandardSchemaValidationPipe } = common as unknown as {
+      StandardSchemaValidationPipe?: new () => {
+        transform(value: unknown, metadata: unknown): Promise<unknown>;
+      };
+    };
+    (StandardSchemaValidationPipe ? it : it.skip)(
+      "traces only `validate` on StandardSchemaValidationPipe",
+      async () => {
+        const pipe = decorate(new StandardSchemaValidationPipe!()) as {
+          transform(value: unknown, metadata: unknown): Promise<unknown>;
+        };
+        const schema = {
+          "~standard": { validate: (value: unknown) => ({ value }) },
+        };
+
+        await expect(
+          withTrace(() => pipe.transform("a", { type: "body", schema })),
+        ).resolves.toBe("a");
+        expect(steps()).toEqual(["StandardSchemaValidationPipe.validate"]);
+      },
+    );
+
+    it("traces what a subclass adds, and not what it inherits", async () => {
+      class AppValidationPipe extends ValidationPipe {
+        override async transform(value: unknown, metadata: never) {
+          return super.transform(this.normalize(value), metadata);
+        }
+
+        normalize(value: unknown) {
+          return value;
+        }
+      }
+      const pipe = decorate(
+        new AppValidationPipe({
+          validatorPackage: { validate: () => [] } as never,
+          transformerPackage: {
+            plainToInstance: (_type: unknown, value: unknown) => value,
+            classToPlain: (value: unknown) => value,
+          } as never,
+        }),
+      ) as AppValidationPipe;
+
+      await withTrace(() =>
+        pipe.transform({}, { type: "body", metatype: CreateOrderDto } as never),
+      );
+      expect(steps()).toEqual([
+        "AppValidationPipe.transform",
+        "AppValidationPipe.normalize",
+        "AppValidationPipe.validate",
+      ]);
+    });
+
+    it("traces everything on a pipe an application wrote, whatever its name", () => {
+      // The pipe Nest's documentation has readers write, by the same name.
+      class WrittenByHand {
+        transform(value: string) {
+          return this.toValidate(value) ? this.validate(value) : value;
+        }
+
+        toValidate(value: string) {
+          return value.length > 0;
+        }
+
+        validate(value: string) {
+          return value;
+        }
+      }
+      Object.defineProperty(WrittenByHand, "name", { value: "ValidationPipe" });
+      const pipe = decorate(new WrittenByHand()) as WrittenByHand;
+
+      withTrace(() => pipe.transform("a"));
+      expect(steps()).toEqual([
+        "ValidationPipe.transform",
+        "ValidationPipe.toValidate",
+        "ValidationPipe.validate",
+      ]);
+    });
+
+    it("leaves Nest's other pipes as they were", async () => {
+      const pipe = decorate(new ParseIntPipe()) as ParseIntPipe;
+
+      await withTrace(() => pipe.transform("42", { type: "param" }));
+      expect(steps()).toEqual([
+        "ParseIntPipe.transform",
+        "ParseIntPipe.isNumeric",
+      ]);
+    });
+
+    it("leaves guards and interceptors as they were", () => {
+      class SessionGuard {
+        canActivate() {
+          return this.hasSession();
+        }
+
+        hasSession() {
+          return true;
+        }
+      }
+      class EnvelopeInterceptor {
+        intercept() {
+          return this.wrap();
+        }
+
+        wrap() {
+          return {};
+        }
+      }
+      const guard = decorate(new SessionGuard()) as SessionGuard;
+      const interceptor = decorate(
+        new EnvelopeInterceptor(),
+      ) as EnvelopeInterceptor;
+
+      withTrace(() => {
+        guard.canActivate();
+        interceptor.intercept();
+      });
+      expect(steps()).toEqual([
+        "SessionGuard.canActivate",
+        "SessionGuard.hasSession",
+        "EnvelopeInterceptor.intercept",
+        "EnvelopeInterceptor.wrap",
+      ]);
+    });
+  });
+
+  describe("when decorating @nestjs/config's ConfigService", () => {
+    /** The shape of @nestjs/config 4's ConfigService, which the SDK doesn't depend on. */
+    class ConfigService {
+      private readonly cache: Record<string, unknown> = {};
+
+      constructor(private readonly internalConfig: Record<string, unknown>) {}
+
+      get(propertyPath: string, options?: unknown) {
+        this.isGetOptionsObject(options);
+        const value =
+          this.getFromValidatedEnv(propertyPath) ??
+          this.getFromProcessEnv(propertyPath) ??
+          this.getFromInternalConfig(propertyPath);
+        this.setInCacheIfDefined(propertyPath, value);
+        return value;
+      }
+
+      getOrThrow(propertyPath: string) {
+        const value = this.get(propertyPath);
+        if (value === undefined) {
+          throw new Error(`"${propertyPath}" does not exist`);
+        }
+        return value;
+      }
+
+      getFromValidatedEnv(_propertyPath: string): unknown {
+        return undefined;
+      }
+
+      getFromProcessEnv(_propertyPath: string): unknown {
+        return undefined;
+      }
+
+      getFromInternalConfig(propertyPath: string) {
+        return this.internalConfig[propertyPath];
+      }
+
+      setInCacheIfDefined(propertyPath: string, value: unknown) {
+        this.cache[propertyPath] = value;
+      }
+
+      isGetOptionsObject(options: unknown) {
+        return typeof options === "object";
+      }
+    }
+
+    const steps = () =>
+      startedSteps.map((step) => `${step.className}.${step.methodName}`);
+
+    it("traces what an application calls, not its helpers", () => {
+      const config = decorate(
+        new ConfigService({ port: 3000 }),
+      ) as ConfigService;
+
+      withTrace(() => {
+        expect(config.get("port")).toBe(3000);
+        expect(config.getOrThrow("port")).toBe(3000);
+      });
+      expect(steps()).toEqual([
+        "ConfigService.get",
+        "ConfigService.getOrThrow",
+        "ConfigService.get",
+      ]);
+    });
+
+    it("traces what a subclass adds", () => {
+      class AppConfig extends ConfigService {
+        databaseUrl() {
+          return this.get("databaseUrl");
+        }
+      }
+      const config = decorate(
+        new AppConfig({ databaseUrl: "postgres://" }),
+      ) as AppConfig;
+
+      withTrace(() => config.databaseUrl());
+      expect(steps()).toEqual(["AppConfig.databaseUrl", "AppConfig.get"]);
+    });
+
+    it("traces everything on an application's own ConfigService", () => {
+      class OwnConfig {
+        get(key: string) {
+          return this.read(key);
+        }
+
+        read(key: string) {
+          return key;
+        }
+      }
+      Object.defineProperty(OwnConfig, "name", { value: "ConfigService" });
+      const config = decorate(new OwnConfig()) as OwnConfig;
+
+      withTrace(() => config.get("port"));
+      expect(steps()).toEqual(["ConfigService.get", "ConfigService.read"]);
+    });
+  });
+
   describe("when decorating a class with native private members", () => {
     class SecretService {
       #prefix = "secret";
@@ -900,6 +1517,62 @@ describe("createInstanceDecorator", () => {
       // point is traced, nested self-calls are the documented trade-off.
       expect(startedSteps).toEqual([
         { className: "TenantCache", methodName: "lookup" },
+      ]);
+    });
+  });
+
+  // ioredis copies EventEmitter's prototype onto its clients', `constructor`
+  // included, so a client's `constructor` is `EventEmitter`.
+  describe("when decorating an ioredis client", () => {
+    it.each([
+      [
+        "Redis",
+        () => new Redis({ lazyConnect: true }),
+        "Redis#getBuiltinCommands",
+      ],
+      [
+        "Cluster",
+        () =>
+          new Cluster([{ host: "127.0.0.1", port: 1 }], { lazyConnect: true }),
+        "Cluster#getBuiltinCommands",
+      ],
+    ] as const)(
+      "labels a %s client's spans after it, not EventEmitter",
+      (className, connect, spanId) => {
+        // Never connected: lazy, and no command is sent.
+        const client = connect();
+        expect(client.constructor).toBe(EventEmitter);
+        try {
+          const decorated = decorate(client) as typeof client;
+
+          withTrace(() => decorated.getBuiltinCommands());
+
+          expect(startedSteps).toEqual([
+            { className, methodName: "getBuiltinCommands" },
+          ]);
+          expect(endedSteps).toEqual([{ spanId }]);
+        } finally {
+          client.disconnect();
+        }
+      },
+    );
+
+    it("keeps the EventEmitter label on anything else whose constructor reads EventEmitter", () => {
+      // Built as ioredis builds a client, but on no `Commander`.
+      class Mixed {
+        sendCommand() {
+          return "sent";
+        }
+      }
+      Object.defineProperty(Mixed.prototype, "constructor", {
+        value: EventEmitter,
+      });
+      const decorated = decorate(new Mixed()) as Mixed;
+
+      withTrace(() => decorated.sendCommand());
+
+      expect(startedSteps).toEqual([
+        { className: "EventEmitter", methodName: "sendCommand" },
       ]);
     });
   });

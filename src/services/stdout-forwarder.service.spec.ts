@@ -122,6 +122,37 @@ describe("StdoutForwarderService", () => {
       expect(buffer.entries).toHaveLength(0);
     });
 
+    it("forwards at most a bounded number of entries from one write", () => {
+      const service = build();
+
+      // One logged value full of line breaks - a client's username, say -
+      // is one write. Every line of it used to become an entry, and the log
+      // buffer's caps are shared by the whole process: one request could
+      // push every other request's lines out of the batch.
+      write(
+        service,
+        Array.from({ length: 3000 }, (_, i) => `line ${i}`).join("\n") + "\n",
+      );
+
+      expect(buffer.entries).toHaveLength(50);
+      expect(buffer.entries[0].text).toBe("line 0");
+      expect(buffer.entries[48].text).toBe("line 48");
+      expect(buffer.entries[49].text).toContain("2951 more lines");
+    });
+
+    it("files the note on lines left out under the trace that wrote them", () => {
+      const service = build();
+
+      als.run(new Map([[TRACE_ID_KEY, "trace-flood"]]), () =>
+        write(service, "x\n".repeat(100)),
+      );
+
+      expect(buffer.entries).toHaveLength(50);
+      expect(
+        buffer.entries.every((entry) => entry.traceId === "trace-flood"),
+      ).toBe(true);
+    });
+
     it("forwards an over-long fragment rather than growing without bound", () => {
       const service = build();
 
@@ -131,7 +162,67 @@ describe("StdoutForwarderService", () => {
       write(service, "x".repeat(9 * 1024));
 
       expect(buffer.entries).toHaveLength(1);
-      expect(buffer.entries[0].text.length).toBeGreaterThan(8 * 1024);
+      // At least what the buffer keeps of an entry. The last 4 KB are only
+      // shown to the redactor - see the next cases.
+      expect(buffer.entries[0].text.length).toBeGreaterThanOrEqual(4 * 1024);
+    });
+
+    describe("a line cut at the cap", () => {
+      it("sends nothing of a secret whose value the cut held back", () => {
+        const service = build();
+
+        // A streamed reply printed piece by piece: the cap falls right after
+        // `password=`. Forwarded as a line of its own, the rest of it began
+        // with the whole password.
+        write(service, "x".repeat(8190) + " password=");
+        write(service, "hunter2secret and more\n");
+
+        expect(JSON.stringify(buffer.entries)).not.toContain("hunter2");
+      });
+
+      it("sends nothing of a secret the cut split", () => {
+        const service = build();
+
+        write(service, `${"a".repeat(8180)} apiKey="c0ffeec0ffee`);
+        write(service, 'c0ffee" done\n');
+
+        expect(buffer.entries.length).toBeGreaterThan(0);
+        expect(JSON.stringify(buffer.entries)).not.toContain("c0ffee");
+      });
+
+      it("drops the rest of that line, then forwards the next as usual", () => {
+        const service = build();
+
+        write(service, "y".repeat(9 * 1024));
+        write(service, "z".repeat(100));
+        write(service, "zz\nnext line\n");
+
+        expect(buffer.entries.map((entry) => entry.text[0])).toEqual([
+          "y",
+          "n",
+        ]);
+        expect(buffer.entries[1].text).toBe("next line");
+      });
+
+      it("forwards nothing for a cut line of only whitespace", () => {
+        const service = build();
+
+        write(service, " ".repeat(9 * 1024));
+
+        expect(buffer.entries).toHaveLength(0);
+      });
+
+      it("keeps a stream's cut line apart from the other stream", () => {
+        const service = build();
+
+        write(service, "y".repeat(9 * 1024), "stdout");
+        write(service, "on stderr\n", "stderr");
+
+        expect(buffer.entries.map((entry) => entry.text.slice(0, 9))).toEqual([
+          "yyyyyyyyy",
+          "on stderr",
+        ]);
+      });
     });
   });
 
@@ -243,6 +334,103 @@ describe("StdoutForwarderService", () => {
       expect(
         (buffer.entries[0] as unknown as { timestamp: number }).timestamp,
       ).toEqual(expect.any(Number));
+    });
+  });
+
+  describe("lines written in pieces by several executions", () => {
+    const inTrace = (traceId: string, run: () => void) =>
+      als.run(new Map([[TRACE_ID_KEY, traceId]]), run);
+
+    it("joins a piece only to the line its own execution started", () => {
+      const service = build();
+
+      // One request prints a reply piece by piece while another logs. Joined
+      // to the other's line, the first pieces went out under its trace, in
+      // front of a line that no longer parsed - and the rest of a secret
+      // still being written went out alone, matching no rule.
+      inTrace("trace-alice", () => write(service, "reply: password=hun"));
+      inTrace("trace-bob", () =>
+        write(
+          service,
+          "[Nest] 1  - 07/29/2026, 10:42:18 AM    WARN [Auth] login failed for bob\n",
+        ),
+      );
+      inTrace("trace-alice", () => write(service, "ter2secret done\n"));
+
+      expect(JSON.stringify(buffer.entries)).not.toContain("ter2secret");
+      expect(buffer.entries).toMatchObject([
+        {
+          traceId: "trace-bob",
+          level: "warn",
+          context: "Auth",
+          text: "login failed for bob",
+        },
+        { traceId: "trace-alice", text: "reply: password=[REDACTED] done" },
+      ]);
+    });
+
+    it("joins the pieces one execution writes from different spans", () => {
+      const service = build();
+
+      // The store is copied for every span, so it is the trace that says
+      // whose line a piece belongs to, not the store object.
+      als.run(new Map([[TRACE_ID_KEY, "trace-1"]]), () =>
+        write(service, "hel"),
+      );
+      als.run(
+        new Map([
+          [TRACE_ID_KEY, "trace-1"],
+          [CALLER_METADATA_KEY, "span-2"],
+        ]),
+        () => write(service, "lo\n"),
+      );
+
+      expect(buffer.entries).toMatchObject([
+        { text: "hello", traceId: "trace-1", spanId: "span-2" },
+      ]);
+    });
+
+    it("drops the rest of a line cut at the cap for its own execution only", () => {
+      const service = build();
+
+      inTrace("trace-alice", () => write(service, "y".repeat(9 * 1024)));
+      inTrace("trace-bob", () => write(service, "from bob\n"));
+      inTrace("trace-alice", () => write(service, "rest of it\nnext\n"));
+
+      expect(
+        buffer.entries.map((entry) => [entry.traceId, entry.text.slice(0, 8)]),
+      ).toEqual([
+        ["trace-alice", "yyyyyyyy"],
+        ["trace-bob", "from bob"],
+        ["trace-alice", "next"],
+      ]);
+    });
+
+    it("forwards the line held longest once too many are held", () => {
+      const service = build();
+
+      // An execution that ends without its newline leaves its line behind.
+      for (let i = 0; i < 65; i++) {
+        inTrace(`trace-${i}`, () => write(service, `piece ${i}`));
+      }
+
+      expect(buffer.entries).toMatchObject([
+        { text: "piece 0", traceId: "trace-0" },
+      ]);
+    });
+
+    it("files a line forwarded on shutdown under the trace that wrote it", () => {
+      const service = build();
+
+      service.start();
+      inTrace("trace-late", () => {
+        process.stdout.write("no newline yet");
+      });
+      service.onModuleDestroy();
+
+      expect(
+        buffer.entries.find((entry) => entry.text === "no newline yet"),
+      ).toMatchObject({ traceId: "trace-late" });
     });
   });
 
@@ -378,6 +566,63 @@ describe("StdoutForwarderService", () => {
       );
 
       expect(buffer.entries[0].context).toBe("token=[REDACTED]");
+      expect(buffer.entries[0].text).toBe("login");
+    });
+
+    describe("a bracket read as the context", () => {
+      const NEST_LOG = "[Nest] 1  - 07/29/2026, 10:42:18 AM     LOG";
+
+      it("does not cut a secret in two at its first ]", () => {
+        const service = build();
+
+        // Logged without a context, a message that opens with `[` reads as
+        // one, closed at the message's first `]` - here inside the password.
+        // Redacted apart, neither half matched a rule.
+        write(
+          service,
+          `${NEST_LOG} [{"email":"alice@example.com","password":"s3cr]etV4lue"}]\n`,
+        );
+
+        const sent = JSON.stringify(buffer.entries);
+        expect(sent).not.toContain("s3cr");
+        expect(sent).not.toContain("etV4lue");
+        // Where the context ends then depends on where the redactor's mask
+        // falls; either way both fields are cut from the line redacted whole.
+        expect(buffer.entries).toHaveLength(1);
+        expect(buffer.entries[0].level).toBe("log");
+        expect(sent).toContain('\\"password\\":[REDACTED]');
+      });
+
+      it("does not send the rest of a credential that runs on past it", () => {
+        const service = build();
+
+        write(
+          service,
+          `${NEST_LOG} [Authorization: Bearer abc]defghijklmnop sent\n`,
+        );
+
+        expect(JSON.stringify(buffer.entries)).not.toContain("defghijk");
+      });
+
+      it("keeps a bracket that is only a guess when nothing in it is masked", () => {
+        const service = build();
+
+        write(service, `${NEST_LOG} [1, 2] done\n`);
+
+        expect(buffer.entries).toMatchObject([
+          { context: "1, 2", text: "done" },
+        ]);
+      });
+
+      it("keeps it apart when redaction is off", () => {
+        const service = build({ redaction: { enabled: false } });
+
+        write(service, `${NEST_LOG} [AppService]   started\n`);
+
+        expect(buffer.entries).toMatchObject([
+          { context: "AppService", text: "started" },
+        ]);
+      });
     });
 
     it("is on by default, because forwarding moves logs onto another machine", () => {
@@ -404,6 +649,190 @@ describe("StdoutForwarderService", () => {
       write(service, "password=hunter2\n");
 
       expect(buffer.entries[0].text).toContain("***");
+    });
+
+    describe("a message written over several lines", () => {
+      const NEST = "[Nest] 1  - 07/29/2026, 10:42:18 AM";
+      const body = [
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj",
+        "MzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu",
+        "NMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s+CLOyS56YyCFGeJZ",
+      ];
+      const pem = [
+        "-----BEGIN PRIVATE KEY-----",
+        ...body,
+        "-----END PRIVATE KEY-----",
+      ].join("\n");
+
+      it("redacts a private key logged in its own layout", () => {
+        const service = build();
+
+        // Redacted a line at a time, the key's lines were never seen
+        // together, and each one shipped - while the trace of the same
+        // request, redacted whole, had it masked.
+        write(service, `${NEST}    WARN [Deploy] Cannot import key: ${pem}\n`);
+
+        const sent = JSON.stringify(buffer.entries);
+        for (const line of body) {
+          expect(sent).not.toContain(line.slice(0, 16));
+        }
+        expect(buffer.entries[0]).toMatchObject({
+          level: "warn",
+          context: "Deploy",
+        });
+        expect(buffer.entries[0].text).toMatch(/^Cannot import key: /);
+      });
+
+      it("redacts a quoted value cut by a line break whole", () => {
+        const service = build();
+
+        write(
+          service,
+          'Error: secret="aGVsbG8gd29ybGQgaGVsbG8g\nd29ybGQ=" is not base64url\n    at main (/app/main.js:1:1)\n',
+        );
+
+        // The lines go to the redactor as the one text they were written as,
+        // and a quoted value runs on to its closing quote on the next line.
+        const sent = JSON.stringify(buffer.entries);
+        expect(sent).not.toContain("aGVsbG8");
+        expect(sent).not.toContain("d29ybGQ");
+        expect(buffer.entries[0].text).toBe(
+          "Error: secret=[REDACTED] is not base64url",
+        );
+      });
+
+      it("keeps a line that has a prefix of its own apart", () => {
+        const service = build();
+
+        write(
+          service,
+          `${NEST}     LOG [First] password:\n${NEST}     LOG [Second] ready\n`,
+        );
+
+        expect(buffer.entries).toMatchObject([
+          { context: "First", text: "password:" },
+          { context: "Second", text: "ready", level: "log" },
+        ]);
+      });
+
+      it("keeps a JSON record one entry, and apart from the lines under it", () => {
+        const service = build();
+
+        write(
+          service,
+          `${JSON.stringify({ level: "info", message: "a\nb" })}\nplain under it\n`,
+        );
+
+        expect(buffer.entries.map((entry) => entry.text)).toEqual([
+          "a\nb",
+          "plain under it",
+        ]);
+      });
+
+      it("redacts a value the per-write cap cut, with the lines past it", () => {
+        const service = build();
+
+        const filler = Array.from({ length: 48 }, (_, i) => `step ${i}`);
+        write(
+          service,
+          [
+            ...filler,
+            'secret="aGVsbG8gd29ybGQgaGVsbG8g',
+            'd29ybGQ="',
+            ...filler,
+          ].join("\n") + "\n",
+        );
+
+        expect(buffer.entries).toHaveLength(50);
+        expect(JSON.stringify(buffer.entries)).not.toContain("aGVsbG8");
+        expect(buffer.entries[48].text).toBe("secret=[REDACTED]");
+      });
+    });
+
+    describe("an over-long line", () => {
+      const password = "Pw-0123456789abcdef0123456789abcdef";
+
+      it("is still read as the structured line it is", () => {
+        const service = build();
+
+        // Cut before it was parsed, a long JSON line was no longer JSON: it
+        // went out as raw text, where nothing masks by key, and
+        // `passwordConfirmation` with it.
+        als.run(new Map([[TRACE_ID_KEY, "trace-signup"]]), () =>
+          write(
+            service,
+            `${JSON.stringify({
+              level: "warn",
+              message: "signup rejected",
+              context: "SignupController",
+              form: {
+                password,
+                passwordConfirmation: password,
+                bio: "x".repeat(17_000),
+              },
+            })}\n`,
+          ),
+        );
+
+        expect(buffer.entries).toHaveLength(1);
+        expect(JSON.stringify(buffer.entries[0])).not.toContain("Pw-0123");
+        expect(buffer.entries[0]).toMatchObject({
+          text: "signup rejected",
+          level: "warn",
+          context: "SignupController",
+          traceId: "trace-signup",
+        });
+        // Sent without them: every string in them would need the window too.
+        expect(buffer.entries[0].attributes).toBeUndefined();
+      });
+
+      it("never sends a secret the redactor's window cut in two", () => {
+        const service = build();
+
+        // `token=AAAA…` shrinks to `token=[REDACTED]`, which pulls whatever
+        // sat at the window's edge into what ships - here the first 17
+        // characters of a quoted key whose closing quote lay past the edge.
+        const key = "c0ffee".repeat(10);
+        const padding = 16 * 1024 - "token=".length - ' apiKey="'.length - 17;
+        write(service, `token=${"A".repeat(padding)} apiKey="${key}" done\n`);
+
+        expect(buffer.entries).toHaveLength(1);
+        expect(buffer.entries[0].text).toMatch(/^token=\[REDACTED\]/);
+        expect(buffer.entries[0].text).not.toContain("c0ffee");
+      });
+
+      it("keeps a secret that lies whole inside the window masked", () => {
+        const service = build();
+
+        write(service, `password=hunter2secret ${"word ".repeat(5_000)}\n`);
+
+        expect(buffer.entries[0].text).toMatch(/^password=\[REDACTED\] word/);
+        expect(buffer.entries[0].text).not.toContain("hunter2");
+      });
+
+      it("bounds the context as it bounds the message", () => {
+        const service = build();
+
+        write(
+          service,
+          `${JSON.stringify({
+            level: "info",
+            message: "ready",
+            context: `token=${"B".repeat(20_000)}`,
+          })}\n`,
+        );
+
+        expect(buffer.entries[0].context).toBe("token=[REDACTED]");
+      });
+
+      it("is cut, unredacted, when redaction is off", () => {
+        const service = build({ redaction: { enabled: false } });
+
+        write(service, `password=hunter2 ${"y".repeat(20_000)}\n`);
+
+        expect(buffer.entries[0].text).toMatch(/^password=hunter2 y/);
+        expect(buffer.entries[0].text.length).toBeLessThanOrEqual(16 * 1024);
+      });
     });
   });
 

@@ -21,8 +21,6 @@ import { NodeRuntimeMetricsService } from "../services/node-runtime-metrics.serv
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   IngestMode,
-  NOT_INGESTED_GRACE_MS,
-  NotIngestedReason,
   OveragePauseReason,
   parseDegradedMessage,
   parseNotIngestedMessage,
@@ -38,22 +36,22 @@ import {
   SIGN_UP_URL,
 } from "./credentials-notice.js";
 import { ObserveAgentSharedBuffer } from "./observe-agent.shared-buffer.js";
+import {
+  OtlpExportGrant,
+  parseOtlpExportMessage,
+} from "../otlp/otlp-export-grant.js";
+import { OtlpTraceExporter } from "../otlp/otlp-trace-exporter.service.js";
+import {
+  collectorEndpointOf,
+  hasScaffoldCredentials,
+  isHostedCollector,
+  lacksHostedCredentials,
+  sendsToObserve,
+} from "./observe-reporting.util.js";
 
 const DEFAULT_RUNTIME_METRICS_INTERVAL = 60000; // 60 seconds
 const MIN_RUNTIME_METRICS_INTERVAL = 30000; // 30 seconds
 const DEFAULT_FLUSH_INTERVAL = 5000; // 5 seconds
-
-/**
- * The hosted collector. Unlike a collector in placeholder mode, it accepts
- * nothing without credentials.
- */
-const HOSTED_COLLECTOR_ENDPOINT = "https://observe-api.nestjs.com";
-
-/**
- * Where signals are posted when `endpoint` is not configured.
- */
-const DEFAULT_COLLECTOR_ENDPOINT =
-  process.env.OBSERVE_ENDPOINT ?? HOSTED_COLLECTOR_ENDPOINT;
 const MIN_FLUSH_INTERVAL = 1000; // 1 second
 
 /**
@@ -87,16 +85,6 @@ const FINAL_FLUSH_POLL_MS = 10;
  * a pegged CPU and a saturated loop, and mean nothing.
  */
 const MIN_FINAL_RUNTIME_WINDOW_MS = 10_000;
-
-/**
- * The credentials `nest new --observe` writes into `AppModule`.
- *
- * A project fresh from the generator has these until someone signs up, so
- * they mean "not connected yet", not "wrong": sending them only buys a 401
- * and an `Error:` line on the very first `npm run start`.
- */
-const SCAFFOLD_APP_KEY = "YOUR_APP_KEY";
-const SCAFFOLD_APP_SECRET = "YOUR_APP_SECRET";
 
 const DASHBOARD_URL = `${SIGN_UP_URL}/dashboard`;
 
@@ -139,6 +127,9 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     // the module always provides it.
     @Optional()
     private readonly operationTraceRegistry?: OperationTraceRegistry,
+    // Optional for the same reason.
+    @Optional()
+    private readonly otlpTraceExporter?: OtlpTraceExporter,
   ) {}
 
   onModuleInit() {
@@ -163,12 +154,15 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       this.logger.log(
         "Observe is disabled (enabled: false): nothing is recorded or sent.",
       );
-    } else if (this.hasScaffoldCredentials || this.lacksHostedCredentials) {
+    } else if (
+      hasScaffoldCredentials(this.options) ||
+      lacksHostedCredentials(this.options)
+    ) {
       // Nothing is sent, so there is no worker to start. The flush timer below
       // still runs and empties the buffer, which the instrumentation keeps
       // writing into either way.
       const notice = describeMissingCredentials({
-        scaffold: this.hasScaffoldCredentials,
+        scaffold: hasScaffoldCredentials(this.options),
         unset:
           !this.options.appKey && !this.options.appSecret
             ? "both"
@@ -184,6 +178,10 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       }
     } else {
       this.initializeWorker();
+      // Not in `initializeWorker`, which restarts a stopped worker too: that
+      // one has to get a batch in first.
+      this.observeAgentSharedBuffer.recordStarted();
+      this.reportOpenTelemetryInterop("started");
     }
 
     if (this.options.openTelemetry === true && this.sendsNothing) {
@@ -227,10 +225,12 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
     this.lastRuntimeSampleAt = Date.now();
     this.runtimeMetricsInterval = setInterval(() => {
-      this.lastRuntimeSampleAt = Date.now();
-      this.observeAgentSharedBuffer.addNodeRuntimeMetrics(
-        this.nodeRuntimeMetricsService.collectNodeRuntimeMetrics(),
-      );
+      // Moved on only by a sample that was taken: one that could not be
+      // leaves its window open, and the next sample - or the final one -
+      // covers it.
+      if (this.addRuntimeMetrics()) {
+        this.lastRuntimeSampleAt = Date.now();
+      }
     }, interval);
 
     if (this.options.debug) {
@@ -494,7 +494,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
             // window since the previous one, so taking this earlier could
             // replace an unsent sample and lose its window.
             sampleRuntimeMetrics = false;
-            this.addFinalRuntimeMetrics();
+            this.addRuntimeMetrics();
             continue;
           }
         }
@@ -535,65 +535,31 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     if (this.observeAgentSharedBuffer.hasRuntimeMetrics()) {
       return true;
     }
-    this.addFinalRuntimeMetrics();
+    this.addRuntimeMetrics();
     return false;
   }
 
   /**
-   * The runtime-metrics window between the last scheduled sample and now.
+   * The runtime-metrics window between the last sample and now - scheduled
+   * or final - and whether it was taken.
+   *
+   * Never throws. Sampling reads `/proc` and the like, and fails when the
+   * process has no file descriptor to spare (`EMFILE`), which a flood of idle
+   * connections can arrange: out of a timer, that would be an uncaught
+   * exception in the host, and the end of it.
    */
-  private addFinalRuntimeMetrics() {
+  private addRuntimeMetrics(): boolean {
     try {
       this.observeAgentSharedBuffer.addNodeRuntimeMetrics(
         this.nodeRuntimeMetricsService.collectNodeRuntimeMetrics(),
       );
+      return true;
     } catch (error) {
       if (this.options.debug) {
         this.logger.debug(
-          `Could not collect final runtime metrics: ${String(error)}`,
+          `Could not collect runtime metrics: ${String(error)}`,
         );
       }
-    }
-  }
-
-  private get hasScaffoldCredentials(): boolean {
-    return (
-      this.options.appKey === SCAFFOLD_APP_KEY &&
-      this.options.appSecret === SCAFFOLD_APP_SECRET
-    );
-  }
-
-  /**
-   * Whether credentials are missing and the collector is the hosted one,
-   * which answers every batch without them with a 401.
-   *
-   * The worker leaves both headers off when either half is unset, which a
-   * collector in placeholder mode accepts, so a collector of the user's own
-   * still gets those batches. The hosted collector refuses them for as long
-   * as the process runs: on 2026-10-15 that was 42% of the 1.87M batches it
-   * refused, from processes deployed without their environment variables,
-   * some of them posting every five seconds for weeks.
-   */
-  private get lacksHostedCredentials(): boolean {
-    return (
-      (!this.options.appKey || !this.options.appSecret) &&
-      this.isHostedCollector
-    );
-  }
-
-  /**
-   * Whether `endpoint` - set, from `OBSERVE_ENDPOINT`, or the default - is the
-   * hosted collector. Compared by host, so a trailing slash or a capital
-   * letter cannot pass it off as a collector of the user's own.
-   */
-  private get isHostedCollector(): boolean {
-    try {
-      return (
-        new URL(this.endpoint).hostname ===
-        new URL(HOSTED_COLLECTOR_ENDPOINT).hostname
-      );
-    } catch {
-      // Not a URL at all; the worker says so when it tries to send.
       return false;
     }
   }
@@ -608,15 +574,11 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
   /** Whether nothing will be sent, so there is no worker to feed. */
   private get sendsNothing(): boolean {
-    return (
-      this.isDisabled ||
-      this.hasScaffoldCredentials ||
-      this.lacksHostedCredentials
-    );
+    return !sendsToObserve(this.options);
   }
 
   private get endpoint(): string {
-    return this.options.endpoint ?? DEFAULT_COLLECTOR_ENDPOINT;
+    return collectorEndpointOf(this.options);
   }
 
   /**
@@ -666,6 +628,9 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
         appSecret: this.options.appSecret,
         // Clamped by `onModuleInit` before the first worker starts.
         flushInterval: this.options.flushInterval ?? DEFAULT_FLUSH_INTERVAL,
+        // Batches ask what the app's plan allows `otlp` to export only when
+        // it is set up to export at all.
+        asksForOtlpExport: this.otlpTraceExporter?.enabled === true,
       }),
     });
     this.watchWorker(this.worker);
@@ -685,6 +650,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       // Whatever comes next, this worker gets nothing in any more: a
       // restarted one has to get a batch in again first.
       this.observeAgentSharedBuffer.recordStopped();
+      this.reclaimSlotOfStoppedWorker();
       this.reportOpenTelemetryInterop("stopped");
       if (code !== 0) {
         this.logger.error(
@@ -697,6 +663,30 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     });
   }
 
+  /**
+   * Frees the shared slot when the worker died holding it.
+   *
+   * A worker that dies mid-send - an uncaught exception, an out-of-memory -
+   * never reaches the `finally` that lets go of the lock, and its successor,
+   * started on the same buffer, could never take it: every later flush would
+   * be skipped for the life of the process. The main thread holds the lock
+   * only inside one synchronous `flush`, so a lock still held when the exit
+   * is handled can only be the dead worker's. Its batch is dropped, as on
+   * every failed send, so a batch that ends the worker cannot end the next
+   * one too. A slot that is not locked is left alone: its batch is still
+   * waiting, and goes to the next worker.
+   */
+  private reclaimSlotOfStoppedWorker() {
+    const buffer = this.observeAgentSharedBuffer;
+    if (!buffer.isBufferLocked()) {
+      return;
+    }
+    // The batch's length, after the lock word - what the worker zeroes
+    // before it lets go.
+    new DataView(buffer.sharedBuffer, 4, 4).setUint32(0, 0);
+    buffer.releaseLock();
+  }
+
   handleMessage(msg: string) {
     const pausedUntil = parsePausedMessage(msg);
     if (pausedUntil !== null) {
@@ -706,20 +696,31 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
     const notIngested = parseNotIngestedMessage(msg);
     if (notIngested !== null) {
+      // Only a refusal of the credentials pauses OpenTelemetry interop. A
+      // batch that failed to get in otherwise - the collector down, a 5xx, a
+      // timeout, a 429 pause - is an outage at NestJS Observe, and the
+      // traces running through the services around this one stay whole
+      // through it.
       if (notIngested === "refused") {
         this.observeAgentSharedBuffer.recordRefused();
-      } else {
-        // After the paused line, when the worker pauses: it posts that first.
-        this.observeAgentSharedBuffer.recordFailed(this.sendsPausedUntil);
+        this.reportOpenTelemetryInterop("refused");
       }
-      this.reportOpenTelemetryInterop(notIngested);
+      return;
+    }
+
+    // Ahead of the verdict for the same batch, which the worker posts after
+    // it - see `OtlpExportGrant`.
+    const otlpExport = parseOtlpExportMessage(msg);
+    if (otlpExport !== null) {
+      this.observeAgentSharedBuffer.setOtlpExport(otlpExport);
+      this.reportOtlpExport(otlpExport);
       return;
     }
 
     const mode = parseDegradedMessage(msg);
     if (mode !== null) {
       this.observeAgentSharedBuffer.recordAccepted();
-      this.reportOpenTelemetryInterop();
+      this.reportOpenTelemetryInterop("accepted");
       this.reportFirstAcceptedBatch();
       this.applyIngestMode(mode, parseOveragePauseReason(msg));
       return;
@@ -743,37 +744,74 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
   /**
    * Says when OpenTelemetry interop turns on or off, with `openTelemetry` on:
-   * it runs only while the collector takes this app's telemetry (see
-   * `ObserveAgentSharedBuffer.isIngesting`), and a `traceparent` that stops
-   * going out with no word would read as a bug in the agent.
+   * it runs only beside reporting to NestJS Observe (see
+   * `ObserveAgentSharedBuffer.isReporting`), and a `traceparent` that stops
+   * going out with no word would read as a bug in the agent. `why` is what
+   * just happened, which the line gives as the reason.
    */
   private reportOpenTelemetryInterop(
-    why?: NotIngestedReason | "stopped",
+    why: "started" | "accepted" | "refused" | "stopped",
   ): void {
     if (this.options.openTelemetry !== true) {
       return;
     }
-    const on = this.observeAgentSharedBuffer.isIngesting();
+    const on = this.observeAgentSharedBuffer.isReporting();
     if (on === this.reportedOpenTelemetry) {
       return;
     }
     this.reportedOpenTelemetry = on;
     if (on) {
       this.logger.log(
-        "OpenTelemetry interop is on: the collector is taking this app's telemetry, so traceparent is read and sent.",
+        why === "started"
+          ? "OpenTelemetry interop is on: traceparent is read and sent beside reporting to NestJS Observe. " +
+              "It stays on through collector outages and rate limits, and pauses only if the collector refuses the " +
+              "app's credentials or the telemetry worker stops."
+          : "OpenTelemetry interop is on again: the collector accepted this app's telemetry, so traceparent is read " +
+              "and sent.",
       );
       return;
     }
     const reason =
       why === "refused"
         ? "the collector refused this app's credentials"
-        : why === "stopped"
-          ? "the telemetry worker stopped"
-          : `no batch has reached the collector for ${NOT_INGESTED_GRACE_MS / 1000} seconds`;
+        : "the telemetry worker stopped";
     this.logger.warn(
-      `OpenTelemetry interop is paused: ${reason}. It runs only while the agent is reporting to NestJS Observe, ` +
-        `and resumes with the next batch the collector accepts.`,
+      `OpenTelemetry interop is paused: ${reason}. It resumes with the next batch the collector accepts.`,
     );
+  }
+
+  /**
+   * The OTLP export grant last said, or null before the first. Kept beside
+   * the log so each change is said once: every accepted batch repeats it.
+   */
+  private reportedOtlpExport: OtlpExportGrant | null = null;
+
+  /**
+   * Says what the collector granted `otlp` when it changes, the first answer
+   * included - an export that stays silent would read as a broken receiver.
+   * Only the plan's answer: a pause while the collector is not taking the
+   * app's telemetry is said by the interop line above.
+   */
+  private reportOtlpExport(grant: OtlpExportGrant): void {
+    if (grant === this.reportedOtlpExport) {
+      return;
+    }
+    this.reportedOtlpExport = grant;
+    const url = this.otlpTraceExporter?.url ?? "the OTLP receiver";
+    if (grant === "full") {
+      this.logger.log(
+        `OTLP export is on: every trace this app records goes to ${url}.`,
+      );
+    } else if (grant === "capped") {
+      this.logger.log(
+        `OTLP export is on, capped by this app's plan: traces go to ${url} as NestJS Observe keeps them, ` +
+          "so an operation it keeps without its spans - past the plan's daily pacing or monthly allowance - is exported without them too.",
+      );
+    } else {
+      this.logger.warn(
+        `OTLP export is off: the collector did not grant it for this app's plan, so nothing goes to ${url}.`,
+      );
+    }
   }
 
   /** Whether this process has said the collector accepted its first batch. */
@@ -795,7 +833,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     }
     this.reportedConnection = true;
     this.logger.log(
-      this.isHostedCollector
+      isHostedCollector(this.endpoint)
         ? `Observe is connected: the collector accepted this app's first batch. Requests and jobs appear at ${DASHBOARD_URL} as soon as the app serves them.`
         : `Observe is connected: ${this.endpoint} accepted this app's first batch.`,
     );

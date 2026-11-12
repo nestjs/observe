@@ -5,7 +5,8 @@ import {
   Server,
   ServerResponse,
 } from "node:http";
-import { Socket } from "node:net";
+import { randomBytes } from "node:crypto";
+import { createServer as createNetServer, Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   detachedWorkerData,
@@ -39,8 +40,8 @@ const writeBatch = (sharedBuffer: SharedArrayBuffer, json: string) => {
  * `sends(n)` once it has reported n successful sends. Any error the worker
  * reports fails the wait - a retried batch must not surface as one.
  */
-const startWorker = (endpoint: string) => {
-  const sharedBuffer = new SharedArrayBuffer(64 * 1024);
+const startWorker = (endpoint: string, bufferSize = 64 * 1024) => {
+  const sharedBuffer = new SharedArrayBuffer(bufferSize);
   const worker = new Worker(detachedWorkerSource(), {
     eval: true,
     workerData: detachedWorkerData({
@@ -54,15 +55,19 @@ const startWorker = (endpoint: string) => {
 
   let sent = 0;
   let failure: string | undefined;
+  let exited: number | undefined;
+  const errors: string[] = [];
   const waiters: Array<() => void> = [];
   worker.on("message", (msg: string) => {
     if (msg === SENT) {
       sent += 1;
     } else if (msg.startsWith("Error:")) {
       failure = msg;
+      errors.push(msg);
     }
     waiters.splice(0).forEach((wake) => wake());
   });
+  worker.on("exit", (code) => (exited = code));
 
   const sends = (count: number) =>
     new Promise<void>((resolve, reject) => {
@@ -87,6 +92,11 @@ const startWorker = (endpoint: string) => {
   return {
     send: (batch: unknown) => writeBatch(sharedBuffer, JSON.stringify(batch)),
     sends,
+    /** Every error the worker reported, which `sends` would fail on. */
+    errors,
+    /** Forgets a reported error, for a case that expects one. */
+    forgive: () => (failure = undefined),
+    exitCode: () => exited,
     stop: () => worker.terminate(),
   };
 };
@@ -175,5 +185,121 @@ describe("the detached worker's connection to the collector", () => {
 
     expect(requests).toBe(3);
     expect(connections).toBe(2);
+  }, 20_000);
+
+  // The reply is held, decoded and parsed in the application's process:
+  // without a limit its size, and many times that once parsed, would be the
+  // sender's to choose.
+  it("stops reading a reply past 64 KiB, and still acts on its status", async () => {
+    let written = 0;
+    collector = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        const chunk = Buffer.alloc(16 * 1024, " ");
+        const more = () => {
+          // A reply that never ends; it stops only when the worker hangs up.
+          while (!res.destroyed && res.write(chunk)) {
+            written += chunk.length;
+            if (written > 8 * 1024 * 1024) {
+              return;
+            }
+          }
+          res.once("drain", more);
+        };
+        more();
+      });
+    });
+    worker = startWorker(await listen(collector));
+
+    worker.send({ traces: [] });
+    await worker.sends(1);
+
+    expect(written).toBeLessThan(8 * 1024 * 1024);
+  }, 20_000);
+
+  // Node emits no response for a 101 with `Connection: Upgrade`, only an
+  // `upgrade` event, and destroys the socket without an error: a send that
+  // waits on neither would never settle, and the worker would end holding
+  // the shared buffer's lock - no telemetry again until a restart.
+  it("fails a send answered with an upgrade nobody asked for, and sends the next", async () => {
+    let connections = 0;
+    const upgrading = createNetServer((connection) => {
+      connections += 1;
+      const first = connections === 1;
+      connection.on("error", () => undefined);
+      connection.once("data", () =>
+        connection.write(
+          first
+            ? "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            : "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        ),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      upgrading.listen(0, "127.0.0.1", resolve),
+    );
+    try {
+      const { port } = upgrading.address() as { port: number };
+      worker = startWorker(`http://127.0.0.1:${port}`);
+      worker.send({ traces: [] });
+      for (let waited = 0; waited < 3_000; waited += 50) {
+        if (worker.errors.length > 0 || worker.exitCode() !== undefined) {
+          break;
+        }
+        await sleep(50);
+      }
+      expect(worker.exitCode()).toBeUndefined();
+      expect(worker.errors.join("\n")).toContain("101");
+
+      worker.forgive();
+      worker.send({ traces: [] });
+      await worker.sends(1);
+    } finally {
+      upgrading.close();
+    }
+  }, 20_000);
+
+  // A collector that answers off the head of a batch and stops reading: the
+  // send is over, but the upload never finishes, and a socket nobody pools
+  // or times out any more would stay open, one more per flush.
+  it("lets go of the connection when the reply ends before the batch is written", async () => {
+    let closed = false;
+    let socket: Socket | undefined;
+    const early = createNetServer((connection) => {
+      socket = connection;
+      connection.once("data", () => {
+        connection.pause();
+        connection.write(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
+            "Connection: keep-alive\r\nContent-Length: 2\r\n\r\n{}",
+        );
+      });
+      connection.on("error", () => undefined);
+      connection.on("close", () => (closed = true));
+      connection.on("end", () => (closed = true));
+    });
+    await new Promise<void>((resolve) => early.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = early.address() as { port: number };
+      worker = startWorker(`http://127.0.0.1:${port}`, 8 * 1024 * 1024);
+      // Too much for the kernel to take unread, gzipped or not.
+      worker.send({
+        traces: [randomBytes(4 * 1024 * 1024).toString("base64")],
+      });
+      await worker.sends(1);
+
+      // Read now: a released request comes to its end, a held one waits.
+      await sleep(200);
+      socket!.resume();
+      const isClosed = () => closed;
+      for (let waited = 0; !isClosed() && waited < 3_000; waited += 50) {
+        await sleep(50);
+      }
+      expect(closed).toBe(true);
+    } finally {
+      socket?.destroy();
+      await new Promise((resolve) => early.close(resolve));
+    }
   }, 20_000);
 });

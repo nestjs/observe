@@ -2,6 +2,7 @@
  * Reading token usage out of a model provider's response - a JSON body, or
  * the events of a server-sent stream - without ever keeping its text.
  */
+import { topLevelModel } from "./llm-providers.js";
 
 /** What one call consumed, as far as the response said. */
 export interface LlmUsage {
@@ -135,10 +136,14 @@ const EDGE_BYTES = 32 * 1024;
  * A larger body - a long completion, a batch of embeddings - is not kept: its
  * first and last 32 KB are, and the usage is matched out of those. Every
  * provider writes `usage` after the content and `model` before it.
+ *
+ * The bytes are copied, not the chunks kept: a chunk object costs a few
+ * hundred bytes of heap whatever it holds, and the sender decides how the
+ * body is cut - one byte at a time, a 2 MB body would be held a hundred
+ * times over.
  */
 export class JsonUsageReader {
-  private readonly chunks: Uint8Array[] = [];
-  private size = 0;
+  private body = new Bytes(MAX_JSON_BYTES);
   private head: Uint8Array | undefined;
   private tail: Uint8Array | undefined;
 
@@ -147,23 +152,27 @@ export class JsonUsageReader {
       this.tail = keepTail(this.tail, chunk, EDGE_BYTES);
       return;
     }
-    this.chunks.push(chunk);
-    this.size += chunk.byteLength;
-    if (this.size > MAX_JSON_BYTES) {
-      const whole = concat(this.chunks, this.size);
-      this.head = whole.subarray(0, EDGE_BYTES);
-      this.tail = whole.subarray(whole.byteLength - EDGE_BYTES);
-      this.chunks.length = 0;
+    if (this.body.size + chunk.byteLength <= MAX_JSON_BYTES) {
+      this.body.append(chunk);
+      return;
     }
+    const kept = this.body.view();
+    this.head =
+      kept.byteLength >= EDGE_BYTES
+        ? kept.slice(0, EDGE_BYTES)
+        : concat(
+            [kept, chunk.subarray(0, EDGE_BYTES - kept.byteLength)],
+            Math.min(EDGE_BYTES, kept.byteLength + chunk.byteLength),
+          );
+    this.tail = keepTail(kept, chunk, EDGE_BYTES);
+    this.body = new Bytes(0);
   }
 
   finish(): LlmUsage {
     const decoder = new TextDecoder();
     if (!this.head) {
       try {
-        return usageFromDocument(
-          JSON.parse(decoder.decode(concat(this.chunks, this.size))),
-        );
+        return usageFromDocument(JSON.parse(decoder.decode(this.body.view())));
       } catch {
         return {};
       }
@@ -196,11 +205,11 @@ function usageFromEdges(head: string, tail: string): LlmUsage {
   if (cached && usage.cachedInputTokens === undefined) {
     usage.cachedInputTokens = Number(cached[1]);
   }
-  const model = /"model"\s*:\s*"([^"\\]{1,128})"/.exec(head)?.[1];
+  const model = topLevelModel(head);
   return { ...usage, ...(model ? { model } : {}) };
 }
 
-/** Longest stream line examined. Longer lines carry content, not usage. */
+/** Longest stream line examined, in bytes. Longer lines carry content, not usage. */
 const MAX_SSE_LINE = 1024 * 1024;
 
 /**
@@ -209,10 +218,15 @@ const MAX_SSE_LINE = 1024 * 1024;
  * Only `data:` lines that can carry usage or a model are parsed - the first
  * event, and any that mention `usage` - so a long stream of text deltas costs
  * a substring search per line rather than a parse.
+ *
+ * A line still arriving is held as bytes, copied, and decoded once it is
+ * whole: grown a chunk at a time as a string, a line sent a byte at a time
+ * would be a million string objects. A line feed is never part of another
+ * UTF-8 character, so the bytes split into lines as the text does.
  */
 export class SseUsageReader {
   private readonly decoder = new TextDecoder();
-  private pending = "";
+  private pending = new Bytes(MAX_SSE_LINE);
   private skipping = false;
   private usage: LlmUsage = {};
   private sawEvent = false;
@@ -222,40 +236,41 @@ export class SseUsageReader {
   constructor(private readonly now: () => number = () => performance.now()) {}
 
   push(chunk: Uint8Array): void {
-    const text = this.decoder.decode(chunk, { stream: true });
     let start = 0;
     for (;;) {
-      const newline = text.indexOf("\n", start);
+      const newline = chunk.indexOf(0x0a, start);
       if (newline === -1) {
         break;
       }
       if (this.skipping) {
         // The oversized line ends here, unread.
         this.skipping = false;
+      } else if (this.pending.size === 0) {
+        this.line(this.decoder.decode(chunk.subarray(start, newline)));
       } else {
-        this.line(this.pending + text.slice(start, newline));
+        this.pending.append(chunk.subarray(start, newline));
+        this.line(this.decoder.decode(this.pending.view()));
       }
-      this.pending = "";
+      this.pending.clear();
       start = newline + 1;
     }
-    if (this.skipping) {
+    if (this.skipping || start === chunk.byteLength) {
       return;
     }
-    const rest = text.slice(start);
-    if (this.pending.length + rest.length > MAX_SSE_LINE) {
+    if (this.pending.size + chunk.byteLength - start > MAX_SSE_LINE) {
       // An oversized line is content; drop it until its end comes past.
-      this.pending = "";
+      this.pending.clear();
       this.skipping = true;
       return;
     }
-    this.pending += rest;
+    this.pending.append(chunk.subarray(start));
   }
 
   finish(): LlmUsage {
-    if (this.pending) {
-      this.line(this.pending);
-      this.pending = "";
+    if (this.pending.size > 0 && !this.skipping) {
+      this.line(this.decoder.decode(this.pending.view()));
     }
+    this.pending.clear();
     return this.usage;
   }
 
@@ -278,6 +293,45 @@ export class SseUsageReader {
       this.usage = mergeUsage(this.usage, usageFromDocument(JSON.parse(data)));
     } catch {
       /* not JSON, or not ours to read */
+    }
+  }
+}
+
+/**
+ * Bytes copied in as they arrive, into one buffer that doubles as it fills -
+ * up to `expected`, past it only as far as is needed.
+ */
+class Bytes {
+  private buffer = new Uint8Array(0);
+  size = 0;
+
+  constructor(private readonly expected: number) {}
+
+  append(chunk: Uint8Array): void {
+    const needed = this.size + chunk.byteLength;
+    if (needed > this.buffer.byteLength) {
+      const grown = new Uint8Array(
+        Math.max(
+          needed,
+          Math.min(Math.max(this.buffer.byteLength * 2, 1024), this.expected),
+        ),
+      );
+      grown.set(this.view());
+      this.buffer = grown;
+    }
+    this.buffer.set(chunk, this.size);
+    this.size = needed;
+  }
+
+  view(): Uint8Array {
+    return this.buffer.subarray(0, this.size);
+  }
+
+  /** Empties it, and lets a large buffer go rather than keep it for later. */
+  clear(): void {
+    this.size = 0;
+    if (this.buffer.byteLength > 64 * 1024) {
+      this.buffer = new Uint8Array(0);
     }
   }
 }

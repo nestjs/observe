@@ -7,21 +7,25 @@
  * same host, so a host list covers every client without knowing any of them.
  */
 
-/** Exact hosts, each with the provider name the dashboard groups by. */
-const EXACT_HOSTS: Readonly<Record<string, string>> = {
-  "api.openai.com": "openai",
-  "api.anthropic.com": "anthropic",
-  "generativelanguage.googleapis.com": "google",
-  "api.mistral.ai": "mistral",
-  "api.groq.com": "groq",
-  "openrouter.ai": "openrouter",
-  "api.together.xyz": "together",
-  "api.deepseek.com": "deepseek",
-  "api.x.ai": "xai",
-  "api.cohere.ai": "cohere",
-  "api.cohere.com": "cohere",
-  "api.perplexity.ai": "perplexity",
-};
+/**
+ * Exact hosts, each with the provider name the dashboard groups by. A `Map`,
+ * not an object literal: looked up by the host of any outgoing call, and a
+ * host spelt `constructor` or `__proto__` found an inherited member there.
+ */
+const EXACT_HOSTS: ReadonlyMap<string, string> = new Map([
+  ["api.openai.com", "openai"],
+  ["api.anthropic.com", "anthropic"],
+  ["generativelanguage.googleapis.com", "google"],
+  ["api.mistral.ai", "mistral"],
+  ["api.groq.com", "groq"],
+  ["openrouter.ai", "openrouter"],
+  ["api.together.xyz", "together"],
+  ["api.deepseek.com", "deepseek"],
+  ["api.x.ai", "xai"],
+  ["api.cohere.ai", "cohere"],
+  ["api.cohere.com", "cohere"],
+  ["api.perplexity.ai", "perplexity"],
+]);
 
 /** Hosts that carry a tenant or a region in a subdomain. */
 const HOST_PATTERNS: ReadonlyArray<[RegExp, string]> = [
@@ -38,7 +42,7 @@ export function llmProviderForHost(
 ): string | undefined {
   const normalized = host.toLowerCase();
   const hostname = normalized.replace(/:\d+$/, "");
-  const exact = EXACT_HOSTS[hostname];
+  const exact = EXACT_HOSTS.get(hostname);
   if (exact) {
     return exact;
   }
@@ -56,15 +60,62 @@ export function llmProviderForHost(
 /** Most of a request body read for its `model` field. Prompts can be megabytes. */
 const MODEL_SCAN_BYTES = 64 * 1024;
 
-const MODEL_FIELD = /"model"\s*:\s*"([^"\\]{1,128})"/;
+/** What follows a `"model"` key: the value, when it is a short string. */
+const MODEL_VALUE = /\s*:\s*"([^"\\]{1,128})"/y;
+
+/**
+ * The `model` of the outermost object of a JSON document, or of as much of
+ * one as `text` holds - and nothing for text that does not open with `{`.
+ *
+ * A scan rather than `JSON.parse`, which a cut-off document would fail, and
+ * rather than a search for `"model":`, which finds that key at any depth: a
+ * tool call's input, a tool result or a JSON-mode completion can carry one,
+ * and what it holds is the prompt's, not the model's. Strings are skipped
+ * whole, so a brace or a key inside one counts for nothing. Linear, and done
+ * at the first `model` key of the outermost object - where clients put it.
+ */
+export function topLevelModel(text: string): string | undefined {
+  let index = text.search(/\S/);
+  if (index === -1 || text[index] !== "{") {
+    return undefined;
+  }
+  let depth = 0;
+  for (; index < text.length; index++) {
+    const char = text[index];
+    if (char === '"') {
+      const start = index;
+      for (index++; index < text.length && text[index] !== '"'; index++) {
+        if (text[index] === "\\") {
+          index++;
+        }
+      }
+      if (
+        depth === 1 &&
+        index - start === 6 &&
+        text.startsWith('"model"', start)
+      ) {
+        MODEL_VALUE.lastIndex = index + 1;
+        const value = MODEL_VALUE.exec(text);
+        if (value) {
+          return value[1];
+        }
+      }
+    } else if (char === "{" || char === "[") {
+      depth++;
+    } else if ((char === "}" || char === "]") && --depth === 0) {
+      return undefined;
+    }
+  }
+  return undefined;
+}
 
 /**
  * The model a JSON request body names, read from its first 64 KB.
  *
- * A pattern rather than `JSON.parse`: the body is the application's prompt,
- * often far larger than the one field wanted, and every client puts `model`
- * near the top. Bodies that are streams or forms are not read at all - reading
- * them would consume what the request is about to send.
+ * Read with `topLevelModel`: the body is the application's prompt, often far
+ * larger than the one field wanted, and every client puts `model` near the
+ * top. Bodies that are streams or forms are not read at all - reading them
+ * would consume what the request is about to send.
  */
 export function modelFromRequestBody(body: unknown): string | undefined {
   let text: string | undefined;
@@ -77,7 +128,7 @@ export function modelFromRequestBody(body: unknown): string | undefined {
       new Uint8Array(body, 0, Math.min(body.byteLength, MODEL_SCAN_BYTES)),
     );
   }
-  return text ? MODEL_FIELD.exec(text)?.[1] : undefined;
+  return text ? topLevelModel(text) : undefined;
 }
 
 /**

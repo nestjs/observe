@@ -30,6 +30,42 @@ describe("createSensitiveKeyMatcher", () => {
     }
   });
 
+  it("matches a short credential word at the end of a compound name", () => {
+    for (const key of [
+      "token_auth",
+      "report_pwd",
+      "db_pwd",
+      "pwd2",
+      "x-auth",
+    ]) {
+      expect(isSensitive(key), key).toBe(true);
+    }
+  });
+
+  it("matches names written with dots, brackets or spaces", () => {
+    for (const key of [
+      "api.key",
+      "session.id",
+      "auth[token]",
+      "user[password]",
+      "token[]",
+      "Api Key",
+    ]) {
+      expect(isSensitive(key), key).toBe(true);
+    }
+  });
+
+  it("matches the noun inside acronyms and run-together names", () => {
+    for (const key of [
+      "SMTPPasswordNew",
+      "passwordconfirm",
+      "PASSWORDHASH",
+      "APISecretValue",
+    ]) {
+      expect(isSensitive(key), key).toBe(true);
+    }
+  });
+
   it("leaves the keys that only mention a credential alone", () => {
     for (const key of [
       "maxTokens",
@@ -42,6 +78,10 @@ describe("createSensitiveKeyMatcher", () => {
       "code",
       "state",
       "id",
+      "oauth",
+      "authors",
+      "keyboard",
+      "data[tokenCount]",
     ]) {
       expect(isSensitive(key), key).toBe(false);
     }
@@ -53,5 +93,17 @@ describe("createSensitiveKeyMatcher", () => {
     expect(configured("tenantRef")).toBe(true);
     expect(configured("TENANT-REF")).toBe(true);
     expect(configured("tenantRefs")).toBe(false);
+  });
+
+  it("strips a numbered suffix in linear time", () => {
+    // Query-string keys come from the client, and `\d+$` restarted at every
+    // digit of a run that is not at the end: ~350 ms for this key.
+    const key = "1".repeat(15_000) + "x";
+    const startedAt = performance.now();
+
+    expect(isSensitive(key)).toBe(false);
+    expect(isSensitive("1".repeat(15_000) + "token")).toBe(true);
+
+    expect(performance.now() - startedAt).toBeLessThan(25);
   });
 });

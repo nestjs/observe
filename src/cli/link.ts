@@ -1,4 +1,5 @@
 import { writeAgentNotes } from "./agent-notes.js";
+import { webAddress } from "./open-url.js";
 import {
   addDependencyCommand,
   detectPackageManager,
@@ -7,7 +8,11 @@ import {
 import {
   addEnvFileToStartScripts,
   ensureEnvIgnored,
+  isEnvFileValue,
+  isProjectFile,
+  LINK_FILES,
   readPackageName,
+  trackedEnvFile,
   writeEnvFile,
 } from "./project-files.js";
 import {
@@ -101,6 +106,22 @@ export async function link(
     deps.log(`${setup.unsupported}. Nothing was written.`);
     return 1;
   }
+  // Before a code is asked for: no pair is issued for a project whose own
+  // files lead somewhere else, nor for one it cannot be kept out of git in.
+  const outside = LINK_FILES.find((file) => !isProjectFile(options.cwd, file));
+  if (outside) {
+    deps.log(
+      `${outside} leads out of ${options.cwd} - a link, or one that leads nowhere - so link will not write to it. Nothing was written.`,
+    );
+    return 1;
+  }
+  const tracked = trackedEnvFile(options.cwd);
+  if (tracked) {
+    deps.log(
+      `${tracked} is tracked by git, so the secret link writes into it would be in your next commit, whatever .gitignore says. Run git rm --cached ${tracked}, which keeps the file, and link again. Nothing was written.`,
+    );
+    return 1;
+  }
   const manager = detectPackageManager(options.cwd);
 
   let started: StartedLink;
@@ -116,8 +137,18 @@ export async function link(
     return 1;
   }
 
+  // Printed and opened as parsed, and only as a web address: the page is
+  // whatever the service answered, and it is opened before any approval.
+  const page = webAddress(started.verificationUri);
+  if (!page) {
+    deps.log(
+      `NestJS Observe at ${options.endpoint} answered with a link page that is not a web address. Nothing was written.`,
+    );
+    return 1;
+  }
+
   deps.log("");
-  deps.log(`  Open      ${started.verificationUri}`);
+  deps.log(`  Open      ${page}`);
   deps.log(`  and type  ${started.userCode}`);
   deps.log("");
   deps.log(
@@ -130,7 +161,7 @@ export async function link(
   if (options.openBrowser) {
     // The page only, never the code: the code is typed, so a link that
     // carries it cannot approve anything on its own.
-    deps.openUrl(started.verificationUri);
+    deps.openUrl(page);
   }
 
   const credentials = await waitForApproval(deps, options.endpoint, started);
@@ -303,6 +334,11 @@ async function waitForApproval(
     } & Partial<LinkedCredentials>;
 
     if (response.ok && body.appKey && body.appSecret) {
+      // Checked before anything is written: the pair goes into .env, which
+      // every start of the app loads.
+      if (!isEnvFileValue(body.appKey) || !isEnvFileValue(body.appSecret)) {
+        return `${endpoint} answered with something other than a key pair. Nothing was written.`;
+      }
       return body as LinkedCredentials;
     }
     switch (body.error) {

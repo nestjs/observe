@@ -86,12 +86,23 @@ export function inspectProject(
  * The project's own TypeScript, which the code is edited with - parsed by the
  * compiler that will build it, so whatever syntax the project uses, it reads.
  * Undefined without one; the CLI does not bring a compiler of its own.
+ *
+ * Found in the `node_modules` directories the project resolves from, and
+ * loaded by its absolute path from the CLI's own module. Not asked of the
+ * project as `require("typescript")`: Node answers that with package
+ * self-reference first, and in a project named `typescript` with `exports`
+ * it would load and run the project's own file instead, on every link.
  */
 export function loadTypeScript(cwd: string): TypeScript | undefined {
   try {
-    const ts = createRequire(join(cwd, "package.json"))(
-      "typescript",
-    ) as TypeScript;
+    const installed = createRequire(join(cwd, "package.json"))
+      .resolve.paths("typescript")
+      ?.map((dir) => join(dir, "typescript"))
+      .find((dir) => existsSync(join(dir, "package.json")));
+    if (installed === undefined) {
+      return undefined;
+    }
+    const ts = createRequire(import.meta.url)(installed) as TypeScript;
     return typeof ts.createSourceFile === "function" ? ts : undefined;
   } catch {
     return undefined;

@@ -129,6 +129,47 @@ describe("what each callback falls back to", () => {
   });
 });
 
+describe("getUserIdSafely", () => {
+  let warn: ReturnType<typeof vi.fn>;
+  let logger: Logger;
+
+  beforeEach(() => {
+    warn = vi.fn();
+    logger = { warn } as unknown as Logger;
+  });
+
+  it("answers a user id as a string", () => {
+    const getUserId = (() => 42) as unknown as () => string;
+
+    expect(getUserIdSafely(getUserId, [], null, logger, "tcp")).toBe("42");
+    expect(getUserIdSafely(() => "alice", [], null, logger, "tcp")).toBe(
+      "alice",
+    );
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("answers no user id for a value that cannot be made a string, and reports it once", () => {
+    // What `JSON.parse` makes of `{"toString": 1}` - a TCP message's metadata
+    // field, returned as it arrived. `String()` throws on it, and thrown
+    // between ending the trace and plucking it, that left the trace
+    // registered for good.
+    const fromMetadata = JSON.parse('{"toString": 1}') as unknown;
+    const getUserId = (() => fromMetadata) as unknown as () => string;
+
+    expect(() =>
+      getUserIdSafely(getUserId, [], null, logger, "tcp"),
+    ).not.toThrow();
+    expect(getUserIdSafely(getUserId, [], null, logger, "tcp")).toBeUndefined();
+
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        '"tcp.getUserId" returned a value that cannot be made a string; completing the trace without a user id.',
+      ),
+    );
+  });
+});
+
 describe("deferTraceCompletion", () => {
   const quiet = { warn: vi.fn() } as unknown as Logger;
   /** Lets queued microtasks - and the ones they queue - run. */

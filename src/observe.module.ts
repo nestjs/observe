@@ -14,6 +14,7 @@ import {
   ModulesContainer,
 } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
+import { isObservable, Observable } from "rxjs";
 import { ObserveAgentSharedBuffer } from "./agent/observe-agent.shared-buffer.js";
 import { ObserveAgentWorker } from "./agent/observe-agent.worker.js";
 import { ObjectivesRegistry } from "./objectives/objectives.registry.js";
@@ -27,8 +28,12 @@ import {
 } from "./interfaces/observe-options.interface.js";
 import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "./observe.constants.js";
 import { GraphQLObserveAgentService } from "./protocols/graphql-observe-agent.service.js";
-import { HttpObserveAgentService } from "./protocols/http-observe-agent.service.js";
+import {
+  HttpObserveAgentService,
+  shareHttpAdapterHooks,
+} from "./protocols/http-observe-agent.service.js";
 import { OutgoingObserveAgentService } from "./outgoing/outgoing-observe-agent.service.js";
+import { OtlpTraceExporter } from "./otlp/otlp-trace-exporter.service.js";
 import {
   installLlmFetchObserver,
   llmCallsOff,
@@ -49,8 +54,13 @@ import { TraceSamplerService } from "./services/trace-sampler.service.js";
 import { TracerService } from "./services/tracer.service.js";
 import { KeyOf } from "./types/key-of.type.js";
 import { assertModuleOptions } from "./utils/assert-module-options.util.js";
+import { setAgentHook } from "./utils/shared-hook-slot.util.js";
 import { defaultTraceIdGenerator } from "./utils/default-trace-id-generator.util.js";
 import { recordTraceIdGeneratorOrigin } from "./utils/trace-id-generator-origin.util.js";
+import {
+  OpenTelemetryInteropGate,
+  traceparentToHandOn,
+} from "./utils/trace-handoff.util.js";
 import {
   fitServiceVersion,
   MAX_SERVICE_VERSION_LENGTH,
@@ -58,6 +68,7 @@ import {
 import { fitToLength } from "./utils/fit-to-length.util.js";
 import { inferServiceVersion } from "./utils/infer-service-version.util.js";
 import { LogRedactor } from "./utils/log-redactor.js";
+import { liveTraceId } from "./utils/operation-state.util.js";
 
 /**
  * All three async providers are optional on the options type, but one of them
@@ -196,6 +207,9 @@ export function createObserveModule<Store extends Record<string, unknown>>(
     >,
     options.sourceContext,
   );
+  // Read by the microservice dispatch hook, which a client is handed as it is
+  // instantiated - before the module's options resolve. Configured below.
+  const openTelemetryInterop = new OpenTelemetryInteropGate();
 
   @Module({
     imports: [DiscoveryModule],
@@ -204,6 +218,21 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         provide: "ASSERT_MODULE_OPTIONS",
         useFactory: assertModuleOptions,
         inject: [{ token: OBSERVE_OPTIONS, optional: true }],
+      },
+      {
+        provide: OpenTelemetryInteropGate,
+        useFactory: (
+          observeOptions?: ObserveModuleOptionsWithDefaults,
+          observeAgentSharedBuffer?: ObserveAgentSharedBuffer,
+        ) =>
+          openTelemetryInterop.configure(
+            observeOptions,
+            observeAgentSharedBuffer,
+          ),
+        inject: [
+          { token: OBSERVE_OPTIONS, optional: true },
+          ObserveAgentSharedBuffer,
+        ],
       },
       {
         provide: AsyncLocalStorage,
@@ -259,6 +288,8 @@ export function createObserveModule<Store extends Record<string, unknown>>(
       // A no-op unless @nestjs/websockets is installed.
       WsObserveAgentService,
       OutgoingObserveAgentService,
+      // A no-op unless `otlp` asks for export.
+      OtlpTraceExporter,
     ],
     exports: [AsyncLocalStorage, TracerService],
   })
@@ -379,8 +410,15 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         // inspection throws before the structural checks below ever touch
         // them.
         options.skipInstrumentation!(instance) ||
-        [asyncLocalStorage, operationTraceRegistry].includes(
-          instance as AsyncLocalStorage<any> | OperationTraceRegistry,
+        [
+          asyncLocalStorage,
+          operationTraceRegistry,
+          openTelemetryInterop,
+        ].includes(
+          instance as
+            | AsyncLocalStorage<any>
+            | OperationTraceRegistry
+            | OpenTelemetryInteropGate,
         ) ||
         instance instanceof TraceSamplerService ||
         instance instanceof TracerService ||
@@ -396,6 +434,9 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         instance instanceof ScheduleObserveAgentService ||
         instance instanceof WsObserveAgentService ||
         instance instanceof OutgoingObserveAgentService ||
+        // Handed every finished operation from inside its completion: agent
+        // bookkeeping, like the buffer that hands them over.
+        instance instanceof OtlpTraceExporter ||
         // Nest's discovery machinery, which the GraphQL agent walks to map
         // root fields back to their resolver classes. It has to stay
         // unproxied: ModulesContainer extends Map, and a Map method invoked
@@ -441,8 +482,21 @@ export function createObserveModule<Store extends Record<string, unknown>>(
           },
         );
         return (instance: unknown) => {
-          propagateTraceIdThrough(instance, () =>
-            asyncLocalStorage.getStore()?.get(options.traceIdKey as never),
+          shareHooksOfHttpAdapter(instance);
+          deliverRepliesToTheirCaller(instance, asyncLocalStorage);
+          propagateTraceIdThrough(
+            instance,
+            // Not a finished operation's, past its grace period: a message a
+            // timer it left armed sends is no part of its trace.
+            () =>
+              liveTraceId(
+                asyncLocalStorage.getStore() as Map<unknown, unknown>,
+                options.traceIdKey!,
+              ),
+            (traceId) =>
+              openTelemetryInterop.isOn()
+                ? traceparentToHandOn(asyncLocalStorage.getStore(), traceId)
+                : undefined,
           );
           return decorate(instance as never);
         };
@@ -453,23 +507,55 @@ export function createObserveModule<Store extends Record<string, unknown>>(
 }
 
 /**
+ * Shares the HTTP adapter's request and response hooks with the application
+ * from the moment Nest creates the `HttpAdapterHost`, ahead of every provider
+ * of the application's, so a hook it sets on the adapter runs beside the
+ * agent's - see `shareHttpAdapterHooks`.
+ */
+function shareHooksOfHttpAdapter(instance: unknown): void {
+  try {
+    if (instance instanceof HttpAdapterHost) {
+      shareHttpAdapterHooks(instance);
+    }
+  } catch {
+    // `instanceof` runs a proxy's prototype trap, which may throw, and Nest
+    // 11 does not guard the instance decorator.
+  }
+}
+
+/**
  * Makes a microservice client send the current trace id with every packet.
+ *
+ * TCP and Redis clients carry it from `@nestjs/microservices` 12.0.4, and
+ * the NATS, Kafka, RabbitMQ, MQTT 5 and gRPC clients - as a header - from
+ * 12.3.3 (nestjs/nest#18386). Every client has had the method since 12.0.4,
+ * but those others call the hook only from 12.3.3, so on the versions
+ * between, registering it there changes nothing.
  *
  * `setOnDispatchHook` is the client-side counterpart of the server's
  * processing hooks, and only exists on `@nestjs/microservices` versions that
  * carry packet metadata - so this is a feature test, and a no-op on every
  * version before. The id goes out under the same name an HTTP hop uses, and
  * `defaultTraceIdGenerator` reads it back from the receiving context.
+ *
+ * With OpenTelemetry interop on, `traceparentFor` names a W3C `traceparent`
+ * to send beside it, which the receiving agent hands to an OpenTelemetry SDK
+ * in its process - see `traceparentToHandOn`.
+ *
+ * The hook is the application's to set too - Nest names a tenant and a
+ * locale as packet metadata - so the agent's part is set beside it: a
+ * dispatch hook the application sets on the client from here on runs first,
+ * and the agent's after it, adding the id beside what it wrote and never
+ * over an id it chose. Nest hands the same client over again for an alias,
+ * which replaces the agent's part rather than nesting it. A hook set in the
+ * client's own factory is already in place, and cannot be read.
  */
 function propagateTraceIdThrough(
   instance: unknown,
   currentTraceId: () => unknown,
+  traceparentFor: (traceId: string) => string | undefined,
 ): void {
-  const client = instance as {
-    setOnDispatchHook?: (
-      hook: (packet: { metadata?: Record<string, string> }) => void,
-    ) => void;
-  };
+  const client = instance as { setOnDispatchHook?: unknown };
   try {
     if (typeof client?.setOnDispatchHook !== "function") {
       return;
@@ -479,11 +565,140 @@ function propagateTraceIdThrough(
     // exclusions deal with it; it is certainly not a microservice client.
     return;
   }
-  client.setOnDispatchHook((packet) => {
-    const traceId = currentTraceId();
-    if (typeof traceId === "string" && !packet.metadata?.["x-request-id"]) {
-      packet.metadata = { ...packet.metadata, "x-request-id": traceId };
+  setAgentHook<DispatchHook>(
+    client,
+    "setOnDispatchHook",
+    (packet) => {
+      const traceId = currentTraceId();
+      if (typeof traceId !== "string") {
+        return;
+      }
+      if (!packet.metadata?.["x-request-id"]) {
+        packet.metadata = { ...packet.metadata, "x-request-id": traceId };
+      }
+      // Only beside the id this operation sends: an id the application chose
+      // names a trace of its own, and the packet is left as it made it.
+      if (
+        packet.metadata?.["x-request-id"] === traceId &&
+        !packet.metadata["traceparent"]
+      ) {
+        const traceparent = traceparentFor(traceId);
+        if (traceparent) {
+          packet.metadata = { ...packet.metadata, traceparent };
+        }
+      }
+    },
+    composeDispatchHook,
+  );
+}
+
+type DispatchHook = (packet: { metadata?: Record<string, string> }) => void;
+
+/** The dispatch hook the client is given: the application's, then the agent's. */
+function composeDispatchHook(
+  application: DispatchHook | undefined,
+  agent: DispatchHook,
+): DispatchHook {
+  if (!application) {
+    return agent;
+  }
+  return function (this: unknown, packet) {
+    application.call(this, packet);
+    agent.call(this, packet);
+  };
+}
+
+/**
+ * Makes what a microservice client's call emits arrive in the async context
+ * of the caller that subscribed to it.
+ *
+ * A client's replies come from events of its connection, and Node runs those
+ * in the async context the connection was opened in: a `ClientProxy`
+ * connects on first use, in the request that used it first, and grpc-js
+ * starts the calls made while its channel connects from the first one's
+ * attempt. Whatever a later caller chained onto its reply - a log line, a
+ * span, the next call's packet - read that request's store, and carried its
+ * trace id, for as long as the connection lived.
+ *
+ * Only what the client hands out is wrapped: the `Observable` of
+ * `ClientProxy#send`, and of each method a `ClientGrpc#getService` service
+ * has. Matched by shape, as the optional peer is never imported here; an
+ * instance that cannot be inspected or written to is left as it is.
+ */
+function deliverRepliesToTheirCaller(
+  instance: unknown,
+  asyncLocalStorage: AsyncLocalStorage<unknown>,
+): void {
+  const client = instance as {
+    send?: (...args: unknown[]) => unknown;
+    emit?: unknown;
+    connect?: unknown;
+    close?: unknown;
+    dispatchEvent?: unknown;
+    getService?: (...args: unknown[]) => unknown;
+    getClientByServiceName?: unknown;
+  };
+  const inCaller = (replies: unknown) =>
+    isObservable(replies)
+      ? inSubscriberContext(replies, asyncLocalStorage)
+      : replies;
+  try {
+    const { send, getService } = client ?? {};
+    if (
+      typeof getService === "function" &&
+      typeof client.getClientByServiceName === "function"
+    ) {
+      client.getService = function (this: unknown, ...args: unknown[]) {
+        const service = getService.apply(this, args);
+        if (typeof service === "object" && service !== null) {
+          const methods = service as Record<string, unknown>;
+          for (const name of Object.keys(methods)) {
+            const method = methods[name];
+            if (typeof method === "function") {
+              methods[name] = function (this: unknown, ...callArgs: unknown[]) {
+                return inCaller(method.apply(this, callArgs));
+              };
+            }
+          }
+        }
+        return service;
+      };
+    } else if (
+      typeof send === "function" &&
+      typeof client.emit === "function" &&
+      typeof client.connect === "function" &&
+      typeof client.close === "function" &&
+      typeof client.dispatchEvent === "function"
+    ) {
+      client.send = function (this: unknown, ...args: unknown[]) {
+        return inCaller(send.apply(this, args));
+      };
     }
+  } catch {
+    // A provider that throws on inspection, or cannot be written to, is not
+    // a client this can help - the decorator's own exclusions deal with it.
+  }
+}
+
+/**
+ * `source`, with each value, error and completion delivered in the store the
+ * subscriber subscribed in. The store is re-entered rather than every async
+ * context with it: the agent's own is what its trace id is read from, and a
+ * reply whose context is already that store pays nothing more.
+ */
+function inSubscriberContext<T>(
+  source: Observable<T>,
+  asyncLocalStorage: AsyncLocalStorage<unknown>,
+): Observable<T> {
+  return new Observable<T>((subscriber) => {
+    const store = asyncLocalStorage.getStore();
+    return source.subscribe({
+      next: (value) =>
+        asyncLocalStorage.run(store, () => subscriber.next(value)),
+      error: (error: unknown) =>
+        asyncLocalStorage.run(store, () => subscriber.error(error)),
+      complete: () => asyncLocalStorage.run(store, () => subscriber.complete()),
+    });
   });
 }
 

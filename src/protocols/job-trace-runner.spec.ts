@@ -1,9 +1,15 @@
 import { Logger } from "@nestjs/common";
+import { context, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
-import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { TRACE_CONTEXT_KEY, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
+import {
+  OPERATION_STATE_KEY,
+  OperationState,
+} from "../utils/operation-state.util.js";
 import { JobRunDescriptor, JobTraceRunner } from "./job-trace-runner.js";
 
 /**
@@ -68,6 +74,29 @@ describe("JobTraceRunner: jobs.ignore", () => {
     expect(seen.traceId).toEqual(expect.any(String));
     expect(seen.traced).toBe(false);
     expect(insertJobSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("ends a run's operation as it settles, traced or ignored", async () => {
+    const operationOfRun = () =>
+      als.getStore()!.get(OPERATION_STATE_KEY) as OperationState;
+
+    const ignored = await createRunner({ ignore: () => true }).run(
+      job,
+      async () => {
+        const operation = operationOfRun();
+        expect(operation.endedAt).toBeUndefined();
+        return operation;
+      },
+    );
+    const traced = await createRunner({}).run(job, async () => {
+      const operation = operationOfRun();
+      expect(operation.endedAt).toBeUndefined();
+      return operation;
+    });
+    await Promise.resolve();
+
+    expect(ignored.endedAt).toEqual(expect.any(Number));
+    expect(traced.endedAt).toEqual(expect.any(Number));
   });
 
   it("traces a job the predicate does not match", () => {
@@ -189,12 +218,160 @@ describe("JobTraceRunner: a run nested in its own job's run", () => {
     expect(inner).toEqual(outer);
   });
 
-  it("still isolates a different job that happens to start in that context", () => {
-    const inner = runner.run(job("7"), () =>
+  it("runs a different job that starts in that context as a run of its own", () => {
+    const [outer, inner] = runner.run(job("7"), () => [
+      observeRun(),
       runner.run(job("8"), () => observeRun()),
+    ]);
+
+    expect(inner.traceId).toEqual(expect.any(String));
+    expect(inner.traceId).not.toBe(outer.traceId);
+    expect(inner.registryKey).not.toBe(outer.registryKey);
+    expect(registry.hasTrace(inner.registryKey!)).toBe(true);
+  });
+
+  it("opens a run of its own in a store an operation left behind", () => {
+    // `cron` re-arms a job's timer from the previous timer's callback, so a
+    // job a request rescheduled fires in that request's store from then on.
+    // Read as an operation still open around the run, the store sent every
+    // firing into an id-less one: `TracerService.createSpan()` threw in the
+    // handler, and no run was reported again.
+    const stale = new Map<string, unknown>([
+      [TRACE_ID_KEY, "answered-request"],
+      [TRACE_REGISTRY_KEY, "answered-request-key"],
+    ]);
+
+    const seen = als.run(stale, () => runner.run(job("9"), () => observeRun()));
+
+    expect(seen.traceId).toEqual(expect.any(String));
+    expect(seen.traceId).not.toBe("answered-request");
+    expect(registry.hasTrace(seen.registryKey!)).toBe(true);
+  });
+});
+
+/**
+ * What a handler returns goes back to its driver. Bull reads more off it than
+ * its value - it calls `cancel()` on a promise-style processor's promise when
+ * the job times out - and drops what a callback-style one returns, so a
+ * promise of the runner's own making in its place either lost those members
+ * or rejected where nothing listened.
+ */
+describe("JobTraceRunner: the promise a handler returns", () => {
+  const TRACE_ID_KEY = "traceId";
+
+  let als: AsyncLocalStorage<Map<string, unknown>>;
+  let endTrace: ReturnType<typeof vi.spyOn>;
+  let runner: JobTraceRunner<Record<string, unknown>>;
+
+  const job: JobRunDescriptor = {
+    queueName: "clicks",
+    name: "count",
+    id: 1,
+    metadata: {},
+  };
+
+  /** The status the run was ended with, once it is. */
+  const reportedStatus = async () => {
+    await vi.waitFor(() => expect(endTrace).toHaveBeenCalledOnce());
+    return (endTrace.mock.calls[0][1] as { status?: string }).status;
+  };
+
+  beforeEach(() => {
+    als = new AsyncLocalStorage();
+    const registry = new OperationTraceRegistry(als as never, false);
+    endTrace = vi.spyOn(registry, "endTrace");
+    runner = new JobTraceRunner(
+      { insertJobSnapshot: vi.fn() } as unknown as ObserveAgentSharedBuffer,
+      { traceIdKey: TRACE_ID_KEY } as ObserveModuleOptionsWithDefaults,
+      registry,
+      als as never,
+      { warn: vi.fn(), debug: vi.fn() } as unknown as Logger,
+    );
+  });
+
+  it("hands a promise-style handler's own promise back, members and all", async () => {
+    const cancel = vi.fn();
+    const work = Object.assign(Promise.resolve("rendered"), { cancel });
+
+    const returned = runner.run(job, () => work);
+
+    expect(returned).toBe(work);
+    expect(returned.cancel).toBe(cancel);
+    await expect(returned).resolves.toBe("rendered");
+    expect(await reportedStatus()).toBe("completed");
+  });
+
+  it("still reports a promise-style run as failed when its promise rejects", async () => {
+    const error = new Error("render failed");
+    const work = Promise.reject(error);
+
+    const returned = runner.run(job, () => work);
+
+    expect(returned).toBe(work);
+    await expect(returned).rejects.toBe(error);
+    expect(await reportedStatus()).toBe("failed");
+  });
+
+  it("hands a callback-style handler's promise back as it returned it", async () => {
+    // `(job, done) => redis.hincrby(key, field, n, done)`: ioredis reports the
+    // failure to `done` and returns the promise it has handled that way, and
+    // Bull drops what the processor returns.
+    const work = Promise.reject(new Error("ERR value is not an integer"));
+
+    const returned = runner.run(
+      job,
+      (settle) => {
+        work.then(undefined, () => settle("failed"));
+        return work;
+      },
+      true,
     );
 
-    expect(inner).toEqual({ traceId: undefined, registryKey: undefined });
+    expect(returned).toBe(work);
+    expect(await reportedStatus()).toBe("failed");
+  });
+
+  it("takes a callback-style run's outcome from its callback, not its promise", async () => {
+    let done!: () => void;
+
+    void runner.run(
+      job,
+      (settle) => {
+        done = () => settle("failed");
+        return Promise.resolve();
+      },
+      true,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    done();
+
+    expect(await reportedStatus()).toBe("failed");
+  });
+
+  it("does not leave a dropped promise rejecting once its failure was reported", async () => {
+    // An instrumented provider's `@Process() count(job, done)` hands back a
+    // promise chained onto its method's: the method's own was handled, the
+    // chained one rejects as well, and Bull drops it.
+    let report!: () => void;
+    const chained = new Promise((_, reject) => {
+      report = () => reject(new Error("ERR value is not an integer"));
+    });
+
+    void runner.run(
+      job,
+      (settle) => {
+        queueMicrotask(() => {
+          settle("failed");
+          report();
+        });
+        return chained;
+      },
+      true,
+    );
+
+    expect(await reportedStatus()).toBe("failed");
+    // Vitest fails the file on a rejection nothing handled.
+    await new Promise((resolve) => setTimeout(resolve, 5));
   });
 });
 
@@ -283,5 +460,180 @@ describe("JobTraceRunner: patchEnqueue", () => {
     inTrace(() => new Queue().add("welcome", {}));
 
     expect(add).toHaveBeenCalledOnce();
+  });
+});
+
+/**
+ * With `openTelemetry` on, a job carries W3C trace context beside the trace id
+ * it inherits, and runs in it for an OpenTelemetry SDK in the worker's
+ * process. With the option off - or the agent not reporting to NestJS
+ * Observe - nothing changes: the options carry the id alone, and the job runs
+ * in no OpenTelemetry trace.
+ */
+describe("JobTraceRunner: W3C trace context, with openTelemetry on", () => {
+  const TRACE_ID_KEY = "traceId";
+  // The W3C spec's own example, and the id Observe writes it as.
+  const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+  const TRACE_ID_AS_UUID = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+  const SPAN_ID = "00f067aa0ba902b7";
+  const TRACEPARENT = `00-${TRACE_ID}-${SPAN_ID}-01`;
+
+  let als: AsyncLocalStorage<Map<string, unknown>>;
+  let registry: OperationTraceRegistry;
+
+  const createRunner = (
+    openTelemetry: boolean | undefined,
+    reporting = true,
+    jobs?: ObserveModuleOptionsWithDefaults["jobs"],
+  ) =>
+    new JobTraceRunner(
+      {
+        insertJobSnapshot: vi.fn(),
+        isReporting: () => reporting,
+      } as unknown as ObserveAgentSharedBuffer,
+      {
+        traceIdKey: TRACE_ID_KEY,
+        openTelemetry,
+        jobs,
+      } as ObserveModuleOptionsWithDefaults,
+      registry,
+      als as never,
+      { warn: vi.fn(), debug: vi.fn() } as unknown as Logger,
+    );
+
+  beforeEach(() => {
+    als = new AsyncLocalStorage();
+    registry = new OperationTraceRegistry(als as never, false);
+    context.setGlobalContextManager(
+      new AsyncLocalStorageContextManager().enable(),
+    );
+  });
+
+  afterEach(() => {
+    context.disable();
+  });
+
+  /** The options a job enqueued in an operation with `TRACE_ID_AS_UUID` gets. */
+  const enqueued = (runner: JobTraceRunner<Record<string, unknown>>) => {
+    const add = vi.fn();
+    class Queue {
+      add(...args: unknown[]) {
+        return add(...args);
+      }
+    }
+    runner.patchEnqueue(Queue.prototype as never, () => 2);
+    als.run(new Map([[TRACE_ID_KEY, TRACE_ID_AS_UUID]]), () =>
+      new Queue().add("welcome", {}, { attempts: 3 }),
+    );
+    return add.mock.calls[0]?.[2] as Record<string, unknown>;
+  };
+
+  /** The OpenTelemetry span context a job enqueued with `opts` runs in. */
+  const ranIn = (
+    runner: JobTraceRunner<Record<string, unknown>>,
+    opts: Record<string, unknown>,
+  ) =>
+    runner.run(
+      { queueName: "emails", name: "welcome", id: 1, opts, metadata: {} },
+      () => trace.getSpanContext(context.active()),
+    );
+
+  it("stamps a traceparent in the job's trace beside its trace id", () => {
+    expect(enqueued(createRunner(true))).toEqual({
+      attempts: 3,
+      observeTraceId: TRACE_ID_AS_UUID,
+      observeTraceparent: expect.stringMatching(
+        new RegExp(`^00-${TRACE_ID}-[0-9a-f]{16}-0[01]$`),
+      ),
+    });
+  });
+
+  it.each([
+    ["off", undefined, true],
+    ["on while the agent is not reporting", true, false],
+  ])(
+    "stamps the trace id alone with openTelemetry %s",
+    (_, openTelemetry, reporting) => {
+      expect(enqueued(createRunner(openTelemetry, reporting))).toEqual({
+        attempts: 3,
+        observeTraceId: TRACE_ID_AS_UUID,
+      });
+    },
+  );
+
+  it("runs the job in the trace it was enqueued in", () => {
+    expect(
+      ranIn(createRunner(true), {
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: TRACEPARENT,
+      }),
+    ).toEqual({
+      traceId: TRACE_ID,
+      spanId: SPAN_ID,
+      traceFlags: 1,
+      isRemote: true,
+    });
+  });
+
+  it("runs a job jobs.ignore matches in that trace too", () => {
+    const runner = createRunner(true, true, { ignore: () => true });
+
+    expect(
+      ranIn(runner, {
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: TRACEPARENT,
+      })?.traceId,
+    ).toBe(TRACE_ID);
+  });
+
+  it.each([
+    ["off", undefined, true],
+    ["on while the agent is not reporting", true, false],
+  ])(
+    "runs the job in no trace with openTelemetry %s",
+    (_, openTelemetry, reporting) => {
+      expect(
+        ranIn(createRunner(openTelemetry, reporting), {
+          observeTraceId: TRACE_ID_AS_UUID,
+          observeTraceparent: TRACEPARENT,
+        }),
+      ).toBeUndefined();
+    },
+  );
+
+  it("runs a job that inherited no trace id in no trace", () => {
+    expect(
+      ranIn(createRunner(true), { observeTraceparent: TRACEPARENT }),
+    ).toBeUndefined();
+  });
+
+  /** The context a job's store carries, and the one its trace started with. */
+  const recordedFor = (opts: Record<string, unknown>) => {
+    const startTrace = vi.spyOn(registry, "startTrace");
+    const stored = createRunner(true).run(
+      { queueName: "emails", name: "welcome", id: 1, opts, metadata: {} },
+      () => als.getStore()?.get(TRACE_CONTEXT_KEY),
+    );
+    return { stored, started: startTrace.mock.calls[0]?.[3] };
+  };
+
+  it("puts the job's span under the span that enqueued it, and carries that context in its store", () => {
+    const sentIn = { traceId: TRACE_ID, parentSpanId: SPAN_ID, sampled: true };
+
+    expect(
+      recordedFor({
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: TRACEPARENT,
+      }),
+    ).toEqual({ stored: sentIn, started: sentIn });
+  });
+
+  it("records no context for a job enqueued unsampled, by an operation the agent was not recording", () => {
+    expect(
+      recordedFor({
+        observeTraceId: TRACE_ID_AS_UUID,
+        observeTraceparent: `00-${TRACE_ID}-${SPAN_ID}-00`,
+      }),
+    ).toEqual({ stored: undefined, started: undefined });
   });
 });

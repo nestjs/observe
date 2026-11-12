@@ -61,18 +61,30 @@ starts the OpenTelemetry Node SDK, it reports each request under the trace id
 the SDK gave it - also when the request started the trace - and leaves
 `traceparent` to the SDK on calls out of the service, so a request has one
 trace id in both tools and every call carries one `traceparent`. The SDK keeps
-its own spans, the agent adds the class-level ones. This is tested against the
-SDK with its auto-instrumentations, on Express and Fastify, over `fetch`,
-`node:http`, `pg` and Nest's own instrumentation. Without the option, the agent
-speaks `x-request-id` alone and leaves any OpenTelemetry SDK in the process
-alone.
+its own spans, the agent adds the class-level ones. Queue jobs and microservice
+messages stay in the request's trace in both tools too. A BullMQ (Pro included)
+or Bull job, and a message over a built-in transport - TCP and Redis on
+`@nestjs/microservices` 12.0.4 and later, NATS, Kafka, RabbitMQ, MQTT 5 and
+gRPC on 12.3.3 and later - carries W3C trace context beside its trace id: as
+call metadata over gRPC, as a header or user property over the others, so a
+consumer in another language instrumented with OpenTelemetry continues the
+trace. In a Nest service, the agent that runs the job or handles the message
+hands that context to the SDK there, which has no instrumentation for BullMQ or
+for Nest's TCP and Redis transports. Where an instrumentation does carry it -
+BullMQ's own `bullmq-otel` add-on, the SDK's gRPC instrumentation - the work's
+spans nest under the span it opens. This is tested against the SDK with its
+auto-instrumentations, on Express and Fastify, over `fetch`, `node:http`, `pg`,
+BullMQ with and without `bullmq-otel`, TCP and gRPC microservices and Nest's
+own instrumentation. Without the option, the agent speaks `x-request-id` alone
+and leaves any OpenTelemetry SDK in the process alone.
 
-It works only beside reporting to NestJS Observe. It turns on with the first
-batch the collector accepts, and pauses - saying so in the log - while the
-collector refuses the app's credentials, once batches have failed to get in
-for a minute, or while the agent's worker is down, resuming with the next batch
-the collector accepts. With `enabled: false`, or without credentials for the
-hosted collector, it never turns on.
+It works only beside reporting to NestJS Observe. It is on from start-up, so a
+new instance's first requests stay in the traces around it, and stays on
+through collector outages and rate limits, so those traces stay whole while
+NestJS Observe is down. It pauses - saying so in the log - only while the
+collector refuses the app's credentials or the agent's worker is down, resuming
+with the next batch the collector accepts. With `enabled: false`, or without
+credentials for the hosted collector, it never turns on.
 
 ```typescript
 ObserveModule.forRoot({
@@ -80,6 +92,12 @@ ObserveModule.forRoot({
   openTelemetry: true,
 });
 ```
+
+With `otlp` set as well, the agent exports the spans it records to the
+OpenTelemetry backend you already run - a collector, Jaeger, Tempo or any
+vendor - on the same trace ids, so the Nest service's spans sit in the same
+waterfall as the rest of the trace. See
+[Exporting to OpenTelemetry](#exporting-to-opentelemetry).
 
 ## Seeing it before installing
 
@@ -361,6 +379,13 @@ children, `s` spanId and `so` startOffset. A collector that does not know the
 tag stores it like any other and attributes the node as one call of its class
 rather than as the number it carries.
 
+Collapsing bounds what is shipped, not what is held while the operation runs,
+so one operation opens at most 10,000 spans, manual ones included. Calls past
+that run as they would untraced, and the operation's `observe.unrecordedSpans`
+tag says how many there were. A handler that calls a provider once per element
+of a list it was sent would otherwise let the sender decide how much memory
+the agent holds.
+
 ## Skipping spans for expected outcomes
 
 Nest applications answer "not found", "not allowed" and "invalid input" by
@@ -403,13 +428,23 @@ Once the module and the instrument are in place, the agent reports, with no furt
 - **Requests, GraphQL operations, RPC messages, WebSocket gateway messages, queue jobs and scheduled jobs**, each with its tree of provider method calls.
 - **Database queries**, as a span under the method that ran them, for `pg`, `mysql2`, `mssql` and `mongodb`. Anything built on those drivers is covered without being known by name: TypeORM, Drizzle, MikroORM and Mongoose are tested in this repository, and others (Knex, Sequelize) go through the same driver calls. SQL Server is the exception: `mssql` is what TypeORM and Prisma's SQL Server adapter run on, but Knex, Sequelize and MikroORM talk to SQL Server through `tedious` directly, which is not covered yet (nor is `mssql/msnodesqlv8`). The statement is recorded with every value removed (`SELECT "o"."id" FROM "orders" "o" WHERE "o"."customer_id" = $1`). Prisma's Rust query engine does not go through these drivers and is not covered yet.
 - **Outbound HTTP calls** made with `fetch`/`undici` or `node:http`/`https` (so Axios too), as `POST api.stripe.com`. The current trace id is forwarded as `x-request-id` - by `fetch` on every supported Node version, by `node:http`/`https` from Node 22.12, the first to let a request's headers still be set at that point - so a service that also runs the agent continues the same trace; a header you set yourself is never overwritten. With `openTelemetry: true`, a W3C `traceparent` goes with it, naming the trace and the call's span, so a service instrumented with OpenTelemetry - in Go, Python, Java or anything else - continues it too, as does a service running the agent behind it. When an OpenTelemetry SDK that propagates W3C Trace Context runs in the same process, `traceparent` is left to it: its instrumentations write the header on the calls they cover, and a request takes only one. `outgoing: { http: { traceContext: false } }` sends `x-request-id` alone even then, and `propagateTraceId: (url) => boolean` keeps both headers away from the URLs you name.
-- **Trace context from OpenTelemetry**, with `openTelemetry: true`: a request arriving with a W3C `traceparent` - from a service instrumented with OpenTelemetry, a mesh, or a load balancer that starts traces - is reported under that trace id, written as a UUID (`4bf92f35-77b3-4da6-a3ce-929d0e0e4736`), so the same id finds it in both tools. With an OpenTelemetry SDK in the same process - or another tracer registered with the OpenTelemetry API, as dd-trace is once its `TracerProvider` is registered - the trace is the one the SDK's server span is in, so a request that starts a trace gets the SDK's id too. That holds when a mesh or router stamped an `x-request-id` of its own on the request too, as Envoy and Heroku's router do: an `x-request-id` is kept only when it names the same trace, which is what another service running the agent sends, so custom ids still carry from one such service to the next. Over HTTP only: microservice, gRPC and queue hops pass the trace id as `x-request-id` and job options, as before. Without the option, a request is named by its `x-request-id`, else by a UUIDv7 of its own, and no `traceparent` is read or sent.
+- **Trace context from OpenTelemetry**, with `openTelemetry: true`: a request arriving with a W3C `traceparent` - from a service instrumented with OpenTelemetry, a mesh, or a load balancer that starts traces - is reported under that trace id, written as a UUID (`4bf92f35-77b3-4da6-a3ce-929d0e0e4736`), so the same id finds it in both tools. With an OpenTelemetry SDK in the same process - or another tracer registered with the OpenTelemetry API, as dd-trace is once its `TracerProvider` is registered - the trace is the one the SDK's server span is in, so a request that starts a trace gets the SDK's id too. That holds when a mesh or router stamped an `x-request-id` of its own on the request too, as Envoy and Heroku's router do: an `x-request-id` is kept only when it names the same trace, which is what another service running the agent sends, so custom ids still carry from one such service to the next. BullMQ (Pro included) and Bull jobs, and messages over the built-in transports (TCP and Redis on `@nestjs/microservices` 12.0.4 and later; NATS, Kafka, RabbitMQ, MQTT 5 and gRPC on 12.3.3 and later), carry W3C trace context beside the trace id, so whatever runs the job or handles the message continues the request's trace in OpenTelemetry too - an SDK in a Nest service, or a consumer in another language. Without the option, a request is named by its `x-request-id`, else by a UUIDv7 of its own, and no `traceparent` is read or sent.
 - **Model calls**: a `fetch` to OpenAI, Azure OpenAI, Anthropic, Gemini or Vertex, Bedrock, Mistral, Groq, OpenRouter, Together, DeepSeek, xAI, Cohere or Perplexity also reports the model and the input, output and cached tokens its response states - read as the response passes through to your code, streams included, so it arrives exactly as it would have and a stream you cancel is cancelled at the provider too. That covers the official SDKs, the Vercel AI SDK and LangChain, which all use `fetch`; calls made through `node:http` (axios, the AWS SDK) keep their plain span. Prompts and completions are never reported. A gateway in front of the providers is added with `outgoing: { llm: { hosts: ['llm-gateway.internal:4000'] } }`, and `outgoing: { llm: false }` turns this off and leaves the global `fetch` as it was.
 - **Trace ids across queues**: a BullMQ (Pro included) or Bull job enqueued while handling a request carries that request's trace id, so the request and its job show up as one trace. Repeatable (cron) jobs start their own.
 - **The code around an error's throw site**: for each in-app frame of a captured error, a few lines of source either side, read from the running process, so the dashboard shows the failing code next to the stack. This sends fragments of your application's source to Observe, stored with the error. Frames in `node_modules` and Node internals are never read. `createObserveModule({ sourceContext: false })` turns it off; the [documentation](https://www.observe.nestjs.com/documentation/sdk#error-source-context) covers tuning it instead.
 - **The release it is running**, so Releases, regressions and fix verification work without a version threaded through the build: `OBSERVE_SERVICE_VERSION` if the environment sets it, else the commit a platform or CI job exposes (Vercel, Render, Railway, Heroku, GitHub Actions, GitLab CI and others), else the commit checked out where the process runs, else a Cloud Run or Azure Container Apps revision. A container image usually carries none of these, so hand it the commit at build time - `ARG GIT_SHA` then `ENV OBSERVE_SERVICE_VERSION=$GIT_SHA`. `serviceVersion` names the release yourself, in at most 50 characters - a longer one is cut to fit, with a warning at startup; `serviceVersion: false` reports none.
 
 Query and outbound-HTTP spans are not billed as events. Turn them off with `outgoing: false`, or one side with `outgoing: { database: false }` / `outgoing: { http: false }`.
+
+### Hooks your application sets too
+
+Several of the places the agent hooks into hold one hook each: GraphQL's `ResolverDecoratorHost` request hooks, the HTTP adapter's `setOnRequestHook`, `setOnResponseHook` and `setOnRouteTriggered`, a microservice server's processing hooks, a `ClientProxy`'s `setOnDispatchHook`, and `@nestjs/bullmq`'s `ProcessorDecoratorService.prototype.decorate`. They are yours to use as well: the agent runs its part beside your hook, whichever is set first, and a getter such as `getOnRequestStartHook()` hands back your own. Three cannot be shared, because the hook is set before Nest hands the object over and nothing can read it back, so the agent's replaces it:
+
+- a request or response hook set on an adapter you build yourself, before `NestFactory.create()`;
+- a processing hook set on a server you pass as `strategy`, before `createMicroservice()` or `connectMicroservice()`;
+- a dispatch hook set in a client's own `useFactory`, or in the constructor of a `customClass` client.
+
+Set those after instead: on `app.getHttpAdapter()` before `listen()`, on `app.getTransportServer()`, or on the injected client from a provider.
 
 ## Capturing failed and slow requests
 
@@ -610,6 +645,49 @@ Declarations are checked when the application starts, and whatever fails is logg
 
 SLOs need a plan that has them - Scale or Enterprise. On any other plan, declarations are sent and ignored. The [documentation](https://www.observe.nestjs.com/documentation/sdk#declaring-objectives-in-code) has the rest.
 
+## Exporting to OpenTelemetry
+
+With `openTelemetry: true`, `otlp` exports the traces the agent records as OpenTelemetry spans, over OTLP/HTTP, to a receiver of your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb, Datadog's agent, or any vendor that takes OTLP. A request that arrived with a `traceparent` goes under the caller's span, and each call it makes is the parent of what the service it calls exports, so the Nest service's spans land in the same trace, in the same waterfall, as the rest of your system.
+
+```typescript
+ObserveModule.forRoot({
+  serviceId: "orders-api",
+  openTelemetry: true,
+  otlp: {
+    endpoint: "https://api.honeycomb.io",
+    headers: { "x-honeycomb-team": process.env.HONEYCOMB_API_KEY! },
+  },
+});
+```
+
+Export runs beside what the agent sends to NestJS Observe, never instead of it, and every plan includes it:
+
+- **Paid plans** export every trace the agent records, ahead of anything NestJS Observe does with its own copy: an overage trim or a paused overage changes what the dashboard keeps, not what is exported.
+- **Free** exports what NestJS Observe keeps. Once your apps send 30,000 events in one UTC day, or the month's allowance is used, most waterfalls are paused, and the requests and jobs behind them are exported as their own spans, without the spans under them; server errors, failed jobs and anything over 1 s keep their full traces in both places. While the collector can't be reached, what NestJS Observe keeps can't be known, so Free's export pauses a few minutes into the outage and resumes with the next batch the collector accepts.
+
+Which applies is the collector's to say: its reply to every batch the agent sends carries what the app's plan includes - the plan of the account that pays for the project. Export starts with the first batch the collector accepts and pauses whenever OpenTelemetry interop does, and the log says when it turns on and how. Without `openTelemetry: true`, without the `appKey` and `appSecret` the hosted collector needs, or with `enabled: false`, nothing is exported, and the agent says why at start-up. A proxy at `endpoint` that adds the credentials on the way to NestJS Observe counts as reporting to it.
+
+`otlp: true` takes everything from the standard variables instead, as an OpenTelemetry SDK would: `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`), `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, with their `_TRACES_` forms. Options set in code win over them. The variables never turn export on by themselves: an application that also runs an OpenTelemetry SDK has them set for that SDK, and would export every trace twice.
+
+| Option               | Default                          | What it does                                                                                              |
+| -------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `endpoint`           | `http://localhost:4318`          | The receiver's base URL; `/v1/traces` is appended unless it is already there.                            |
+| `headers`            | none                             | Sent with every export - a vendor's API key, usually.                                                     |
+| `protocol`           | `'http/protobuf'`                | Or `'http/json'`. gRPC is not supported: point at the receiver's HTTP port.                               |
+| `compression`        | `'gzip'`                         | Or `'none'`.                                                                                              |
+| `timeoutMillis`      | `10000`                          | How long one export may take before it is abandoned and retried.                                          |
+| `serviceName`        | `serviceId`                      | The `service.name` spans are reported under.                                                              |
+| `resourceAttributes` | none                             | Added to the agent's own (`service.version`, `service.instance.id`, `host.name`, `process.pid`, ...).     |
+
+What a backend receives, for each operation:
+
+- **A SERVER span** for every request, GraphQL operation, RPC message and gateway message, named like the dashboard names it (`GET /orders/:id`), with the HTTP semantic conventions - `http.request.method`, `http.route`, `http.response.status_code`, `url.path` - plus `enduser.id`, your `tags`, and the headers `http.capture` recorded. A queue job is a CONSUMER span, a scheduled run an INTERNAL one.
+- **INTERNAL spans** for the provider methods and manual spans under it, named `OrdersService.findOne`, and **CLIENT spans** for queries and outbound HTTP calls, named for what they did (`SELECT orders`, `GET api.stripe.com`).
+- **The same trace ids `traceparent` carries.** A request that arrived with a `traceparent` goes under the caller's span, a queue job or microservice message under the span that handed it on, and a call this service makes names its CLIENT span as the parent the callee sees - so services instrumented with OpenTelemetry, and other services running the agent, assemble into one trace in the backend.
+- **Errors** as span status and an `exception` event, with the class, message and stack the dashboard shows - redacted the same way.
+
+What is exported is what is recorded: after `tracesSampleRate`, `skipSpans` and `spanCollapse`, and on Free after what NestJS Observe holds back. A request whose caller sampled its trace out (`traceparent` flags `00`) is not exported, as an OpenTelemetry SDK sampling by its parent would leave it out. Spans wait in a queue of at most 10,000 while an export is retried (429, 502, 503 and 504, honouring `Retry-After`); past that, whole operations are dropped and counted. Exports run on the application's thread, outside its traces, and whatever is queued is exported when the application closes, within `shutdownFlushTimeout`. Traces only, for now: runtime metrics, custom metrics and logs are not exported.
+
 ## Configuration
 
 Every option, with its default. The [documentation](https://www.observe.nestjs.com/documentation/sdk) covers each in more depth.
@@ -623,6 +701,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `serviceId`              | required                            | Names the service in the dashboard, in at most 100 characters - a longer one is cut to fit, with a warning at startup.                                                                           |
 | `serviceVersion`         | inferred                            | The release the process runs, at most 50 characters - see [What it records without any code](#what-it-records-without-any-code). `false` reports none.                                          |
 | `endpoint`               | `https://observe-api.nestjs.com`    | The collector's base URL - NestJS Observe, or a proxy that forwards to it. `OBSERVE_ENDPOINT` in the environment changes the default without touching the config.                                                                                  |
+| `otlp`                   | `false`                             | Exports traces as OpenTelemetry spans to a receiver of your own, with `openTelemetry: true` - see [Exporting to OpenTelemetry](#exporting-to-opentelemetry). `true` reads the `OTEL_EXPORTER_OTLP_*` variables. |
 | `flushInterval`          | `5000`                              | Milliseconds between sends of buffered telemetry; at least `1000`.                                                                                                                                |
 | `shutdownFlushTimeout`   | `2000`                              | Milliseconds closing the app waits for buffered telemetry to reach the collector before stopping the agent. `0` skips the final send - for test suites that boot the app with real credentials.   |
 | `maxTracesPerBatch`      | `1000`                              | The most traces one send carries.                                                                                                                                                                 |
@@ -634,7 +713,7 @@ Every option, with its default. The [documentation](https://www.observe.nestjs.c
 | `forwardLogs`            | `false`                             | Sends the application's log lines, each correlated to the trace it was written in - see [Logs](https://www.observe.nestjs.com/documentation/sdk#logs).                                           |
 | `redaction`              | on                                  | How log lines, error messages and captured requests are scrubbed before they leave the process: `enabled`, `useDefaultPatterns`, `patterns`, `keys` and `replacement`.                           |
 | `outgoing`               | on                                  | Query and outbound-HTTP spans. `false` turns both off; `{ database: false }` or `{ http: false }` one of them. `{ http: { propagateTraceId, traceContext } }` tunes the `x-request-id` and `traceparent` headers outbound calls carry - `traceparent` only with `openTelemetry`. |
-| `openTelemetry`          | `false`                             | Continues and sends W3C `traceparent`, names a request after the W3C trace it is in, and follows an OpenTelemetry SDK running in the same process - see [Observe and OpenTelemetry](#observe-and-opentelemetry). Works only while the agent is reporting to NestJS Observe. Off, the agent reads and sends `x-request-id` alone. |
+| `openTelemetry`          | `false`                             | Continues and sends W3C `traceparent`, names a request after the W3C trace it is in, and follows an OpenTelemetry SDK running in the same process - see [Observe and OpenTelemetry](#observe-and-opentelemetry). Works only beside reporting to NestJS Observe, and stays on through collector outages. Off, the agent reads and sends `x-request-id` alone. |
 | `http`                   |                                     | `ignore`, `tags`, `setAttributes`, `getUserId`, `queryParamsObfuscateRegex`, `tracePreflights` and `capture` - see [Capturing failed and slow requests](#capturing-failed-and-slow-requests).    |
 | `rpc`, `grpc`            |                                     | `ignore`, `tags`, `setAttributes` and `getUserId` for microservice and gRPC handlers.                                                                                                             |
 | `graphql`                |                                     | The same four, once per GraphQL operation.                                                                                                                                                        |
@@ -682,16 +761,25 @@ $ npm run typecheck
 $ npm run test:int
 ```
 
-The MSSQL unit suite uses the real driver's public request APIs with stubbed transport methods and needs no SQL Server. The queue suites need a Redis, and the query-span integration suites a PostgreSQL, MySQL and MongoDB. Each integration suite skips itself when its server does not answer, so without them `test:int` passes having tested less. CI starts them with these ports and credentials, which the suites default to:
+The MSSQL unit suite uses the real driver's public request APIs with stubbed transport methods and needs no SQL Server. The queue suites need a Redis, the query-span integration suites a PostgreSQL, MySQL and MongoDB, and the OTLP export suite's Jaeger case a Jaeger. Each integration suite skips itself when its server does not answer, so without them `test:int` passes having tested less. CI starts them with these ports and credentials, which the suites default to:
 
 ```bash
 $ docker run -d -p 6379:6379 redis:7-alpine
 $ docker run -d -p 54321:5432 -e POSTGRES_PASSWORD=postgres-whisprr postgres:16-alpine
 $ docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=test mysql:8
 $ docker run -d -p 27027:27017 mongo:7
+$ docker run -d -p 4318:4318 -p 16686:16686 jaegertracing/jaeger:2.22.0
 ```
 
-To point them elsewhere, set `REDIS_HOST`/`REDIS_PORT`, `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE` or `MONGO_HOST`/`MONGO_PORT`.
+To point them elsewhere, set `REDIS_HOST`/`REDIS_PORT`, `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE`, `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DATABASE`, `MONGO_HOST`/`MONGO_PORT`, or `JAEGER_OTLP_ENDPOINT`/`JAEGER_QUERY_URL` for the suite that exports traces into Jaeger.
+
+The suites run on the Nest the devDependencies pin. CI also runs them on Nest 12.0.1 and 11.2.8; to do the same locally, swap the dev tree first. The script rewrites `package.json` and the lockfile, so restore both afterwards:
+
+```bash
+$ node scripts/use-nest.cjs 11.2.8
+$ npm test && npm run test:int
+$ git checkout -- package.json package-lock.json && npm ci --legacy-peer-deps
+```
 
 ## Module format
 

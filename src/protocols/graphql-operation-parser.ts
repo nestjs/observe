@@ -14,12 +14,19 @@ import { GraphQLResolveInfoLike } from "../interfaces/index.js";
  * operation definition and never looks at the rest of the document.
  */
 
-/** Operation keywords, mapped to the root type each one resolves against. */
-const ROOT_TYPE_BY_KEYWORD: Record<string, string> = {
-  query: "Query",
-  mutation: "Mutation",
-  subscription: "Subscription",
-};
+/**
+ * Operation keywords, mapped to the root type each one resolves against.
+ *
+ * A `Map`, not an object literal: the key is the first word of a client's
+ * document, and `constructor` or `__proto__` found an inherited member there,
+ * whose labelling then threw inside the request hook - a 500 for a document
+ * the server would have answered.
+ */
+const ROOT_TYPE_BY_KEYWORD = new Map([
+  ["query", "Query"],
+  ["mutation", "Mutation"],
+  ["subscription", "Subscription"],
+]);
 
 /**
  * Parsed results are cached: a client sends the same handful of documents over
@@ -193,18 +200,34 @@ function toOperation(
   }
   // Shorthand - `{ orders { id } }` - has no keyword at all and is a query.
   const keyword = words[0] ? words[0].toLowerCase() : "query";
-  const rootTypeName = ROOT_TYPE_BY_KEYWORD[keyword];
+  const rootTypeName = ROOT_TYPE_BY_KEYWORD.get(keyword);
   if (!rootTypeName) {
     return undefined;
   }
+  const operationName = words[0] ? words[1] : undefined;
+  // Whitespace is collapsed only here, at the end: `source` positions have to
+  // stay valid while the scan is still reading from it.
+  const sanitizedDocument = truncate(source.replace(/\s+/g, " ").trim());
+  // All three are cut from a string the size of the document, and V8 makes a
+  // cut a view that keeps the whole string it was cut from in memory. They
+  // outlive the request, on its trace until the batch is flushed, so past
+  // what the trace records they are copied out: a 100 kB document whose 8 kB
+  // the trace sent kept the 100 kB, twice over.
+  if (source.length <= MAX_SANITIZED_DOCUMENT_LENGTH) {
+    return { rootTypeName, fieldName, operationName, sanitizedDocument };
+  }
   return {
     rootTypeName,
-    fieldName,
-    operationName: words[0] ? words[1] : undefined,
-    // Whitespace is collapsed only here, at the end: `source` positions have to
-    // stay valid while the scan is still reading from it.
-    sanitizedDocument: truncate(source.replace(/\s+/g, " ").trim()),
+    fieldName: ownCopy(fieldName),
+    operationName:
+      operationName === undefined ? undefined : ownCopy(operationName),
+    sanitizedDocument: ownCopy(sanitizedDocument),
   };
+}
+
+/** The same code units, lone surrogates included, in storage of their own. */
+function ownCopy(value: string): string {
+  return Buffer.from(value, "utf16le").toString("utf16le");
 }
 
 function truncate(document: string): string {
@@ -275,8 +298,15 @@ function stripIgnoredTokens(document: string): string {
   while (index < document.length) {
     const char = document[index];
 
+    // A comment ends at either line terminator, as graphql-js ends it. Read on
+    // to the next `\n`, it swallowed what the server reads after a bare `\r` -
+    // the opening quotes of a block string included.
     if (char === "#") {
-      while (index < document.length && document[index] !== "\n") {
+      while (
+        index < document.length &&
+        document[index] !== "\n" &&
+        document[index] !== "\r"
+      ) {
         index += 1;
       }
       continue;
@@ -284,8 +314,7 @@ function stripIgnoredTokens(document: string): string {
 
     if (char === '"') {
       if (document.startsWith('"""', index)) {
-        const end = document.indexOf('"""', index + 3);
-        index = end === -1 ? document.length : end + 3;
+        index = endOfBlockString(document, index + 3);
       } else {
         index += 1;
         while (index < document.length && document[index] !== '"') {
@@ -299,13 +328,29 @@ function stripIgnoredTokens(document: string): string {
       continue;
     }
 
+    // A name is copied whole, so a digit that continues one (`field2`,
+    // `$var1`) never reaches the number rule below. Whether a digit belongs
+    // to a name is read from the document, never from `out`: the `_` a
+    // literal leaves there is a name character itself, so the number straight
+    // after one - `["draft"489213]`, commas being optional - read as its
+    // tail, and indexing a string built with `+=` copied all of it, once per
+    // digit.
+    if (isNameStart(char)) {
+      const start = index;
+      index += 1;
+      while (index < document.length && isNameChar(document[index])) {
+        index += 1;
+      }
+      out += document.slice(start, index);
+      continue;
+    }
+
     // Numbers go the same way as strings. An inline `verifyOtp(code: 489213)`
     // or `charge(amount: 1999)` is user data exactly as a string literal is,
-    // and blanking it also keeps `first: 10` and `first: 20` one shape. A
-    // digit that continues a name (`field2`, `$var1`) is not a literal.
+    // and blanking it also keeps `first: 10` and `first: 20` one shape.
     const startsNumber =
       isDigit(char) || (char === "-" && isDigit(document[index + 1] ?? ""));
-    if (startsNumber && !isNameChar(out[out.length - 1] ?? "")) {
+    if (startsNumber) {
       index += 1;
       while (index < document.length && isNumberChar(document, index)) {
         index += 1;
@@ -319,6 +364,21 @@ function stripIgnoredTokens(document: string): string {
   }
 
   return out;
+}
+
+/**
+ * Where a block string that opened before `from` ends, its closing quotes
+ * included. `\"""` is three quotes of content, as graphql-js reads it, not the
+ * end: ended there, the rest of the literal was recorded as document syntax.
+ * A block string has no other escape, so a backslash before the quotes always
+ * escapes them.
+ */
+function endOfBlockString(document: string, from: number): number {
+  let end = document.indexOf('"""', from);
+  while (end > from && document[end - 1] === "\\") {
+    end = document.indexOf('"""', end + 3);
+  }
+  return end === -1 ? document.length : end + 3;
 }
 
 function isDigit(char: string): boolean {

@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
+import { EventEmitter } from "events";
 import { HttpAdapterHost } from "@nestjs/core";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
@@ -18,6 +19,8 @@ describe("HttpObserveAgentService", () => {
     data: { attributes?: { originalUrl?: string } };
     reportedTraceId?: string;
   }>;
+  /** The traces the agent told the registry to keep without a span. */
+  let keptWithoutSpans: string[];
 
   const createService = (
     http: ObserveModuleOptionsWithDefaults["http"] = {},
@@ -28,8 +31,12 @@ describe("HttpObserveAgentService", () => {
     },
   ) => {
     startedTraces = [];
+    keptWithoutSpans = [];
     const registry = {
       getRedactor: () => null,
+      keepWithoutSpans: (traceId: string) => {
+        keptWithoutSpans.push(traceId);
+      },
       hasTrace: (traceId: string) =>
         startedTraces.some((started) => started.traceId === traceId),
       startTrace: (
@@ -169,12 +176,15 @@ describe("HttpObserveAgentService", () => {
       expect(startedTraces).toHaveLength(0);
     });
 
-    it("traces a preflight when tracePreflights is on", () => {
+    it("traces a preflight when tracePreflights is on, kept without a span", () => {
       const service = createService({ tracePreflights: true });
 
       preflight(service);
 
       expect(startedTraces).toHaveLength(1);
+      // The CORS layer answers it before any handler or middleware could
+      // record a span, and a trace with none is otherwise dropped.
+      expect(keptWithoutSpans).toEqual([startedTraces[0].traceId]);
     });
 
     it("traces an OPTIONS request that is not a preflight", () => {
@@ -184,6 +194,8 @@ describe("HttpObserveAgentService", () => {
       preflight(service, { origin: "https://app.example.com" });
 
       expect(startedTraces).toHaveLength(1);
+      // A handler ran for it, or the request reached none and is dropped.
+      expect(keptWithoutSpans).toEqual([]);
     });
   });
 
@@ -246,20 +258,44 @@ describe("HttpObserveAgentService", () => {
       }) as { run(callback: () => Promise<void>): Promise<void> };
       const run = (name: string, callback: () => Promise<void>) =>
         new Promise<void>((resolve, reject) => {
-          agent.startHttpRequestTracing(
-            { url: `/${name}`, method: "GET", protocol: "http" },
-            {},
-            () => {
-              tracer.setOperationId(name);
-              handler
-                .run(callback)
-                .finally(() => {
-                  agent.endHttpRequestTracing({}, { statusCode: 200 });
-                })
-                .then(resolve, reject);
-            },
+          // One object to both hooks, as every adapter hands them.
+          const req = { url: `/${name}`, method: "GET", protocol: "http" };
+          agent.startHttpRequestTracing(req, {}, () => {
+            tracer.setOperationId(name);
+            handler
+              .run(callback)
+              .finally(() => {
+                agent.endHttpRequestTracing(req, { statusCode: 200 });
+              })
+              .then(resolve, reject);
+          });
+        });
+      /**
+       * Starts a request whose handler has run, and hands back its response
+       * hook, to be called wherever the test likes.
+       */
+      const startAnswered = (name: string) => {
+        const req = { url: `/${name}`, method: "GET", protocol: "http" };
+        agent.startHttpRequestTracing(req, {}, () => {
+          tracer.setOperationId(name);
+          const registryKey = als.getStore()!.get(TRACE_REGISTRY_KEY);
+          const spanId = registry.internalStartTraceStep(
+            registryKey,
+            "OrdersController",
+            name,
+            undefined,
+          );
+          registry.internalEndTraceStep(
+            registryKey,
+            spanId,
+            "OrdersController",
+            name,
+            spanId,
           );
         });
+        return (statusCode: number) =>
+          agent.endHttpRequestTracing(req, { statusCode });
+      };
       return {
         als,
         registry,
@@ -269,6 +305,7 @@ describe("HttpObserveAgentService", () => {
         options,
         getUserId,
         run,
+        startAnswered,
       };
     }
 
@@ -425,6 +462,42 @@ describe("HttpObserveAgentService", () => {
       );
     });
 
+    it("completes the request its response hook is handed, wherever that runs", async () => {
+      // The adapters run the hook from `finish`, in the async context of
+      // whatever ended the response: a pipelined request's is emitted from
+      // the earlier one's, a stream's from its source's.
+      const context = createContext();
+      const endWaiter = context.startAnswered("waiter");
+      const endPublisher = context.startAnswered("publisher");
+
+      // The waiter's response is ended from no context at all...
+      context.als.exit(() => endWaiter(200));
+      await waitFor(
+        () => context.snapshots.length === 1,
+        1000,
+        "the waiter's snapshot",
+      );
+      // ...and the publisher's from a context that is not its own.
+      context.als.run(new Map([[TRACE_REGISTRY_KEY, "elsewhere"]]), () =>
+        endPublisher(201),
+      );
+      await waitFor(
+        () => context.snapshots.length === 2,
+        1000,
+        "the publisher's snapshot",
+      );
+
+      expect(
+        context.snapshots.map((snapshot) => [
+          snapshot.operationId,
+          snapshot.attributes?.statusCode,
+        ]),
+      ).toEqual([
+        ["waiter", 200],
+        ["publisher", 201],
+      ]);
+    });
+
     it("holds completion while a span of its own is still open", async () => {
       // Asked under any key but this request's own, the open-span check finds
       // no trace, answers that none is open, and the trace completes in a
@@ -541,6 +614,114 @@ describe("HttpObserveAgentService", () => {
         });
       },
     );
+  });
+
+  describe("a client that goes away before its response finishes", () => {
+    /** Starts a request on `res`, answering the key it was registered under. */
+    const startOn = (res: unknown) => {
+      const als = new AsyncLocalStorage<Map<string, any>>();
+      const registry = new OperationTraceRegistry(als as never, false);
+      const service = new HttpObserveAgentService(
+        {} as HttpAdapterHost,
+        als,
+        {
+          traceIdKey: "traceId",
+          traceIdGenerator: () => "trace-1",
+          http: {},
+        } as unknown as ObserveModuleOptionsWithDefaults,
+        registry,
+        {} as ObserveAgentSharedBuffer,
+        { shouldCapture: () => true } as unknown as TraceSamplerService,
+      );
+      let registryKey!: string;
+      service.startHttpRequestTracing(
+        { url: "/upload", method: "POST", protocol: "http" },
+        res,
+        () => {
+          registryKey = als.getStore()!.get(TRACE_REGISTRY_KEY);
+        },
+      );
+      return { registry, registryKey };
+    };
+
+    /** A Node response, as Express and the Node adapter hand it over. */
+    const nodeResponse = (writableFinished: boolean | undefined) =>
+      Object.assign(new EventEmitter(), { writableFinished });
+
+    it.each([
+      ["Express or Node", (res: EventEmitter) => res],
+      // Fastify hands the request hook its reply, and the Node response sits
+      // under it: the reply has no `on`, and nothing listened at all.
+      ["Fastify", (res: EventEmitter) => ({ raw: res })],
+    ])("drops the trace as the response closes, on %s", (_, given) => {
+      const res = nodeResponse(false);
+      const { registry, registryKey } = startOn(given(res));
+
+      res.emit("close");
+
+      // Never reported either way: held on, it was the client's to say how
+      // many such traces the process kept.
+      expect(registry.hasTrace(registryKey)).toBe(false);
+    });
+
+    it.each([
+      ["Express or Node", (res: EventEmitter) => res],
+      ["Fastify", (res: EventEmitter) => ({ raw: res })],
+    ])("keeps the trace of a response that finished, on %s", (_, given) => {
+      const res = nodeResponse(true);
+      const { registry, registryKey } = startOn(given(res));
+
+      res.emit("close");
+
+      expect(registry.hasTrace(registryKey)).toBe(true);
+    });
+
+    it("keeps the trace when the response does not say whether it finished", () => {
+      const res = nodeResponse(undefined);
+      const { registry, registryKey } = startOn(res);
+
+      res.emit("close");
+
+      expect(registry.hasTrace(registryKey)).toBe(true);
+    });
+  });
+
+  describe("a string request ignore", () => {
+    const shouldIgnore = (
+      ignore: NonNullable<ObserveModuleOptionsWithDefaults["http"]>["ignore"],
+      url: string,
+      method = "GET",
+    ) =>
+      (
+        createService({ ignore }) as unknown as {
+          shouldIgnoreRequest: (req: {
+            url: string;
+            method: string;
+          }) => boolean;
+        }
+      ).shouldIgnoreRequest({ url, method });
+
+    it.each([
+      "/account/recover?email=a%40b.c",
+      "/account/recover?",
+      "/account/recover#x",
+    ])("matches the path of %s, not the whole URL", (url) => {
+      // `req.url` carries the query string on every adapter: an endpoint
+      // that takes its input there was never ignored at all.
+      expect(shouldIgnore(["/account/recover"], url)).toBe(true);
+      expect(
+        shouldIgnore([{ method: "GET", path: "/account/recover" }], url),
+      ).toBe(true);
+    });
+
+    it("still matches an entry written with its query string, and nothing else", () => {
+      expect(shouldIgnore(["/health?full=1"], "/health?full=1")).toBe(true);
+      expect(shouldIgnore(["/health"], "/healthz")).toBe(false);
+      expect(shouldIgnore(["/health"], "/health/deep")).toBe(false);
+      expect(
+        shouldIgnore([{ method: "POST", path: "/health" }], "/health?x"),
+      ).toBe(false);
+    });
   });
 
   describe("stateful regex request ignores", () => {

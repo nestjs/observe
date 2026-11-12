@@ -2,6 +2,7 @@ import { ConsoleLogger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
+import { nestMajor } from "../testing/nest-version.js";
 import { LoggerPatcherService } from "./logger-patcher.service.js";
 import { StdoutForwarderService } from "./stdout-forwarder.service.js";
 
@@ -22,6 +23,15 @@ const als = new AsyncLocalStorage<Map<string, any>>();
 
 const inTrace = <T>(traceId: string, fn: () => T) =>
   als.run(new Map([[TRACE_ID_KEY, traceId]]), fn);
+
+/**
+ * Nest 12 writes a message's structured params on the message's line, and can
+ * flatten them into its JSON entry; Nest 11 writes each param as an entry of
+ * its own. The cases built on Nest 12's layout run from 12 on - what the text
+ * ones guard, a wrapper dropping Nest 12's seventh `formatMessage` argument,
+ * cannot happen before it.
+ */
+const itFromNest12 = it.runIf(nestMajor >= 12);
 
 /** Everything the logger wrote to stdout while `fn` ran. */
 function captureStdout(fn: () => void): string {
@@ -48,7 +58,7 @@ describe("LoggerPatcherService", () => {
   describe("text output", () => {
     const logger = () => new ConsoleLogger("Payments", { colors: false });
 
-    it("keeps structured params outside a trace", () => {
+    itFromNest12("keeps structured params outside a trace", () => {
       const output = captureStdout(() =>
         logger().warn("declined", { orderId: "ord_1" }),
       );
@@ -57,7 +67,7 @@ describe("LoggerPatcherService", () => {
       expect(output).not.toContain("Trace ID");
     });
 
-    it("keeps structured params inside a trace", () => {
+    itFromNest12("keeps structured params inside a trace", () => {
       const output = captureStdout(() =>
         inTrace("abc123", () =>
           logger().warn("declined", { orderId: "ord_1" }),
@@ -81,6 +91,20 @@ describe("LoggerPatcherService", () => {
 
   describe("JSON output", () => {
     it("adds the trace id as a field", () => {
+      const output = captureStdout(() =>
+        inTrace("abc123", () =>
+          new ConsoleLogger("Payments", { json: true }).warn("declined"),
+        ),
+      );
+
+      expect(JSON.parse(output)).toMatchObject({
+        level: "warn",
+        message: "declined",
+        traceId: "abc123",
+      });
+    });
+
+    itFromNest12("adds the trace id beside flattened params", () => {
       const output = captureStdout(() =>
         inTrace("abc123", () =>
           new ConsoleLogger("Payments", {

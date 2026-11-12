@@ -29,3 +29,11 @@ export const TRACE_CONTEXT_KEY = "#traceContext";
  * through Redis without touching the job's data.
  */
 export const JOB_TRACE_OPTION_KEY = "observeTraceId";
+
+/**
+ * The job option the enqueuing side stamps a W3C `traceparent` into, beside
+ * `JOB_TRACE_OPTION_KEY`, with `openTelemetry` on: the trace the job runs in
+ * for an OpenTelemetry SDK in the worker's process, and the span it nests
+ * under there - see `traceparentToHandOn`.
+ */
+export const JOB_TRACE_CONTEXT_OPTION_KEY = "observeTraceparent";

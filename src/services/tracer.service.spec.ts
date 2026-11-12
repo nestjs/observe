@@ -10,6 +10,11 @@ import {
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { TracerService } from "./tracer.service.js";
+import {
+  endOperation,
+  OPERATION_GRACE_MS,
+  openOperation,
+} from "../utils/operation-state.util.js";
 
 /**
  * The public API of the agent - what application code actually calls.
@@ -18,8 +23,8 @@ import { TracerService } from "./tracer.service.js";
  * `counter("orders")` twice must hand back the *same* counter, or every call
  * site accumulates its own total and the reported figure is whichever one
  * flushed last. Trace methods also depend on the async store: methods that
- * require a context fail clearly, while optional accessors and naming are safe
- * outside a recorded operation.
+ * require a context fail clearly, while optional accessors, naming and error
+ * reporting are safe outside a recorded operation.
  */
 describe("TracerService", () => {
   const TRACE_ID_KEY = "traceId";
@@ -422,6 +427,19 @@ describe("TracerService", () => {
     it("returns null when the store exists but carries no trace id", () => {
       expect(als.run(new Map(), () => tracer.currentTraceId())).toBeNull();
     });
+
+    it("returns null in a store whose operation ended past the grace period", () => {
+      // A flush interval a request armed lazily, firing long after the
+      // request was answered: the id must not label what it does.
+      const store = new Map<string, unknown>([["traceId", "finished"]]);
+      const operation = openOperation(store);
+
+      expect(als.run(store, () => tracer.currentTraceId())).toBe("finished");
+      endOperation(operation);
+      expect(als.run(store, () => tracer.currentTraceId())).toBe("finished");
+      operation.endedAt = performance.now() - OPERATION_GRACE_MS - 1;
+      expect(als.run(store, () => tracer.currentTraceId())).toBeNull();
+    });
   });
 
   describe("setAttribute and getAttribute", () => {
@@ -764,9 +782,53 @@ describe("TracerService", () => {
       );
     });
 
-    it("fails clearly outside any async context", async () => {
-      await expect(tracer.captureError(new Error("x"))).rejects.toThrow(
-        /AsyncLocalStorage is not initialized/,
+    it("records nothing outside any async context, without failing the caller, and says so once", async () => {
+      // A gateway handler behind an interceptor ran without the message's
+      // store: one that reported a handled error answered with Nest's
+      // exception instead of its fallback, and one that did not await the
+      // call ended the process.
+      const captureError = vi.spyOn(registry, "captureError");
+      const warn = vi
+        .spyOn((tracer as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      await expect(
+        tracer.captureError(new Error("x")),
+      ).resolves.toBeUndefined();
+      await expect(
+        tracer.captureError(new Error("y")),
+      ).resolves.toBeUndefined();
+
+      expect(captureError).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("outside an async context"),
+      );
+    });
+
+    it("does not fail the caller when recording the error fails, and says so once", async () => {
+      // Reporting an error must not raise one: a handler that captures a
+      // failure and then answers with a fallback answered 500 instead, and
+      // one that did not await the call took the process down.
+      vi.spyOn(registry, "captureError").mockImplementation(() => {
+        throw new TypeError("Cannot convert object to primitive value");
+      });
+      const warn = vi
+        .spyOn((tracer as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      await inTrace("c3", async () => {
+        await expect(
+          tracer.captureError(new Error("x")),
+        ).resolves.toBeUndefined();
+        await expect(
+          tracer.captureError(new Error("y")),
+        ).resolves.toBeUndefined();
+      });
+
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Cannot convert object to primitive value"),
       );
     });
   });
@@ -842,6 +904,31 @@ describe("TracerService", () => {
       expect(reused.getValue()).toBe(7);
     });
 
+    it("seeds a metric still at zero and keeps counting from there", () => {
+      tracer.counter("visits");
+      tracer.gauge("queued");
+
+      const counter = tracer.counter("visits", { initialValue: 5 });
+      const gauge = tracer.gauge("queued", { initialValue: 5 });
+      counter.increment();
+      gauge.increment();
+
+      expect(counter.getValue()).toBe(6);
+      expect(gauge.getValue()).toBe(6);
+    });
+
+    it("returns a labelled metric again when given an initial value", () => {
+      const options = { labels: ["route" as const], initialValue: 0 };
+      tracer.counter("hits", options).increment({ route: "/a" });
+      tracer.gauge("open", options).increment({ route: "/a" });
+
+      tracer.counter("hits", options).increment({ route: "/a" });
+      tracer.gauge("open", options).increment({ route: "/a" });
+
+      expect(tracer.counter("hits", options).getValue({ route: "/a" })).toBe(2);
+      expect(tracer.gauge("open", options).getValue({ route: "/a" })).toBe(2);
+    });
+
     it("updates a gauge's kind on a later call", () => {
       tracer.gauge("cpu");
 
@@ -880,6 +967,38 @@ describe("TracerService", () => {
 
       // Registering a metric is not an event; only a change is.
       expect(upserted).toEqual([]);
+    });
+
+    it("reports at most 1,000 metrics, counters, gauges and summaries together", () => {
+      const warn = vi
+        .spyOn((tracer as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      // Named after something a client sent: each new name was kept for the
+      // life of the process and put a `custom` entry of its own in the batch,
+      // which the collector refuses whole past 5,000.
+      for (let index = 0; index < 400; index++) {
+        tracer.counter(`imported.${index}`).increment();
+        tracer.gauge(`queued.${index}`).increment();
+        tracer.summary(`took.${index}`).observe(index);
+      }
+
+      const names = new Set(upserted.map((metric) => metric.name));
+      expect(names.size).toBe(1_000);
+      expect(names.has("imported.333")).toBe(true);
+      expect(names.has("took.333")).toBe(false);
+      expect(warn).toHaveBeenCalledOnce();
+
+      // One the registry already holds keeps working past the limit.
+      tracer.counter("imported.0").increment();
+      expect(tracer.counter("imported.0").getValue()).toBe(2);
+      // One it refused is still a metric the caller can use, just not one
+      // that is reported.
+      const refused = tracer.counter("imported.after");
+      expect(() => refused.increment()).not.toThrow();
+      expect(upserted.map((metric) => metric.name)).not.toContain(
+        "imported.after",
+      );
     });
 
     it("keeps pushing after a metric is re-retrieved", () => {

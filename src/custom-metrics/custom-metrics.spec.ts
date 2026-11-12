@@ -232,6 +232,14 @@ describe("Gauge", () => {
   });
 
   describe("labels", () => {
+    it("sets a value on a label that was never recorded", () => {
+      const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
+
+      gauge.setValue({ pool: "main" }, 5);
+
+      expect(gauge.getValue({ pool: "main" })).toBe(5);
+    });
+
     it("keeps a separate level per label", () => {
       const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
 
@@ -455,6 +463,150 @@ describe("non-finite values", () => {
     expect(warn.mock.calls[1][0]).toContain('"latency"');
   });
 
+  describe("a finite step that would take a reading past the largest number", () => {
+    /** Finite on its own; twice it is past the largest double. */
+    const HUGE = 1e308;
+
+    it("is ignored by a counter, which keeps its last reading", () => {
+      const counter = new Counter("raised");
+
+      // Each is finite and passes any "positive number" check; added in, the
+      // counter stayed at Infinity - null on the wire - for good.
+      counter.increment(HUGE);
+      counter.increment(HUGE);
+      counter.increment(HUGE);
+
+      expect(counter.getValue()).toBe(HUGE);
+      expect(counter.increase).toEqual({ default: HUGE });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('"raised"');
+      expect(warn.mock.calls[0][0]).toContain("largest");
+    });
+
+    it("is ignored on a label, without opening a series for it", () => {
+      const counter = new Counter<"currency">("raised", "d", HUGE, [
+        "currency",
+      ]);
+      counter.increment({ currency: "eur" }, 0);
+
+      counter.increment({ currency: "eur" }, HUGE);
+      counter.increment({ currency: "usd" }, HUGE);
+
+      expect(counter.value).toEqual({ '{"currency":"eur"}': HUGE });
+    });
+
+    it("keeps a counter's increase since the last flush a number", () => {
+      const counter = new Counter<"account">("balance", "d", ["account"]);
+      counter.increment({ account: "a" }, -HUGE);
+      counter.markFlushed();
+
+      // Both readings are finite, but the rise from -1e308 to 1e308 is not.
+      counter.increment({ account: "a" }, HUGE);
+      counter.increment({ account: "a" }, HUGE);
+
+      expect(counter.getValue({ account: "a" })).toBe(0);
+      expect(counter.increase).toEqual({ '{"account":"a"}': HUGE });
+    });
+
+    it("is ignored by a gauge, up or down", () => {
+      const gauge = new Gauge("level");
+
+      gauge.increment(HUGE);
+      gauge.increment(HUGE);
+      expect(gauge.getValue()).toBe(HUGE);
+
+      gauge.setValue(-HUGE);
+      gauge.decrement(HUGE);
+      expect(gauge.getValue()).toBe(-HUGE);
+    });
+
+    it("is ignored on a gauge's label, up or down", () => {
+      const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
+
+      gauge.increment({ pool: "main" }, HUGE);
+      gauge.increment({ pool: "main" }, HUGE);
+      gauge.decrement({ pool: "replica" }, HUGE);
+      gauge.decrement({ pool: "replica" }, HUGE);
+
+      expect(gauge.getValue({ pool: "main" })).toBe(HUGE);
+      expect(gauge.getValue({ pool: "replica" })).toBe(-HUGE);
+    });
+
+    it("is left out of a summary whole, so its count and total agree", () => {
+      const summary = new Summary("amount");
+
+      summary.observe(HUGE);
+      summary.observe(HUGE);
+      summary.observe(5);
+
+      expect(summary.total.default).toBe(HUGE);
+      expect(summary.observations.default).toBe(2);
+      expect(summary.maximum.default).toBe(HUGE);
+    });
+  });
+
+  describe("a value that is not a number at run time", () => {
+    // What a field of a request body can hold: JSON parses `{"toString": 1}`
+    // into an object no string conversion survives, and a deeply nested array
+    // overflows the stack of one.
+    const deeplyNested = () => {
+      let nested: unknown = [];
+      for (let i = 0; i < 20_000; i++) {
+        nested = [nested];
+      }
+      return nested;
+    };
+    const unprintable = (): unknown[] => [
+      { toString: 1 },
+      deeplyNested(),
+      Symbol("amount"),
+    ];
+
+    it("ignores it rather than throwing from the warning", () => {
+      for (const value of unprintable()) {
+        const summary = new Summary("amount");
+        const counter = new Counter<"route">("hits", "d", ["route"]);
+        const gauge = new Gauge<"pool">("level", { labels: ["pool"] });
+
+        // Thrown from the warning, it failed the request being measured.
+        expect(() => summary.observe(value as number)).not.toThrow();
+        expect(() =>
+          counter.increment({ route: "/a" }, value as number),
+        ).not.toThrow();
+        expect(() =>
+          gauge.setValue({ pool: "main" }, value as number),
+        ).not.toThrow();
+
+        expect(summary.observations).toEqual({});
+        expect(counter.value).toEqual({});
+        expect(gauge.value).toEqual({ default: 0 });
+      }
+      expect(warn).toHaveBeenCalledTimes(9);
+      expect(warn.mock.calls[0][0]).toContain("a value of type object");
+      expect(warn.mock.calls[6][0]).toContain("a value of type symbol");
+    });
+
+    it("names a string by its type rather than echoing it", () => {
+      const summary = new Summary("amount");
+
+      summary.observe("12\u001b[2J" as unknown as number);
+
+      // Written to stderr as given, line breaks and escapes included.
+      expect(warn.mock.calls[0][0]).toContain("a value of type string");
+      expect(warn.mock.calls[0][0]).not.toContain("\u001b");
+    });
+
+    it("still prints the numbers the warning is about", () => {
+      new Summary("a").observe(Number.NaN);
+      new Summary("b").observe(Number.NEGATIVE_INFINITY);
+      new Summary("c").observe(undefined as unknown as number);
+
+      expect(warn.mock.calls[0][0]).toContain("ignored NaN");
+      expect(warn.mock.calls[1][0]).toContain("ignored -Infinity");
+      expect(warn.mock.calls[2][0]).toContain("ignored undefined");
+    });
+  });
+
   it("still throws for a mistake in the call, whatever the value", () => {
     // A missing label fails on every run rather than on unlucky data, so
     // refusing it quietly would only hide the bug.
@@ -465,5 +617,44 @@ describe("non-finite values", () => {
       /without specifying a label/,
     );
     expect(() => summary.observe(Number.NaN)).toThrow(/without specifying one/);
+  });
+});
+
+/**
+ * What a number field of a JSON body holds when the client sent `null`, or
+ * when the sender serialised a NaN. Not a label object, though `typeof` says
+ * "object": taken for one, it reached `Object.keys(null)` and failed the
+ * request being measured.
+ */
+describe("a null in place of the value", () => {
+  const NULL = null as unknown as number;
+
+  it("is taken for a missing one by a counter", () => {
+    const counter = new Counter("orders");
+
+    expect(() => counter.increment(NULL)).not.toThrow();
+
+    expect(counter.getValue()).toBe(1);
+  });
+
+  it("is taken for a missing one by a gauge", () => {
+    const gauge = new Gauge("level", { initialValue: 5 });
+
+    expect(() => gauge.increment(NULL)).not.toThrow();
+    expect(() => gauge.decrement(NULL)).not.toThrow();
+    expect(gauge.getValue()).toBe(5);
+    gauge.setValue(9);
+    expect(() => gauge.setValue(NULL)).not.toThrow();
+    expect(gauge.getValue()).toBe(5);
+  });
+
+  it("is a missing label on a labelled metric", () => {
+    const counter = new Counter<"route">("hits", "d", ["route"]);
+    const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
+
+    expect(() => counter.increment(NULL)).toThrow(/without specifying a label/);
+    expect(() => gauge.increment(NULL)).toThrow(/without specifying a label/);
+    expect(() => gauge.decrement(NULL)).toThrow(/without specifying a label/);
+    expect(() => gauge.setValue(NULL)).toThrow(/without specifying a label/);
   });
 });

@@ -173,6 +173,13 @@ function findExec(source: string, start: number) {
   return undefined;
 }
 
+/**
+ * The number of a procedure in a group, `EXEC dbo.Activate;2 'key'` - by now
+ * usually `;?`, or a digit a word runs on from. The call goes on after it: no
+ * statement opens with either, so this `;` cannot be the end of one.
+ */
+const PROCEDURE_NUMBER = /;\s*[?\d]/y;
+
 function redactExecArguments(sql: string): string {
   let text = sql;
   let searchFrom = 0;
@@ -202,7 +209,10 @@ function redactExecArguments(sql: string): string {
       } else if (text[end] === '"') {
         inQuotedIdentifier = true;
       } else if (text[end] === ";") {
-        break;
+        PROCEDURE_NUMBER.lastIndex = end;
+        if (!PROCEDURE_NUMBER.test(text)) {
+          break;
+        }
       }
       end++;
     }
@@ -262,9 +272,15 @@ export function patchMssql(
         sql = prepared;
         procedure = false;
       }
+      // Names in double quotes only where the driver turns the setting on:
+      // its default and `true`. `null` sends no SET, and the session keeps
+      // the server's own setting, which is OFF as installed - there a double
+      // quote opens a string.
+      const quotedIdentifier =
+        this.parent?.config?.options?.enableQuotedIdentifier;
       const { operation, statement } = describeMssqlStatement(
         procedure ? `EXEC ${sql}` : sql,
-        this.parent?.config?.options?.enableQuotedIdentifier !== false,
+        quotedIdentifier === undefined || quotedIdentifier === true,
         !procedure,
       );
       const span = recorder.open(

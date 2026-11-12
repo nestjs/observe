@@ -13,7 +13,9 @@ import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { CodeFrame, collectCodeFrames } from "../utils/source-context.util.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
+import { fitToLength } from "../utils/fit-to-length.util.js";
 import { LogRedactor } from "../utils/log-redactor.js";
+import type { TraceContext } from "../utils/trace-context.util.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
 import {
   collapseRepeatedSpans,
@@ -25,6 +27,26 @@ import { SkipSpansPredicate } from "./skip-spans.util.js";
 const SNAPSHOT_COMPLETION_TIMEOUT_MS = 1000;
 
 /**
+ * Deepest a span is nested in the tree that is shipped, root span included.
+ *
+ * Far past any call chain written by hand, and about a ninth of the depth at
+ * which the first walk of a tree - building it for shipping, collapsing it,
+ * encoding it, serialising the batch it rides in - runs out of stack. Async
+ * recursion is traced level by level (the instance decorator only keeps a
+ * synchronous call out of the tree), so a method that awaits and then calls
+ * itself once per level of a client's JSON body nested its spans as deep as
+ * the body was, and the batch's `JSON.stringify` threw away every other
+ * operation of the flush window with it.
+ */
+const MAX_SPAN_DEPTH = 256;
+
+/**
+ * A node as the registry keeps it while its trace is open: with its depth,
+ * which nothing outside the registry reads and `toShippedNode` leaves out.
+ */
+type TrackedNode = OngoingTraceEventNode & { depth: number };
+
+/**
  * Tag under which a snapshot records how many spans were left out of its tree
  * because they had not ended when it was shipped - the spans still open and
  * everything recorded under them.
@@ -34,6 +56,28 @@ const SNAPSHOT_COMPLETION_TIMEOUT_MS = 1000;
  * collector release has to come first. Absent on a snapshot shipped whole.
  */
 export const UNFINISHED_SPANS_TAG = "observe.unfinishedSpans";
+
+/**
+ * Tag under which a snapshot records how many spans were never opened because
+ * it had already opened `MAX_SPANS_PER_TRACE`. A tag for the reason
+ * `UNFINISHED_SPANS_TAG` is one. Absent on a snapshot that stayed under it.
+ */
+export const UNRECORDED_SPANS_TAG = "observe.unrecordedSpans";
+
+/**
+ * Most spans one operation opens, manual ones included. Past it a traced
+ * call runs as it would untraced, and is counted under `UNRECORDED_SPANS_TAG`.
+ *
+ * Every span is a node, an id and a map entry the registry holds until the
+ * operation ends - about 300 bytes - and `spanCollapse` bounds only what is
+ * shipped, once it has ended. So a handler that calls a provider once per
+ * element of a list it was sent let the sender decide how much the agent
+ * held: one 12 MB WebSocket message ran a process out of heap, and an HTTP
+ * body within the default limit stalled the event loop for seconds as its
+ * spans were collapsed. Ten thousand is far past what a request makes and
+ * what the collapsed tree shows, and about 3 MB per open operation.
+ */
+const MAX_SPANS_PER_TRACE = 10_000;
 
 type TraceId = string;
 type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
@@ -55,6 +99,11 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    */
   errorStatusCode?: number;
   /**
+   * `errorStatusCode` as an outgoing call's span with no span around it
+   * would set it - see `endTrace` for when it counts.
+   */
+  outgoingErrorStatusCode?: number;
+  /**
    * The name `TracerService.setOperationId` gave the operation, put in place
    * on hand-off. Held apart until then so that the transport's own naming -
    * the route hook, which fires after middleware, and the GraphQL root field -
@@ -62,7 +111,37 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    * is applied.
    */
   customOperationId?: string;
+  /**
+   * Set by `keepWithoutSpans`: the operation is reported even if no span was
+   * recorded under it, which `endTrace` otherwise takes to mean no handler
+   * ran.
+   */
+  keptWithoutSpans?: true;
+  /**
+   * How many errors `captureError` has recorded in full for this operation -
+   * see `MAX_CAPTURED_ERRORS_PER_TRACE`. Absent until the first.
+   */
+  capturedErrors?: number;
+  /**
+   * How many spans were not opened because the operation had already opened
+   * `MAX_SPANS_PER_TRACE` - shipped as `UNRECORDED_SPANS_TAG`. Absent until
+   * the first.
+   */
+  unrecordedSpans?: number;
 };
+
+/**
+ * Most errors `captureError` records in full for one operation, as many as
+ * repeated siblings it takes to collapse a group (`spanCollapse.threshold`).
+ *
+ * Building a payload redacts the whole message and the whole stack, which
+ * repeats the message, so a handler reporting each rejected row of a client's
+ * list paid rows x message length on the request thread - seconds for one
+ * 100 kB body - and, captured on a span per row, kept every payload until the
+ * flush. Past the limit a span is still marked as failed and its tags still
+ * merge; it only goes without the details.
+ */
+const MAX_CAPTURED_ERRORS_PER_TRACE = 20;
 
 /**
  * An error the business logic did not model. `IntrinsicException` is what Nest
@@ -83,6 +162,189 @@ function ignoreFailure(fn: () => unknown): void {
   } catch {
     // The span is a side effect of the call, not part of its outcome.
   }
+}
+
+/**
+ * The most of an error's message, and of its stack, that is recorded.
+ *
+ * Both are as long as whoever threw made them, and a message that quotes the
+ * request - `No product with sku ${sku}` - is as long as a client made it. V8
+ * repeats the message at the head of the stack, and a failed operation carries
+ * the error on its root span and on itself, so uncut, each such request held
+ * its text four times over until the flush - and the flush, which writes the
+ * batch to a 16 MB slot, threw the whole batch away over a few of them.
+ */
+const MAX_ERROR_MESSAGE_LENGTH = 4 * 1024;
+const MAX_ERROR_STACK_LENGTH = 8 * 1024;
+/**
+ * How much of a cut stack's head is kept - the error's name and the start of
+ * its message. The rest of the limit goes to its tail, the frames.
+ */
+const ERROR_STACK_HEAD_LENGTH = 2 * 1024;
+const ERROR_TEXT_CUT = "... [truncated by observe]";
+
+/** The first `length` characters, not ending in half a surrogate pair. */
+function headOf(text: string, length: number): string {
+  const last = text.charCodeAt(length - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? length - 1 : length);
+}
+
+/**
+ * Its own copy of a cut: a slice keeps the whole of the text it was taken
+ * from alive for as long as the slice itself is.
+ */
+function copyOf(text: string): string {
+  return Buffer.from(text, "utf8").toString("utf8");
+}
+
+/** An error's message, cut to the most of it that is recorded. */
+function fitErrorMessage(message: string): string {
+  if (
+    typeof message !== "string" ||
+    message.length <= MAX_ERROR_MESSAGE_LENGTH
+  ) {
+    return message;
+  }
+  return copyOf(
+    headOf(message, MAX_ERROR_MESSAGE_LENGTH - ERROR_TEXT_CUT.length) +
+      ERROR_TEXT_CUT,
+  );
+}
+
+/**
+ * An error's stack, cut to the most of it that is recorded: its head and its
+ * tail, since a stack opens with the message and closes with the frames,
+ * which a cut message would otherwise push out of it altogether. The tail
+ * starts on a line of its own where it can.
+ */
+function fitErrorStack(stack: string | undefined): string | undefined {
+  if (typeof stack !== "string" || stack.length <= MAX_ERROR_STACK_LENGTH) {
+    return stack;
+  }
+  const tailLength =
+    MAX_ERROR_STACK_LENGTH - ERROR_STACK_HEAD_LENGTH - ERROR_TEXT_CUT.length;
+  let tailStart = stack.length - tailLength;
+  const line = stack.indexOf("\n", tailStart);
+  if (line !== -1) {
+    tailStart = line;
+  } else {
+    const first = stack.charCodeAt(tailStart);
+    if (first >= 0xdc00 && first <= 0xdfff) {
+      tailStart += 1;
+    }
+  }
+  return copyOf(
+    headOf(stack, ERROR_STACK_HEAD_LENGTH) +
+      ERROR_TEXT_CUT +
+      stack.slice(tailStart),
+  );
+}
+
+/**
+ * Longest span name the collector takes - the encoder's own limit, which it
+ * cuts every name to on the way out.
+ */
+const MAX_SPAN_NAME_LENGTH = 255;
+
+/**
+ * Longest manual span name that is read to be cut. A name is as long as the
+ * code that opened the span made it, often from a string of a client's, and
+ * a name built by concatenation is written out whole the first time any of
+ * it is read - so a span per row of a client's list, each named after a long
+ * string, cost rows x length on the request thread, however little of each
+ * name was kept. A longer one is recorded by its length alone.
+ */
+const MAX_READ_SPAN_NAME_LENGTH = 4 * 1024;
+
+/** A manual span's name, as its node holds it until the trace ships. */
+function fitManualSpanName(name: string): string {
+  // Typed, but passed from code nothing checks at run time; left as it is.
+  if (typeof name !== "string" || name.length <= MAX_SPAN_NAME_LENGTH) {
+    return name;
+  }
+  if (name.length > MAX_READ_SPAN_NAME_LENGTH) {
+    return `[span name of ${name.length} characters]`;
+  }
+  return fitToLength(name, MAX_SPAN_NAME_LENGTH);
+}
+
+/**
+ * A thrown value, or an error's message, as text - whatever it is.
+ *
+ * Neither is what its type says for certain. A microservice client rejects
+ * with the JSON object the remote service sent as its error, and a driver
+ * copies a server reply's fields onto the error it throws; `String()` throws
+ * on `{"toString": 1}`, and that was thrown back at the code recording the
+ * failure - a handler that reported it and answered with a fallback
+ * answered 500 instead.
+ */
+function toErrorText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    // oxlint-disable-next-line typescript/no-base-to-string -- recorded as `String()` always recorded it
+    return String(value);
+  } catch {
+    try {
+      return Object.prototype.toString.call(value);
+    } catch {
+      return "[unprintable value]";
+    }
+  }
+}
+
+/** An error's stack, when it has one that is text. */
+function stackOf(error: Error): string | undefined {
+  try {
+    const stack: unknown = error.stack;
+    return typeof stack === "string" ? stack : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The name of a thrown value's class, when it can be read. */
+function classNameOf(error: unknown): string | undefined {
+  try {
+    const constructor = (error as { constructor?: unknown } | null | undefined)
+      ?.constructor;
+    if (typeof constructor !== "function") {
+      return undefined;
+    }
+    const name: unknown = constructor.name;
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** An absolute-form request target: `http://api.example.com/graphql?query=`. */
+const ABSOLUTE_URL = /^[a-z][a-z\d+.-]*:\/\//i;
+
+/**
+ * The URL of a request that nothing named - no route, no GraphQL resolver -
+ * without its query string.
+ *
+ * Its query string is masked by parameter name only, and nothing says what
+ * it holds: over GET, a GraphQL endpoint's is the operation itself, string
+ * literals and `variables` included, which the GraphQL agent's request hook
+ * blanks - and the hook did not run for a request that is still unnamed: a
+ * middleware refused it, it is a persisted query sent by its hash, or the
+ * endpoint is one the hook is not registered for. Anything that is not a
+ * request target - a GraphQL document - is left as it is.
+ */
+function withoutQueryString(
+  originalUrl: string | undefined,
+): string | undefined {
+  if (
+    typeof originalUrl !== "string" ||
+    !(originalUrl.startsWith("/") || ABSOLUTE_URL.test(originalUrl))
+  ) {
+    return originalUrl;
+  }
+  const queryAt = originalUrl.indexOf("?");
+  return queryAt === -1 ? originalUrl : originalUrl.slice(0, queryAt);
 }
 
 /** A node and everything below it. */
@@ -165,6 +427,17 @@ export class OperationTraceRegistry {
    * would bury everything else in the log. Full text once, one line after.
    */
   private hasReportedMissingInstrumentation = false;
+  /** See `reportSpanDepthLimit`. */
+  private hasReportedSpanDepthLimit = false;
+  /** See `reportCapturedErrorLimit`. */
+  private hasReportedCapturedErrorLimit = false;
+  /** See `countUnrecordedSpan`. */
+  private hasReportedSpanLimit = false;
+  /**
+   * Root spans of outgoing calls - a query, an HTTP call - that ended with
+   * an error. See `endTrace` for what they decide.
+   */
+  private readonly failedOutgoingRoots = new WeakSet<object>();
   /**
    * Applied to every tree as it is plucked. Defaults are live from
    * construction rather than waiting for `configureSpanCollapse`, so a
@@ -197,6 +470,16 @@ export class OperationTraceRegistry {
    * switched off explicitly.
    */
   private redactor: LogRedactor | null = new LogRedactor();
+  /**
+   * The W3C trace context each operation arrived with, by snapshot.
+   *
+   * Beside the snapshot rather than on it: both encoders map every key a
+   * snapshot has onto the wire, and the collector refuses a batch carrying a
+   * key it does not know. The snapshot object `startTrace` builds is the one
+   * `pluckSnapshot` hands out, so whoever receives it can still look its
+   * context up - and the entry goes when the snapshot does.
+   */
+  private readonly traceContexts = new WeakMap<object, TraceContext>();
 
   constructor(
     private readonly als: AsyncLocalStorage<
@@ -248,10 +531,10 @@ export class OperationTraceRegistry {
   private toErrorPayload(error: Error | string | object) {
     const raw =
       error instanceof Error
-        ? { message: error.message, stack: error.stack }
-        : { message: String(error), stack: undefined };
+        ? { message: toErrorText(error.message), stack: stackOf(error) }
+        : { message: toErrorText(error), stack: undefined };
     // Redacted here, at the one point every error payload passes through.
-    const payload = this.redactor
+    const redacted = this.redactor
       ? {
           message: this.redactor.redactMessage(raw.message),
           stack:
@@ -260,6 +543,11 @@ export class OperationTraceRegistry {
               : this.redactor.redactMessage(raw.stack),
         }
       : raw;
+    // Cut once redacted, so no rule is handed half of what it matches.
+    const payload = {
+      message: fitErrorMessage(redacted.message),
+      stack: fitErrorStack(redacted.stack),
+    };
 
     const result: {
       cls?: string;
@@ -269,8 +557,9 @@ export class OperationTraceRegistry {
       tags?: Record<string, string | number | boolean>;
     } = payload;
 
-    if (typeof error?.constructor === "function") {
-      result.cls = error.constructor.name;
+    const cls = classNameOf(error);
+    if (cls !== undefined) {
+      result.cls = cls;
     }
 
     if (this.sourceContext !== false) {
@@ -278,20 +567,15 @@ export class OperationTraceRegistry {
       // Read off the raw stack with the raw message: the message is what marks
       // where the frames start, and it only matches the stack it came from.
       // Nothing of either is shipped from here - just the file positions.
+      // Source is as likely to hold a literal secret as a message is, and
+      // goes to the same place.
       const codeFrames = collectCodeFrames(raw.stack, {
         ...settings,
         message: raw.message,
+        redactor: this.redactor ?? undefined,
       });
       if (codeFrames) {
-        // Source is as likely to hold a literal secret as a message is, and
-        // goes to the same place.
-        const redactor = this.redactor;
-        result.codeFrames = redactor
-          ? codeFrames.map((frame) => ({
-              ...frame,
-              lines: redactor.redactSource(frame.lines),
-            }))
-          : codeFrames;
+        result.codeFrames = codeFrames;
       }
     }
 
@@ -333,6 +617,8 @@ export class OperationTraceRegistry {
      * key - a job inheriting the id of the operation that enqueued it.
      */
     reportedTraceId: string = traceId,
+    /** The `traceparent` the operation arrived with, when it had one. */
+    traceContext?: TraceContext,
   ): void {
     if (this.traceSnapshots.has(traceId)) {
       this.logger.warn(
@@ -352,6 +638,17 @@ export class OperationTraceRegistry {
       refsMarkedAsComplete: 0,
     };
     this.traceSnapshots.set(traceId, snapshot);
+    if (traceContext) {
+      this.traceContexts.set(snapshot, traceContext);
+    }
+  }
+
+  /**
+   * The `traceparent` a snapshot's operation arrived with, if it had one -
+   * for the exporter, which puts the operation under the caller's span.
+   */
+  traceContextOf(snapshot: object): TraceContext | undefined {
+    return this.traceContexts.get(snapshot);
   }
 
   endTrace(traceId: string): void;
@@ -377,15 +674,24 @@ export class OperationTraceRegistry {
         // recorded a span for it. Both at once has one cause: the instance
         // decorator never wrapped the providers, because `instrument` never
         // reached NestFactory.
+        //
+        // Dropped before the line is written, not after: a logger taken from
+        // the container is wrapped like any provider and writes inside this
+        // operation's async store, so with the trace still registered every
+        // call it makes on itself opened a span here - in a span map nothing
+        // would ever free again.
+        this.abandonTrace(traceId);
         this.reportMissingInstrumentation(snapshot);
-        this.traceSnapshots.delete(traceId);
         return;
       }
 
       // Ignore snapshots that have no traces as that means
-      // the request didnt even have a handler in the first place
-      this.traceSnapshots.delete(traceId);
-      return;
+      // the request didnt even have a handler in the first place - unless
+      // the transport said the operation is complete without one.
+      if (!snapshot.keptWithoutSpans) {
+        this.abandonTrace(traceId);
+        return;
+      }
     }
     // Set by `startTrace` and deleted a few lines below, so it is always there
     // for a snapshot still in the registry. The fallback keeps a duration of 0
@@ -397,8 +703,18 @@ export class OperationTraceRegistry {
       "statusCode" in opts && typeof opts.statusCode === "number"
         ? opts.statusCode
         : undefined;
+    // An outgoing call's error at the root (see `internalEndTraceStep`) may
+    // have been caught and answered: a duplicate key turned into a 409, a
+    // failed lookup into a 200 with a fallback. A transport that reports a
+    // status code says how the operation ended, so there it does not stand in
+    // for one; on one that reports none, it is all there is to go on.
     const errorStatusCode =
-      "protocol" in snapshot ? snapshot.errorStatusCode : undefined;
+      "protocol" in snapshot
+        ? snapshot.errorStatusCode ??
+          (reportedStatusCode === undefined
+            ? snapshot.outgoingErrorStatusCode
+            : undefined)
+        : undefined;
 
     // A root span that threw outranks a success status code reported by the
     // transport. Two cases need this. Transports that carry no status code of
@@ -425,22 +741,54 @@ export class OperationTraceRegistry {
     }
 
     if ("userId" in opts && typeof opts.userId !== "undefined") {
-      const requestSnapshot = snapshot as RequestSnapshot;
-      requestSnapshot.userId = String(opts.userId);
+      // Typed as a string, but a transport passes on what `getUserId`
+      // returned, and `String()` throws on `{"toString": 1}`. Thrown here,
+      // between ending the trace and plucking it, it left the trace
+      // registered for good; the trace goes without a user id instead.
+      let userId: string | undefined;
+      try {
+        // oxlint-disable-next-line typescript/no-unnecessary-type-conversion -- typed a string, but whatever `getUserId` returned
+        userId = String(opts.userId);
+      } catch {
+        userId = undefined;
+      }
+      if (userId !== undefined) {
+        (snapshot as RequestSnapshot).userId = userId;
+      }
     }
 
     delete snapshot.startTimestamp; // Clean up to avoid confusion
 
     if (snapshot.traces && snapshot.traces.length > 0) {
-      // Iterate through root traces to check if any have errors
+      // The first root span that failed gives the operation its error. An
+      // outgoing call's counts only where nothing else did and the operation
+      // failed by its status - or reported none: otherwise its error was
+      // caught and answered, and recording it as the operation's put the
+      // driver's message, bound values and all, in place of what the
+      // application returned.
+      let outgoing: (typeof snapshot.traces)[number] | undefined;
+      let found = false;
       for (const trace of snapshot.traces) {
-        if ("error" in trace && trace.error) {
-          // If any root trace has an error, we mark the entire snapshot as having an error
-          if (typeof trace.error === "object") {
-            snapshot.error = trace.error;
-          }
-          break; // No need to check further once an error is found
+        if (!("error" in trace) || !trace.error) {
+          continue;
         }
+        if (this.failedOutgoingRoots.has(trace)) {
+          outgoing ??= trace;
+          continue;
+        }
+        if (typeof trace.error === "object") {
+          snapshot.error = trace.error;
+        }
+        found = true;
+        break;
+      }
+      if (
+        !found &&
+        typeof outgoing?.error === "object" &&
+        (reportedStatusCode === undefined ||
+          (typeof statusCode === "number" && statusCode >= 500))
+      ) {
+        snapshot.error = outgoing.error;
       }
     }
   }
@@ -532,6 +880,12 @@ export class OperationTraceRegistry {
     if (!snapshot) {
       return undefined;
     }
+    // No step, as for an operation that is not recorded: every caller then
+    // runs the call untraced and closes nothing.
+    if (snapshot.refsCounter >= MAX_SPANS_PER_TRACE) {
+      this.countUnrecordedSpan(snapshot);
+      return undefined;
+    }
     snapshot.refsCounter += 1;
 
     const newNodeId = spanId ?? uuidv7();
@@ -542,7 +896,7 @@ export class OperationTraceRegistry {
     // span: V8 hands back a batch afterwards, so there is nothing to label at
     // the moment a sample fires.
     activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
-    const newNode: OngoingTraceEventNode = {
+    const newNode: TrackedNode = {
       origin: "auto",
       type: "start",
       className,
@@ -556,6 +910,9 @@ export class OperationTraceRegistry {
       // store (CALLER_METADATA_KEY), so the two sides agree by construction
       // instead of by a timing heuristic. It costs a uuid per span on the wire.
       spanId: newNodeId,
+      // Set where the node is attached; in the literal so every node has the
+      // same shape from the start.
+      depth: 1,
     };
 
     let refsByCaller = this.callerIdsByTraceId.get(traceId);
@@ -583,21 +940,55 @@ export class OperationTraceRegistry {
    * ending after its caller did, is already tolerated in
    * `internalEndTraceStep`. Auto and manual spans both attach through here, so
    * they share the tolerance.
+   *
+   * A node past `MAX_SPAN_DEPTH` is kept out of its caller's children, and so
+   * out of the shipped tree, and everything opened under it goes the same
+   * way. Nothing else about it changes: it still has its parent, so an error
+   * it ends with is not taken for the operation's own, and it is still
+   * registered and counted, so the calls under it find their caller and the
+   * trace completes when it would have.
    */
   private attachToCaller(
     snapshot: SnapshotWithSignal,
     refsByCaller: Map<string | undefined, OngoingTraceEventNode> | undefined,
     callerId: string | undefined,
-    newNode: OngoingTraceEventNode,
+    newNode: TrackedNode,
   ): void {
-    const caller = callerId ? refsByCaller?.get(callerId) : undefined;
+    // Every node in the map was opened by this registry, with its depth.
+    const caller = (callerId ? refsByCaller?.get(callerId) : undefined) as
+      | TrackedNode
+      | undefined;
     if (caller?.type === "start") {
-      caller.children.push(newNode);
       newNode.parent = caller;
+      newNode.depth = caller.depth + 1;
+      if (newNode.depth <= MAX_SPAN_DEPTH) {
+        caller.children.push(newNode);
+      } else {
+        this.reportSpanDepthLimit(snapshot, newNode);
+      }
     } else {
       // No (live) caller means insert trace at the root level
       snapshot.traces.push(newNode);
     }
+  }
+
+  /**
+   * Once for the process: a chain that deep comes from one recursive method,
+   * which recurses that deep on every request it is given the same input.
+   * Flagged before the line is written, which an instrumented logger records
+   * as one more span of the same chain.
+   */
+  private reportSpanDepthLimit(
+    snapshot: SnapshotWithSignal,
+    node: TrackedNode,
+  ): void {
+    if (this.hasReportedSpanDepthLimit) {
+      return;
+    }
+    this.hasReportedSpanDepthLimit = true;
+    this.logger.warn(
+      `Trace "${snapshot.traceId}" is reported without the spans nested more than ${MAX_SPAN_DEPTH} levels deep, from "${node.className}#${node.methodKey}" down. A method that calls itself once per level of its input traces each level. Later traces this deep are not reported.`,
+    );
   }
 
   internalEndTraceStep(
@@ -615,6 +1006,8 @@ export class OperationTraceRegistry {
     // other unknown caller.
     callerId: string | undefined,
     error?: Error | string | object,
+    /** The span is an outgoing call's, opened by `OutgoingSpanRecorder`. */
+    outgoing = false,
   ): void {
     const snapshot = this.traceSnapshots.get(traceId);
     if (!snapshot) {
@@ -662,14 +1055,23 @@ export class OperationTraceRegistry {
 
     if (error && !activeTrace.error) {
       const isRootSpan = !parent;
-      if (isRootSpan) {
+      if (isRootSpan && outgoing) {
+        // An outgoing call at the root ran outside every traced call of the
+        // operation - most often a query in a cold Observable, run when Nest
+        // subscribed, after the provider that built it had returned. Whoever
+        // handles its error is not traced, so the error says nothing yet of
+        // how the operation ended: `endTrace` decides what it counts for.
+        snapshot.outgoingErrorStatusCode = this.toErrorStatusCode(error);
+        this.failedOutgoingRoots.add(activeTrace);
+      } else if (isRootSpan) {
         // Only a root span decides this: an error thrown deeper down may well
         // have been caught and handled by its caller, in which case the
         // operation did not fail at all.
         snapshot.errorStatusCode = this.toErrorStatusCode(error);
-
-        // If this is the root span, we can directly set the error on the snapshot
-        // if it's a non-intrinsic error
+      }
+      if (isRootSpan) {
+        // A root span keeps the error's details: it may become the
+        // operation's own.
         if (typeof error === "object") {
           activeTrace.error = this.toErrorPayload(error);
         } else {
@@ -838,7 +1240,61 @@ export class OperationTraceRegistry {
     // Merge tags
     Object.assign(targetSpan.tags, tags);
 
+    const captured = snapshot.capturedErrors ?? 0;
+    if (captured >= MAX_CAPTURED_ERRORS_PER_TRACE) {
+      // A span that already holds the details of one keeps them.
+      targetSpan.error ??= true;
+      this.reportCapturedErrorLimit(reportedTraceId);
+      return;
+    }
+    snapshot.capturedErrors = captured + 1;
     targetSpan.error = this.toErrorPayload(error);
+  }
+
+  /**
+   * Once for the process: the operation that gets here does so on every
+   * request it is given the same input.
+   */
+  private reportCapturedErrorLimit(reportedTraceId: string): void {
+    if (this.hasReportedCapturedErrorLimit) {
+      return;
+    }
+    this.hasReportedCapturedErrorLimit = true;
+    this.logger.warn(
+      `Trace "${reportedTraceId}" captured more than ${MAX_CAPTURED_ERRORS_PER_TRACE} errors; the spans of later ones are marked as failed, without the error's details. Later traces past this limit are not reported.`,
+    );
+  }
+
+  /**
+   * Counts a span left unopened by `MAX_SPANS_PER_TRACE`. Warned once for
+   * the process: an operation that gets there does so on every request it is
+   * given the same input.
+   */
+  private countUnrecordedSpan(snapshot: SnapshotWithSignal): void {
+    snapshot.unrecordedSpans = (snapshot.unrecordedSpans ?? 0) + 1;
+    if (this.hasReportedSpanLimit) {
+      return;
+    }
+    this.hasReportedSpanLimit = true;
+    this.logger.warn(
+      `Trace "${snapshot.traceId}" opened ${MAX_SPANS_PER_TRACE} spans; the calls it makes after that run untraced, and the snapshot counts them under the "${UNRECORDED_SPANS_TAG}" tag. Later traces past this limit are not reported.`,
+    );
+  }
+
+  /**
+   * Reports the trace even if it ends with no span recorded under it.
+   *
+   * `endTrace` drops such a trace, as a request no handler ran for. A CORS
+   * preflight that `http.tracePreflights` asked for is the one operation that
+   * is complete without a handler: the CORS layer answers it before any
+   * route, and - on Fastify from `@nestjs/platform-fastify` 12.1.3 - before
+   * any middleware that could record a span for it.
+   */
+  keepWithoutSpans(traceId: TraceId): void {
+    const snapshot = this.traceSnapshots.get(traceId);
+    if (snapshot) {
+      snapshot.keptWithoutSpans = true;
+    }
   }
 
   /**
@@ -897,14 +1353,44 @@ export class OperationTraceRegistry {
       }
       cleanup();
 
-      // These four are what distinguish the registry's working copy from the
+      // These are what distinguish the registry's working copy from the
       // snapshot the API receives, so removing them is the hand-off.
       const bookkeeping = snapshot as Partial<SnapshotWithSignal>;
       const customOperationId = bookkeeping.customOperationId;
+      const unrecordedSpans = bookkeeping.unrecordedSpans;
+      if (unrecordedSpans !== undefined) {
+        // A copy: the object `startTrace` was given is the transport's `tags`
+        // option, shared by every operation it reports.
+        snapshot.tags = {
+          ...snapshot.tags,
+          [UNRECORDED_SPANS_TAG]: unrecordedSpans,
+        };
+      }
+      delete bookkeeping.unrecordedSpans;
       delete bookkeeping.refsCounter;
       delete bookkeeping.refsMarkedAsComplete;
       delete bookkeeping.errorStatusCode;
+      delete bookkeeping.outgoingErrorStatusCode;
       delete bookkeeping.customOperationId;
+      delete bookkeeping.keptWithoutSpans;
+      delete bookkeeping.capturedErrors;
+
+      // Before a custom name is applied: a request is named after its URL
+      // when nothing else named it - by the buffer, or below as the name a
+      // custom one replaces - and that URL is then sent without its query
+      // string. Here, at the one point every request snapshot is handed on,
+      // ahead of the buffer and of the OTLP export that reads it too.
+      if (
+        "protocol" in snapshot &&
+        snapshot.operationId == null &&
+        snapshot.attributes?.originalUrl !== undefined
+      ) {
+        const originalUrl = withoutQueryString(snapshot.attributes.originalUrl);
+        if (originalUrl !== snapshot.attributes.originalUrl) {
+          // A copy: the transport may share the object it was given.
+          snapshot.attributes = { ...snapshot.attributes, originalUrl };
+        }
+      }
 
       // Before `skipSpans`, which judges the operation by the name it is
       // reported under.
@@ -1108,6 +1594,11 @@ export class OperationTraceRegistry {
     name: string,
     spanFunction: (span: TraceSpanDelegate) => any,
   ) {
+    if (snapshot.refsCounter >= MAX_SPANS_PER_TRACE) {
+      this.countUnrecordedSpan(snapshot);
+      return spanFunction(new TraceSpanDelegate("", name, {}));
+    }
+
     // Book the span in the same ledger auto spans use. Completion goes through
     // internalEndTraceStep, which increments refsMarkedAsComplete - without
     // the matching increment here, every completed manual span pushed the
@@ -1124,12 +1615,14 @@ export class OperationTraceRegistry {
     // completion no-ops and the span's execution time is silently attributed
     // to its parent - profile correlation for manual spans found nothing.
     activeSliceRecorder()?.enter(traceId, newNodeId, startTime);
-    const manualSpan: OngoingTraceEventNode = {
+    const manualSpan: TrackedNode = {
       // Same identity rule as auto spans: the span id *is* the caller id it is
       // registered under, so a log line written inside this span carries an id
       // that resolves back to this node.
       spanId: newNodeId,
-      name,
+      // Cut as the span opens, so the tree never holds a long name; the
+      // callback's delegate keeps the one it was given.
+      name: fitManualSpanName(name),
       origin: "manual",
       type: "start",
       className: labels.className,
@@ -1137,6 +1630,7 @@ export class OperationTraceRegistry {
       startTime,
       startOffset: this.toStartOffset(snapshot, startTime),
       children: [],
+      depth: 1,
     };
     let refsByCaller = this.callerIdsByTraceId.get(traceId);
     this.attachToCaller(snapshot, refsByCaller, callerId, manualSpan);
@@ -1175,7 +1669,7 @@ export class OperationTraceRegistry {
     };
 
     const tags = {} as Record<string, string | number | boolean>;
-    const delegate = new TraceSpanDelegate(newNodeId, manualSpan.name, tags);
+    const delegate = new TraceSpanDelegate(newNodeId, name, tags);
     manualSpan.tags = tags;
     const store = this.als.getStore();
     return this.als.run(

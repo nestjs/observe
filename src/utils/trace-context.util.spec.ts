@@ -1,3 +1,5 @@
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import {
   formatTraceparent,
   randomSpanId,
@@ -95,6 +97,36 @@ describe("readTraceContext", () => {
     expect(traceState!.length).toBeLessThanOrEqual(512);
     expect(entries.join(",").startsWith(traceState!)).toBe(true);
     expect(traceState!.endsWith("v")).toBe(true);
+  });
+});
+
+describe("readTraceContext and the header it was read from", () => {
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+
+  /** Heap still in use once `make`'s garbage is gone and its result kept. */
+  const retainedBy = (make: () => unknown) => {
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    const kept = make();
+    gc();
+    const after = process.memoryUsage().heapUsed;
+    expect(kept).toBeDefined();
+    return after - before;
+  };
+
+  // A version past 00 may carry anything after its flags, and a job's or a
+  // packet's metadata is not held to a header's size: the context outlives
+  // the request in the OTLP retry queue, and must not hold all of that.
+  it("keeps none of a long traceparent alive, nor of a long tracestate", () => {
+    // Made inside, so that nothing but the context can keep them.
+    const retained = retainedBy(() =>
+      readTraceContext({
+        traceparent: `cc-${TRACE_ID}-${PARENT_ID}-01-${"x".repeat(16 * 1024 * 1024)}`,
+        tracestate: `${" ".repeat(8 * 1024 * 1024)}vendor=abc`,
+      }),
+    );
+    expect(retained).toBeLessThan(4 * 1024 * 1024);
   });
 });
 

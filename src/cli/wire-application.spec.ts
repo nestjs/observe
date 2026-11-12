@@ -3,6 +3,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -50,6 +51,28 @@ describe("wireApplication", () => {
   const read = (path: string) => readFileSync(join(cwd, path), "utf8");
   const wire = (main = "src/main.ts") =>
     wireApplication(ts, cwd, main, "orders-api");
+
+  // A link out of the tree, or a `../` import: the file is some other
+  // application's, which the person never asked to have rewritten.
+  it.each([["src/main.ts"], ["src/app.module.ts"]])(
+    "leaves the wiring to the person when %s leads out of the project",
+    (linked) => {
+      const outside = mkdtempSync(join(tmpdir(), "observe-outside-"));
+      try {
+        write("src/app.module.ts", NEST_NEW_MODULE);
+        write("src/main.ts", NEST_NEW_MAIN);
+        const original = read(linked);
+        writeFileSync(join(outside, "theirs.ts"), original);
+        rmSync(join(cwd, linked));
+        symlinkSync(join(outside, "theirs.ts"), join(cwd, linked));
+
+        expect(wire()).toMatchObject({ kind: "manual" });
+        expect(readFileSync(join(outside, "theirs.ts"), "utf8")).toBe(original);
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("wires a nest new project the way nest new --observe generates it", () => {
     write("src/app.module.ts", NEST_NEW_MODULE);

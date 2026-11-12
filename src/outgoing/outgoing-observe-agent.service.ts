@@ -14,6 +14,7 @@ import {
   loadAsResolvedBy,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
+import { toGlobalRegExp } from "../utils/redact-url-query.js";
 import type { TraceContext } from "../utils/trace-context.util.js";
 import { subscribeOutgoingHttp } from "./http.integration.js";
 import {
@@ -26,6 +27,11 @@ import { patchMssql } from "./mssql.integration.js";
 import { patchMysql2 } from "./mysql2.integration.js";
 import { OutgoingSpanRecorder } from "./outgoing-span.recorder.js";
 import { patchPg } from "./pg.integration.js";
+import {
+  patchUndiciDispatch,
+  patchUndiciUnwrap,
+} from "./undici.integration.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 /**
  * Spans for what leaves the process: database queries and outbound HTTP.
@@ -105,7 +111,7 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     operationTraceRegistry: OperationTraceRegistry,
     asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
     /**
-     * Says whether the collector takes this app's telemetry, which W3C Trace
+     * Says whether the agent reports to NestJS Observe, which W3C Trace
      * Context waits on. Absent only where a test builds the service by hand,
      * and interop then stays off.
      */
@@ -146,13 +152,32 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     }
 
     if (outgoing?.http !== false) {
+      // undici creates a request, and publishes the channel read below, in
+      // whatever context the dispatch that hands it to a client runs in -
+      // for a queued pool request or a followed redirect, another request's.
+      // Loaded by deep path: undici's entry point would install its own
+      // `Agent` as the global `fetch` dispatcher.
+      this.patchDriver(
+        "undici",
+        "undici/lib/dispatcher/dispatcher-base",
+        [],
+        patchUndiciDispatch,
+      );
+      this.patchDriver(
+        "undici",
+        "undici/lib/handler/unwrap-handler",
+        [],
+        patchUndiciUnwrap,
+      );
       const http = typeof outgoing?.http === "object" ? outgoing.http : {};
       this.unsubscribeHttp = subscribeOutgoingHttp(
         recorder,
         () => {
           const store = asyncLocalStorage.getStore();
-          const traceId: unknown = store?.get(this.options.traceIdKey);
-          if (typeof traceId !== "string") {
+          // A call a finished operation's timer makes, past the grace
+          // period, carries none of its ids.
+          const traceId = liveTraceId(store, this.options.traceIdKey);
+          if (traceId === undefined) {
             return undefined;
           }
           const traceContext = store?.get(TRACE_CONTEXT_KEY) as
@@ -163,12 +188,13 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
         http,
         () => operationTraceRegistry.getRedactor(),
         // W3C Trace Context goes out only with `openTelemetry` on, and only
-        // while the collector takes this app's telemetry - see
-        // `ObserveAgentSharedBuffer.isIngesting`.
+        // while the agent reports to NestJS Observe - see
+        // `ObserveAgentSharedBuffer.isReporting`.
         () =>
           this.options.openTelemetry === true &&
           http.traceContext !== false &&
-          this.observeAgentSharedBuffer?.isIngesting() === true,
+          this.observeAgentSharedBuffer?.isReporting() === true,
+        toGlobalRegExp(this.options.http?.queryParamsObfuscateRegex),
       );
       // Model calls are read off the spans above, so they go with them.
       if (outgoing?.llm !== false) {

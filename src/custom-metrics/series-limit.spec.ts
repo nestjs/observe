@@ -1,6 +1,7 @@
 import type { MockInstance } from "vitest";
 import { Counter, MAX_SERIES_PER_METRIC } from "./counter.js";
 import { Gauge } from "./gauge.js";
+import { Summary } from "./summary.js";
 
 describe("series cardinality cap", () => {
   let warn: MockInstance;
@@ -88,6 +89,72 @@ describe("series cardinality cap", () => {
       );
     });
   });
+
+  /**
+   * A summary that declared no labels takes any. Its window is cleared only
+   * when a flush is written, which an agent sending nothing - switched off,
+   * or without credentials - never does: each new label stayed for the life
+   * of the process.
+   */
+  describe("summary without declared labels", () => {
+    const observeEach = (summary: Summary<string>, n: number, from = 0) => {
+      for (let i = from; i < from + n; i++) {
+        summary.observe(1, `user-${i}`);
+      }
+    };
+
+    it("stops taking labels at the cap, keeping the ones it has", () => {
+      const summary = new Summary<string>("search_ms");
+
+      observeEach(summary, MAX_SERIES_PER_METRIC + 500);
+      summary.observe(7, "user-0");
+
+      const observations = summary.observations;
+      expect(Object.keys(observations)).toHaveLength(MAX_SERIES_PER_METRIC);
+      expect(observations["user-0"]).toBe(2);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('"search_ms"');
+    });
+
+    it("takes them again in the next window, without another warning", () => {
+      const summary = new Summary<string>("search_ms");
+      observeEach(summary, MAX_SERIES_PER_METRIC + 1);
+
+      summary.markFlushed();
+      observeEach(summary, MAX_SERIES_PER_METRIC + 1, 5_000);
+
+      expect(Object.keys(summary.observations)).toHaveLength(
+        MAX_SERIES_PER_METRIC,
+      );
+      expect(summary.observations["user-5000"]).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a label longer than the collector accepts", () => {
+      const summary = new Summary<string>("search_ms");
+
+      summary.observe(1, "a".repeat(256));
+      summary.observe(1, "b".repeat(90_000));
+      summary.observe(1, "c".repeat(255));
+
+      expect(Object.keys(summary.observations)).toEqual(["c".repeat(255)]);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves a summary that declared its labels alone", () => {
+      const labels = Array.from(
+        { length: MAX_SERIES_PER_METRIC + 1 },
+        (_, i) => `l${i}`,
+      );
+      const summary = new Summary<string>("declared", { labels });
+
+      for (const label of labels) {
+        summary.observe(1, label);
+      }
+
+      expect(Object.keys(summary.observations)).toHaveLength(labels.length);
+    });
+  });
 });
 
 describe("series key length", () => {
@@ -134,5 +201,95 @@ describe("series key length", () => {
     gauge.decrement(url(300));
 
     expect(Object.keys(gauge.value)).toEqual(["default"]);
+  });
+});
+
+/**
+ * A label value is a string or a number, but a handler that passes a field of
+ * a JSON body on unchecked can hand a metric anything JSON parses to. An array
+ * nested a few thousand levels deep overflowed the stack where the series key
+ * was made, and a bigint threw there too, out of the metric call and into the
+ * request being measured.
+ */
+describe("label values no series can be keyed by", () => {
+  let warn: MockInstance;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  const deeplyNested = () => {
+    let nested: unknown = [];
+    for (let i = 0; i < 20_000; i++) {
+      nested = [nested];
+    }
+    return nested;
+  };
+  const unusable = (): unknown[] => [deeplyNested(), { toString: 1 }, 10n];
+  const asLabel = (value: unknown) => ({ catalog: value as string });
+
+  it("are ignored by a counter rather than thrown", () => {
+    const counter = new Counter<"catalog">("searches", "d", ["catalog"]);
+
+    for (const value of unusable()) {
+      expect(() => counter.increment(asLabel(value))).not.toThrow();
+    }
+    counter.increment({ catalog: "books" });
+
+    expect(Object.keys(counter.value)).toEqual(['{"catalog":"books"}']);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('"searches"');
+  });
+
+  it("are ignored by a gauge in every operation", () => {
+    const gauge = new Gauge<"catalog">("open", { labels: ["catalog"] });
+
+    for (const value of unusable()) {
+      expect(() => gauge.increment(asLabel(value))).not.toThrow();
+      expect(() => gauge.decrement(asLabel(value))).not.toThrow();
+      expect(() => gauge.setValue(asLabel(value), 3)).not.toThrow();
+    }
+
+    expect(gauge.value).toEqual({ default: 0 });
+  });
+
+  it("are ignored in place of the value on a metric without labels", () => {
+    const counter = new Counter("orders");
+
+    // Taken for a label set, as any object is.
+    expect(() => counter.increment(deeplyNested() as number)).not.toThrow();
+
+    expect(counter.value).toEqual({ default: 0 });
+  });
+
+  it("are ignored as a summary's own label", () => {
+    const summary = new Summary<string>("search_ms");
+
+    for (const value of unusable()) {
+      expect(() => summary.observe(1, value as string)).not.toThrow();
+    }
+    summary.observe(1, "books");
+
+    expect(summary.observations).toEqual({ books: 1 });
+  });
+
+  it("still key strings, numbers, booleans and nulls as before", () => {
+    const counter = new Counter<"a" | "b" | "c" | "d">("mixed", "d", [
+      "a",
+      "b",
+      "c",
+      "d",
+    ]);
+
+    counter.increment({ a: "x", b: 1, c: true as never, d: null as never });
+
+    expect(Object.keys(counter.value)).toEqual([
+      '{"a":"x","b":1,"c":true,"d":null}',
+    ]);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

@@ -29,6 +29,51 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
       "DELETE sessions",
       "DELETE FROM sessions WHERE token = ?",
     ],
+    [
+      "SELECT * FROM ONLY users WHERE id = 1",
+      "SELECT users",
+      "SELECT * FROM ONLY users WHERE id = ?",
+    ],
+    [
+      "DELETE FROM ONLY sessions WHERE id = 1",
+      "DELETE sessions",
+      "DELETE FROM ONLY sessions WHERE id = ?",
+    ],
+    [
+      "SELECT EXTRACT(EPOCH FROM created_at) AS ts FROM events WHERE id = 1",
+      "SELECT events",
+      "SELECT EXTRACT(EPOCH FROM created_at) AS ts FROM events WHERE id = ?",
+    ],
+    [
+      "SELECT TRIM(BOTH ' ' FROM lower(name)) FROM users",
+      "SELECT users",
+      "SELECT TRIM(BOTH ? FROM lower(name)) FROM users",
+    ],
+    [
+      "SELECT * FROM (SELECT id FROM orders) AS recent",
+      "SELECT orders",
+      "SELECT * FROM (SELECT id FROM orders) AS recent",
+    ],
+    [
+      "SELECT * FROM ((SELECT a FROM b) UNION ALL (SELECT c FROM d)) AS u",
+      "SELECT b",
+      "SELECT * FROM ((SELECT a FROM b) UNION ALL (SELECT c FROM d)) AS u",
+    ],
+    [
+      "SELECT COALESCE((SELECT max(x) FROM a), 0) AS m FROM b",
+      "SELECT b",
+      "SELECT COALESCE((SELECT max(x) FROM a), ?) AS m FROM b",
+    ],
+    [
+      "SELECT * FROM (VALUES (1), (2)) AS v(id)",
+      "SELECT",
+      "SELECT * FROM (VALUES (?), (?)) AS v(id)",
+    ],
+    [
+      "SELECT * FROM (a JOIN b ON a.id = b.a_id) WHERE a.x = 1",
+      "SELECT",
+      "SELECT * FROM (a JOIN b ON a.id = b.a_id) WHERE a.x = ?",
+    ],
     ["BEGIN", "BEGIN", "BEGIN"],
     ["  ", "QUERY", ""],
   ])("%s", (sql, operation, statement) => {
@@ -96,10 +141,6 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
       "SELECT * FROM users WHERE pw = ? AND id = ?",
     ],
     [
-      "SELECT `it's` FROM t WHERE name = 'secret-value'",
-      "SELECT `it's` FROM t WHERE name = ?",
-    ],
-    [
       "SELECT * FROM t WHERE name = 'secret-value",
       "SELECT * FROM t WHERE name = ?",
     ],
@@ -144,6 +185,15 @@ describe("describeSqlStatement for Postgres", () => {
       `SELECT "a--b" FROM t WHERE name = 'secret-value'`,
       `SELECT "a--b" FROM t WHERE name = ?`,
     ],
+    // A backtick quotes nothing in Postgres: it is an operator character.
+    [
+      "SELECT * FROM docs WHERE content &` 'secret term' AND share_token = 'tok-123'",
+      "SELECT * FROM docs WHERE content &` ? AND share_token = ?",
+    ],
+    [
+      "SELECT * FROM d WHERE a &` 'x' /* user:42 */ AND b &` 'secret-value'",
+      "SELECT * FROM d WHERE a &` ? AND b &` ?",
+    ],
     // A plain string takes a backslash as it is. Whether `\'` ends one turns
     // on a session setting, so what follows such a string is not shipped.
     [
@@ -166,6 +216,23 @@ describe("describeSqlStatement for Postgres", () => {
     ["SELECT /* outer /* inner */ 1", "SELECT"],
     ["SELECT 5 # 3, 1_000_000, 0o17", "SELECT ? # ?, ?, ?"],
     ["SELECT a$b$c, $1 FROM t", "SELECT a$b$c, $1 FROM t"],
+    // A tag is a letter, `_` or non-ASCII character, then any of those or
+    // digits.
+    [
+      "INSERT INTO notes (body) VALUES ($q1$secret note$q1$)",
+      "INSERT INTO notes (body) VALUES (?)",
+    ],
+    [
+      "SELECT $body_2$it's secret$body_2$ FROM t WHERE b = 'secret-value'",
+      "SELECT ? FROM t WHERE b = ?",
+    ],
+    [
+      "SELECT $_1$secret$_1$, $é$secret$é$, $tag_ü9$secret$tag_ü9$",
+      "SELECT ?, ?, ?",
+    ],
+    ["SELECT $q1$a $q$ b $q11$ secret$q1$ FROM t", "SELECT ? FROM t"],
+    ["SELECT $q1$secret 'value", "SELECT ?"],
+    ["SELECT $1, $2 FROM t WHERE a = $3", "SELECT $1, $2 FROM t WHERE a = $3"],
   ])("%s", (sql, statement) => {
     expect(describeSqlStatement(sql, "postgresql").statement).toBe(statement);
   });
@@ -174,13 +241,37 @@ describe("describeSqlStatement for Postgres", () => {
 describe("describeSqlStatement for MySQL", () => {
   it.each([
     [
+      "SELECT `it's` FROM t WHERE name = 'secret-value'",
+      "SELECT `it's` FROM t WHERE name = ?",
+    ],
+    [
       `SELECT * FROM users WHERE email = "secret@example.com"`,
       "SELECT * FROM users WHERE email = ?",
     ],
-    [`SELECT "it\\"s", "a""b", "c'd" FROM t`, "SELECT ?, ?, ? FROM t"],
+    [`SELECT "a""b", "c'd", "it\\'s" FROM t`, "SELECT ?, ?, ? FROM t"],
+    [
+      "SELECT 'a\\\\', 'b' FROM t WHERE c = 'secret-value'",
+      "SELECT ?, ? FROM t WHERE c = ?",
+    ],
+    // A backslash escapes a quote, unless the server runs with
+    // NO_BACKSLASH_ESCAPES - then `'C:\'` is a whole string. Where such a
+    // string ends is the server's to say, so nothing after it is shipped.
+    [
+      "UPDATE files SET opened_at = NOW() WHERE path = 'C:\\' AND tenant_key = 'tenant-secret'",
+      "UPDATE files SET opened_at = NOW() WHERE path = ?",
+    ],
+    [
+      `SELECT * FROM t WHERE path = "C:\\" AND k = "tenant-secret"`,
+      "SELECT * FROM t WHERE path = ?",
+    ],
     [
       "SELECT * FROM t WHERE a = 'it\\'s' AND b = 'secret-value'",
-      "SELECT * FROM t WHERE a = ? AND b = ?",
+      "SELECT * FROM t WHERE a = ?",
+    ],
+    [`SELECT "it\\"s", "secret-value" FROM t`, "SELECT ?"],
+    [
+      "SELECT * FROM t WHERE a = 'x\\\\\\' AND b = 'secret-value'",
+      "SELECT * FROM t WHERE a = ?",
     ],
     [
       "SELECT * FROM t WHERE id = 1 # user=secret@example.com",
@@ -192,6 +283,24 @@ describe("describeSqlStatement for MySQL", () => {
     ],
     ["SELECT /* outer /* inner */ 1", "SELECT ?"],
     ["SELECT a$$b$$, $$c FROM t", "SELECT a$$b$$, $$c FROM t"],
+    // `--` opens a comment only before whitespace or a control character:
+    // `credit--5` is `credit - -5`, and what follows it is still SQL.
+    [
+      "UPDATE accounts SET credit=credit--5, memo='see ticket\nsecret line' WHERE account_key='secret-key'",
+      "UPDATE accounts SET credit=credit-?, memo=? WHERE account_key=?",
+    ],
+    [
+      "SELECT credit--5 /* user:42\nsession:abc */ FROM t",
+      "SELECT credit-? FROM t",
+    ],
+    ["SELECT 1 --\tuser=secret@example.com\nFROM t", "SELECT ? FROM t"],
+    ["SELECT 1 --\r\nFROM t", "SELECT ? FROM t"],
+    ["SELECT 1 --", "SELECT ?"],
+    // The comment ends at the line feed that makes it one.
+    [
+      "SELECT * --\nFROM t WHERE a = 'x\ny' AND k = 'secret-value'",
+      "SELECT * FROM t WHERE a = ? AND k = ?",
+    ],
   ])("%s", (sql, statement) => {
     expect(describeSqlStatement(sql, "mysql").statement).toBe(statement);
   });

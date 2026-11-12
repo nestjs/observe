@@ -6,7 +6,6 @@ import {
   DEGRADED_TTL_MS,
   isNotableSnapshot,
   isServerErrorSnapshot,
-  NOT_INGESTED_GRACE_MS,
   NOT_INGESTED_MESSAGE_PREFIX,
   NOTABLE_DURATION_MS,
   parseDegradedMessage,
@@ -331,8 +330,11 @@ describe("the not-ingested line", () => {
 });
 
 /**
- * Whether the collector is taking this app's telemetry, which OpenTelemetry
- * interop runs on: only beside reporting to NestJS Observe.
+ * Whether this app reports to NestJS Observe, which OpenTelemetry interop
+ * runs on, and whether the collector takes its telemetry, which what the
+ * collector's replies grant holds on. A batch that fails to get in for any
+ * other reason than refused credentials is no input here at all - see the
+ * worker's interop suite.
  */
 describe("the shared buffer's ingest health", () => {
   const bufferOf = () =>
@@ -340,75 +342,58 @@ describe("the shared buffer's ingest health", () => {
       serviceId: "svc",
     } as ObserveModuleOptionsWithDefaults);
 
-  it("starts off, until a first batch gets in", () => {
+  it("starts off, until the worker starts", () => {
     const buffer = bufferOf();
+    expect(buffer.isReporting()).toBe(false);
     expect(buffer.isIngesting()).toBe(false);
 
+    buffer.recordStarted();
+    expect(buffer.isReporting()).toBe(true);
+    expect(buffer.isIngesting()).toBe(false);
+  });
+
+  it("ingests from the first batch that gets in", () => {
+    const buffer = bufferOf();
+    buffer.recordStarted();
     buffer.recordAccepted();
+
+    expect(buffer.isReporting()).toBe(true);
     expect(buffer.isIngesting()).toBe(true);
   });
 
-  it("never turns on while every batch fails", () => {
-    const buffer = bufferOf();
-    buffer.recordFailed(0, 1_000);
-    buffer.recordFailed(0, 1_000 + 10 * NOT_INGESTED_GRACE_MS);
-
-    expect(buffer.isIngesting()).toBe(false);
-  });
-
-  it("stops at once when the collector refuses the credentials", () => {
+  it("keeps a batch already taken when the worker's start is recorded after it", () => {
     const buffer = bufferOf();
     buffer.recordAccepted();
-    buffer.recordRefused();
-
-    expect(buffer.isIngesting()).toBe(false);
-  });
-
-  it("stops at once when the worker stops", () => {
-    const buffer = bufferOf();
-    buffer.recordAccepted();
-    buffer.recordStopped();
-
-    expect(buffer.isIngesting()).toBe(false);
-  });
-
-  it("rides out failures shorter than the grace, and stops once they last it", () => {
-    const buffer = bufferOf();
-    buffer.recordAccepted();
-
-    buffer.recordFailed(0, 1_000);
-    buffer.recordFailed(0, 1_000 + NOT_INGESTED_GRACE_MS - 1);
-    expect(buffer.isIngesting()).toBe(true);
-
-    buffer.recordFailed(0, 1_000 + NOT_INGESTED_GRACE_MS);
-    expect(buffer.isIngesting()).toBe(false);
-  });
-
-  it("stops at once for a pause longer than the grace", () => {
-    // A 429 says when the worker sends again; nothing gets in before then.
-    const buffer = bufferOf();
-    buffer.recordAccepted();
-    buffer.recordFailed(1_000 + NOT_INGESTED_GRACE_MS, 1_000);
-
-    expect(buffer.isIngesting()).toBe(false);
-  });
-
-  it("measures the grace from the first failure since the last batch that got in", () => {
-    const buffer = bufferOf();
-    buffer.recordAccepted();
-    buffer.recordFailed(0, 1_000);
-    buffer.recordAccepted();
-    buffer.recordFailed(0, 1_000 + NOT_INGESTED_GRACE_MS);
+    buffer.recordStarted();
 
     expect(buffer.isIngesting()).toBe(true);
+  });
+
+  it.each([
+    ["the collector refuses the credentials", "recordRefused"],
+    ["the worker stops", "recordStopped"],
+  ] as const)("stops at once when %s", (_, record) => {
+    const started = bufferOf();
+    started.recordStarted();
+    started[record]();
+    const ingesting = bufferOf();
+    ingesting.recordStarted();
+    ingesting.recordAccepted();
+    ingesting[record]();
+
+    for (const buffer of [started, ingesting]) {
+      expect(buffer.isReporting()).toBe(false);
+      expect(buffer.isIngesting()).toBe(false);
+    }
   });
 
   it("turns back on with the next batch that gets in", () => {
     const buffer = bufferOf();
-    buffer.recordAccepted();
+    buffer.recordStarted();
     buffer.recordRefused();
     buffer.recordAccepted();
 
+    expect(buffer.isReporting()).toBe(true);
     expect(buffer.isIngesting()).toBe(true);
   });
 });

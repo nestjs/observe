@@ -26,10 +26,52 @@ export function admitsFinite(
 
   if (!state.warned) {
     state.warned = true;
+    // Only what the warning is about - a NaN, an Infinity, a missing value -
+    // is printed. Anything else got past the type at run time, a field of a
+    // request body say, and need not convert to a string at all: `{"toString":
+    // 1}` throws a TypeError and a deeply nested array a RangeError, out of
+    // the call this function exists not to fail. Nor is a string any
+    // particular length, or free of line breaks.
+    const refused: unknown = value;
+    const given =
+      typeof refused === "number" || refused === undefined || refused === null
+        ? String(refused)
+        : `a value of type ${typeof refused}`;
     console.warn(
-      `[observe] Metric "${metricName}" ignored ${value}, which is not a finite number. ` +
+      `[observe] Metric "${metricName}" ignored ${given}, which is not a finite number. ` +
         `Further ones are ignored without another warning. This usually means the value is ` +
         `computed from something that can be zero or missing (a division by a zero total, a failed parse).`,
+    );
+  }
+  return false;
+}
+
+/**
+ * Whether a metric may move to `reading`, which an admitted value takes it to,
+ * when what goes on the wire is its difference from `baseline` - a counter's
+ * increase since the last flush - or the reading itself.
+ *
+ * Asked after `admitsFinite`, about the result rather than the argument: two
+ * finite numbers can add up to an Infinity (`1e308 + 1e308`), which is sent
+ * as null just the same, and which nothing added later would bring back. The
+ * step is ignored and the reading kept, under the same once-per-metric
+ * warning as a non-finite argument.
+ */
+export function admitsReading(
+  metricName: string,
+  reading: number,
+  state: { warned: boolean },
+  baseline = 0,
+): boolean {
+  if (Number.isFinite(reading - baseline)) {
+    return true;
+  }
+
+  if (!state.warned) {
+    state.warned = true;
+    console.warn(
+      `[observe] Metric "${metricName}" ignored a value that would take it past the largest number it can report ` +
+        `(${Number.MAX_VALUE}). Further ones, and non-finite values, are ignored without another warning.`,
     );
   }
   return false;

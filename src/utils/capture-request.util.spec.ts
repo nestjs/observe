@@ -48,6 +48,100 @@ describe("captureRequest", () => {
     });
   });
 
+  it("masks the query of a URL in any captured header, not only referer", () => {
+    const captured = captureRequest(
+      {
+        headers: {
+          "x-forwarded-uri": "/oauth/callback?code=abc123&state=xyz",
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+          accept: "text/html;q=0.9,*/*;q=0.8",
+        },
+      },
+      { headers: ["x-forwarded-uri", "user-agent", "accept"] },
+      redactor,
+    );
+
+    expect(captured?.headers).toEqual({
+      "x-forwarded-uri":
+        "/oauth/callback?code=%5BREDACTED%5D&state=%5BREDACTED%5D",
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      accept: "text/html;q=0.9,*/*;q=0.8",
+    });
+  });
+
+  it("redacts a header before cutting it, so a secret across the cut is masked", () => {
+    const jwt =
+      "eyJhbGciOiJIUzI1NiJ9." +
+      "eyJzdWIiOiJ1c2VyLTQyIiwiZW1haWwiOiJhQGV4YW1wbGUuY29tIn0." +
+      "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    // The cut at 512 falls inside the JWT's payload, before its last dot.
+    const referer = `https://app.example.com/${"a".repeat(440)}/${jwt}`;
+
+    const captured = captureRequest(
+      { headers: { referer } },
+      undefined,
+      redactor,
+    );
+
+    expect(captured?.headers?.referer).not.toContain("eyJzdWIi");
+    expect(captured?.headers?.referer.length).toBeLessThanOrEqual(512);
+  });
+
+  it("applies the deployment's query obfuscation pattern to captured URLs", () => {
+    const captured = captureRequest(
+      { headers: { referer: "https://app.example.com/x?tenant=acme&page=2" } },
+      undefined,
+      redactor,
+      /tenant=[^&]*/g,
+    );
+
+    expect(captured?.headers?.referer).toEqual(
+      "https://app.example.com/x?[REDACTED]&page=2",
+    );
+  });
+
+  it("redacts a JSON body that arrived as a string by key, as a parsed one", () => {
+    const captured = captureRequest(
+      {
+        body: JSON.stringify({
+          tenantRef: "acme",
+          profile: { passwordConfirmation: "Tr0ub4dor", signature: "sig-9f3c" },
+          note: "hello",
+        }),
+      },
+      { headers: false, body: true },
+      new LogRedactor({ keys: ["tenant_ref"] }),
+    );
+
+    expect(JSON.parse(captured?.body ?? "")).toEqual({
+      tenantRef: "[REDACTED]",
+      profile: { passwordConfirmation: "[REDACTED]", signature: "[REDACTED]" },
+      note: "hello",
+    });
+  });
+
+  it("serializes no more of a sparse array than the cap can hold", () => {
+    // multer turns `f[1000000]=x` into an array with a million holes, and each
+    // hole serializes as `null`.
+    const sparse: unknown[] = [];
+    sparse[5_000_000] = "x";
+    const nested: unknown[] = [];
+    nested[2_000] = [];
+    (nested[2_000] as unknown[])[2_000] = [];
+    const startedAt = performance.now();
+
+    const captured = captureRequest(
+      { body: { f: sparse, g: nested, password: "hunter2" } },
+      { headers: false, body: true },
+      redactor,
+    );
+
+    expect(performance.now() - startedAt).toBeLessThan(50);
+    expect(captured?.bodyTruncated).toBe(true);
+    expect(Buffer.byteLength(captured?.body ?? "")).toBeLessThanOrEqual(2048);
+    expect(captured?.body).not.toContain("hunter2");
+  });
+
   it("records a body only on request, redacted by key before serialization", () => {
     const captured = captureRequest(req, { body: true }, redactor);
     const body = JSON.parse(captured!.body!);

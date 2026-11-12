@@ -47,3 +47,38 @@ describe("OutgoingSpanRecorder.isRecording", () => {
     });
   });
 });
+
+describe("OutgoingSpanRecorder.endWhenSettled", () => {
+  const recorder = new OutgoingSpanRecorder(
+    new OperationTraceRegistry(new AsyncLocalStorage(), false),
+    new AsyncLocalStorage(),
+    "traceId",
+  );
+  const failingSpan = {
+    spanId: "span-1",
+    end: () => {
+      throw new Error("span bookkeeping failed");
+    },
+  };
+
+  it("keeps a span that fails to close out of the call's outcome", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      expect(recorder.endWhenSettled(failingSpan, "rows")).toBe("rows");
+      await expect(
+        recorder.endWhenSettled(failingSpan, Promise.resolve("rows")),
+      ).resolves.toBe("rows");
+      const failed = Promise.reject(new Error("query failed"));
+      failed.catch(() => undefined);
+      recorder.endWhenSettled(failingSpan, failed);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+  });
+});

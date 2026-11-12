@@ -1,13 +1,24 @@
-import { ServerKafka, Transport } from "@nestjs/microservices";
+import { Logger } from "@nestjs/common";
+import {
+  Server,
+  ServerKafka,
+  ServerTCP,
+  TcpContext,
+  Transport,
+} from "@nestjs/microservices";
+import { context as otelContext, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
+import { createRequire } from "node:module";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createInstanceDecorator } from "../instrument/create-instance-decorator.instrument.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
-import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { TRACE_CONTEXT_KEY, TRACE_REGISTRY_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { TracerService } from "../services/tracer.service.js";
+import { nestMajor } from "../testing/nest-version.js";
 import { waitFor } from "../testing/observe-harness.js";
 import { RpcObserveAgentService } from "./rpc-observe-agent.service.js";
 
@@ -36,9 +47,9 @@ describe("RpcObserveAgentService", () => {
 
   it("subscribes to the RPC target registry when @nestjs/microservices is installed", () => {
     const subscribe = vi.fn(() => ({ unsubscribe: vi.fn() }));
-    const agent = createAgent(subscribe);
-
-    agent.onModuleInit();
+    // From the constructor: Nest announces a server as it builds the
+    // microservice, before the application is handed it.
+    createAgent(subscribe);
 
     expect(subscribe).toHaveBeenCalledTimes(1);
   });
@@ -51,23 +62,69 @@ describe("RpcObserveAgentService", () => {
       "loadMicroservices",
     ).mockReturnValue(undefined);
     const subscribe = vi.fn();
-    const agent = createAgent(subscribe);
+    let agent: ReturnType<typeof createAgent> | undefined;
 
-    expect(() => agent.onModuleInit()).not.toThrow();
+    expect(() => {
+      agent = createAgent(subscribe);
+    }).not.toThrow();
     expect(subscribe).not.toHaveBeenCalled();
-    expect(() => agent.onModuleDestroy()).not.toThrow();
+    expect(() => agent!.onModuleDestroy()).not.toThrow();
+  });
+
+  it("starts even when the target registry cannot be subscribed to", () => {
+    vi.spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+
+    expect(() =>
+      createAgent(() => {
+        throw new Error("no registry");
+      }),
+    ).not.toThrow();
   });
 
   describe("getOperationIdFromContext", () => {
-    const getOperationId = (ctx: unknown): string => {
+    const getOperationId = (ctx: unknown, target?: unknown): string => {
       const agent = createAgent(() => ({ unsubscribe: vi.fn() }));
-      agent.onModuleInit();
       return (
         agent as unknown as {
-          getOperationIdFromContext: (ctx: unknown) => string;
+          getOperationIdFromContext: (ctx: unknown, target?: unknown) => string;
         }
-      ).getOperationIdFromContext(ctx);
+      ).getOperationIdFromContext(ctx, target);
     };
+
+    /** A TCP message as Nest delivers it, its pattern as the sender wrote it. */
+    const tcpMessage = (pattern: string) =>
+      new TcpContext([{} as never, pattern]);
+
+    it("names a TCP message by the route its handler is registered under", () => {
+      const server = new ServerTCP({});
+      server.addHandler({ cmd: "sum" }, async () => 1);
+
+      for (const spelling of [
+        '{"cmd":"sum"}',
+        '{ "cmd" : "sum" }',
+        '{"cmd":"refund","cmd":"sum"}',
+        '{"cmd":"s\\u0075m"}',
+      ]) {
+        expect(getOperationId(tcpMessage(spelling), server)).toBe(
+          '{"cmd":"sum"}',
+        );
+      }
+    });
+
+    it("keeps the text of a message the server cannot be asked about", () => {
+      const spelling = '{ "cmd" : "sum" }';
+      const throwing = {
+        getHandlers: () => {
+          throw new Error("not a server");
+        },
+      } as unknown as Server;
+
+      expect(getOperationId(tcpMessage(spelling))).toBe(spelling);
+      expect(getOperationId(tcpMessage(spelling), throwing)).toBe(spelling);
+      expect(getOperationId(tcpMessage(spelling), new ServerTCP({}))).toBe(
+        spelling,
+      );
+    });
 
     it("falls back to getPattern for a custom transport's own context class", () => {
       expect(getOperationId({ getPattern: () => "custom.pattern" })).toBe(
@@ -115,7 +172,6 @@ describe("RpcObserveAgentService", () => {
         buffer,
         new TraceSamplerService(executionOptions),
       );
-      agent.onModuleInit();
       const tracer = new TracerService(
         registry,
         als as never,
@@ -444,11 +500,13 @@ describe("RpcObserveAgentService", () => {
           startTrace: vi.fn(),
           endTrace: vi.fn(),
           pluckSnapshot: vi.fn(),
+          // Asked by the end hook, which runs once the handler settles -
+          // since 12.0.4, when it fails too.
+          hasTrace: vi.fn(() => false),
         } as never,
         {} as never,
         { shouldCapture: () => overrides.capture ?? true } as never,
       );
-      agent.onModuleInit();
       return agent;
     };
 
@@ -491,34 +549,251 @@ describe("RpcObserveAgentService", () => {
           await expect(
             Promise.resolve(startHook(transportId, {}, done)),
           ).rejects.toBe(error);
-          // gRPC calls done from a timer; let it fire so an extra call counts.
+          // Let any timer fire, so an extra call would count.
           await new Promise((resolve) => setTimeout(resolve, 0));
           expect(done).toHaveBeenCalledTimes(2);
         },
       );
+
+      it.each([
+        ["traced", {}],
+        ["ignored", { ignore: true }],
+        ["sampled out", { capture: false }],
+      ])(
+        "has run done by the time it returns when the operation is %s",
+        (_operation, overrides) => {
+          // Nest listens for a gRPC call's `cancelled` and `end` inside done,
+          // and grpc-js emits `cancelled` once: a call whose deadline expired
+          // on arrival, run a tick later, left a client-streaming handler
+          // waiting on a request stream that never ended.
+          const startHook = captureStartHook(createHookedAgent(overrides));
+          const done = vi.fn(async () => "handled");
+
+          void startHook(transportId, {}, done);
+
+          expect(done).toHaveBeenCalledOnce();
+        },
+      );
     });
 
-    it("lets a Kafka consumer see an event handler's failure", async () => {
-      const server = new ServerKafka({});
-      createHookedAgent().registerRpcHooks(server as never);
-      const error = new Error("handler failed");
-      server.addHandler(
-        "orders",
-        async () => {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          throw error;
+    /**
+     * With `openTelemetry` on, a TCP or Redis message carries W3C trace
+     * context in its metadata beside the trace id, and its handler runs in it
+     * for an OpenTelemetry SDK in this process.
+     */
+    describe("W3C trace context sent with a message", () => {
+      // The W3C spec's own example, and the id Observe writes it as.
+      const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+      const TRACE_ID_AS_UUID = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+      const SPAN_ID = "00f067aa0ba902b7";
+      const TRACEPARENT = `00-${TRACE_ID}-${SPAN_ID}-01`;
+
+      beforeEach(() => {
+        otelContext.setGlobalContextManager(
+          new AsyncLocalStorageContextManager().enable(),
+        );
+      });
+
+      afterEach(() => {
+        otelContext.disable();
+      });
+
+      /** What the agent's trace registry is asked, for the cases that read it. */
+      const registryOf = () => ({
+        startTrace: vi.fn(),
+        endTrace: vi.fn(),
+        pluckSnapshot: vi.fn(),
+        hasTrace: vi.fn(() => false),
+      });
+
+      const startHookFor = (
+        openTelemetry: boolean | undefined,
+        reporting = true,
+        overrides: { ignore?: boolean; capture?: boolean } = {},
+        registry = registryOf(),
+        als = new AsyncLocalStorage<Map<string, any>>(),
+      ) => {
+        const agent = new RpcObserveAgentService(
+          als,
+          {
+            traceIdKey: "traceId",
+            // What the default makes of the id the sending agent attached.
+            traceIdGenerator: () => TRACE_ID_AS_UUID,
+            openTelemetry,
+            rpc: { ignore: () => overrides.ignore ?? false },
+          } as never,
+          {
+            getRpcTargetRegistry: () => ({
+              subscribe: () => ({ unsubscribe: vi.fn() }),
+            }),
+          } as never,
+          registry as never,
+          { isReporting: () => reporting } as never,
+          { shouldCapture: () => overrides.capture ?? true } as never,
+        );
+        return captureStartHook(agent);
+      };
+
+      /** The OpenTelemetry span context a message's handler ran in. */
+      const handledIn = (
+        startHook: ReturnType<typeof startHookFor>,
+        metadata: Record<string, string> | undefined,
+      ) =>
+        Promise.resolve(
+          startHook(Transport.TCP, { getMetadata: () => metadata }, async () =>
+            trace.getSpanContext(otelContext.active()),
+          ),
+        );
+
+      it.each([
+        ["traced", {}],
+        ["ignored", { ignore: true }],
+        ["sampled out", { capture: false }],
+      ])(
+        "runs the handler of a %s message in the trace it was sent in",
+        async (_, overrides) => {
+          const startHook = startHookFor(true, true, overrides);
+
+          await expect(
+            handledIn(startHook, {
+              "x-request-id": TRACE_ID_AS_UUID,
+              traceparent: TRACEPARENT,
+            }),
+          ).resolves.toEqual({
+            traceId: TRACE_ID,
+            spanId: SPAN_ID,
+            traceFlags: 1,
+            isRemote: true,
+          });
         },
-        true,
       );
 
-      await expect(
-        server.getMessageHandler()({
-          topic: "orders",
-          partition: 0,
-          message: { value: Buffer.from("{}"), headers: {} },
-          heartbeat: async () => undefined,
-        } as never),
-      ).rejects.toBe(error);
+      it.each([
+        ["openTelemetry off", undefined, true, TRACEPARENT],
+        ["the agent not reporting", true, false, TRACEPARENT],
+        [
+          "a traceparent for another trace",
+          true,
+          true,
+          `00-${"a".repeat(32)}-${SPAN_ID}-01`,
+        ],
+        ["no traceparent", true, true, undefined],
+      ])(
+        "runs the handler in no trace with %s",
+        async (_, openTelemetry, reporting, traceparent) => {
+          const startHook = startHookFor(openTelemetry, reporting);
+
+          await expect(
+            handledIn(
+              startHook,
+              traceparent === undefined ? undefined : { traceparent },
+            ),
+          ).resolves.toBeUndefined();
+        },
+      );
+
+      const SENT_IN = {
+        traceId: TRACE_ID,
+        parentSpanId: SPAN_ID,
+        sampled: true,
+      };
+
+      it("puts the handler's span under the span that sent the message, and carries that context in its store", async () => {
+        const registry = registryOf();
+        const als = new AsyncLocalStorage<Map<string, any>>();
+        const startHook = startHookFor(true, true, {}, registry, als);
+
+        const stored = await Promise.resolve(
+          startHook(
+            Transport.TCP,
+            {
+              getMetadata: () => ({
+                "x-request-id": TRACE_ID_AS_UUID,
+                traceparent: TRACEPARENT,
+              }),
+            },
+            async () => als.getStore()?.get(TRACE_CONTEXT_KEY),
+          ),
+        );
+
+        expect(stored).toEqual(SENT_IN);
+        expect(registry.startTrace.mock.calls[0][3]).toEqual(SENT_IN);
+      });
+
+      it("records no context for a message sent unsampled, by an operation the sender was not recording", async () => {
+        const registry = registryOf();
+        const startHook = startHookFor(true, true, {}, registry);
+
+        await handledIn(startHook, {
+          "x-request-id": TRACE_ID_AS_UUID,
+          traceparent: `00-${TRACE_ID}-${SPAN_ID}-00`,
+        });
+
+        expect(registry.startTrace.mock.calls[0][3]).toBeUndefined();
+      });
+
+      it("puts a gRPC call's span under the caller's, read off the call's metadata", async () => {
+        const registry = registryOf();
+        const als = new AsyncLocalStorage<Map<string, any>>();
+        const startHook = startHookFor(true, true, {}, registry, als);
+        const call = {
+          request: {},
+          operationId: "FindOne",
+          metadata: {
+            get: (key: string) => (key === "traceparent" ? [TRACEPARENT] : []),
+          },
+        };
+
+        const stored = await Promise.resolve(
+          startHook(Transport.GRPC, call, async () =>
+            als.getStore()?.get(TRACE_CONTEXT_KEY),
+          ),
+        );
+
+        expect(stored).toEqual(SENT_IN);
+        expect(registry.startTrace.mock.calls[0][3]).toEqual(SENT_IN);
+      });
     });
+
+    // Nest 11's ServerKafka loads kafkajs as it is constructed, Nest 12's only
+    // once it listens - so before 12 this needs kafkajs installed.
+    const itWithServerKafka = it.runIf(
+      nestMajor >= 12 || isInstalled("kafkajs"),
+    );
+
+    itWithServerKafka(
+      "lets a Kafka consumer see an event handler's failure",
+      async () => {
+        const server = new ServerKafka({});
+        createHookedAgent().registerRpcHooks(server as never);
+        const error = new Error("handler failed");
+        server.addHandler(
+          "orders",
+          async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            throw error;
+          },
+          true,
+        );
+
+        await expect(
+          server.getMessageHandler()({
+            topic: "orders",
+            partition: 0,
+            message: { value: Buffer.from("{}"), headers: {} },
+            heartbeat: async () => undefined,
+          } as never),
+        ).rejects.toBe(error);
+      },
+    );
   });
 });
+
+function isInstalled(name: string): boolean {
+  try {
+    createRequire(import.meta.url).resolve(name);
+    return true;
+  } catch {
+    return false;
+  }
+}

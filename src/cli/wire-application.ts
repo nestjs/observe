@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, posix } from "node:path";
 import type * as TS from "typescript";
+import { isProjectFile } from "./project-files.js";
 import { SDK_PACKAGE, TypeScript } from "./project-setup.js";
 
 /** One file the wiring changed, and what it changed there. */
@@ -48,6 +49,11 @@ export function wireApplication(
   try {
     const files = planWiring(ts, cwd, mainPath, serviceId);
     for (const file of files) {
+      // A link out of the tree, or a `../` path: some other application's
+      // file, which nobody asked to have rewritten.
+      if (!isProjectFile(cwd, file.path)) {
+        return manual(`${file.path} leads out of the project`);
+      }
       if (
         syntaxErrors(ts, file.path, file.text) >
         syntaxErrors(ts, file.path, file.original)

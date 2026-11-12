@@ -10,38 +10,65 @@ import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.j
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { REQUEST_ID_PATTERN } from "../utils/default-trace-id-generator.util.js";
 import { fitToLength } from "../utils/fit-to-length.util.js";
-import { parseLogLine } from "../utils/log-line.parser.js";
+import {
+  ParsedLogLine,
+  parseLogLine,
+  stripAnsi,
+} from "../utils/log-line.parser.js";
 import { LogRedactor } from "../utils/log-redactor.js";
-import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "../observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  OBSERVE_OPTIONS,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
+import { liveTraceId } from "../utils/operation-state.util.js";
 
 /**
  * Cap on the unterminated tail held between writes.
  *
  * A process that writes a long stretch without a newline (a progress bar, a
  * streamed response) would otherwise grow this string without bound. At the cap
- * the tail is forwarded as-is rather than discarded - a partial line is still
- * evidence.
+ * the tail is forwarded rather than discarded - a partial line is still
+ * evidence - and the rest of that line, up to its newline, is dropped: it is
+ * not a line of its own, and a secret the cap split would start it. A line
+ * written in one call loses everything past the 4 KB the shared buffer keeps
+ * of an entry anyway.
  */
 const MAX_PARTIAL_LINE_LENGTH = 8 * 1024;
 
 /**
- * Most of a line the parser and redactor are ever given.
+ * Most text the redactor is ever given in one go - a line, or a message and
+ * the lines under it. Text past it is not sent: see `REDACTION_LOOKAHEAD`.
  *
- * Everything in `toLogEntry` runs synchronously inside the patched
+ * Everything in `toLogEntries` runs synchronously inside the patched
  * `process.stdout.write`, on the application's own hot path, and the redactor
  * is a set of regular expressions whose cost grows with input length. A single
  * multi-megabyte line - a dumped payload, and payloads can carry content an
  * outside caller chose - must not be able to hold the event loop while every
  * rule walks it. A bound only helps while that cost stays linear: a pattern
  * that backtracks super-linearly holds the loop for minutes inside 16 KB, which
- * is why the parser's patterns are written to be linear.
+ * is why the redactor's patterns are written to be linear.
  *
- * The bound is safe because it is four times what can ship: the shared buffer
- * truncates entries to 4 KB, so bytes beyond this window were never going to
- * leave the process - and a secret straddling the 4 KB cut still sits whole
- * inside this window, so it is redacted before the cut can split it.
+ * The parser is not held to it. It is linear, and a line cut before it reads
+ * it is a different line: a JSON record no longer parses, and goes out as raw
+ * text that nothing masks by key.
  */
-const MAX_PARSED_LINE_LENGTH = 16 * 1024;
+const MAX_REDACTED_LENGTH = 16 * 1024;
+
+/**
+ * How much of what the redactor is shown is there only to be seen, past the
+ * text that is sent.
+ *
+ * A cut through a secret leaves two pieces no rule recognises, and the piece
+ * in front of the cut ships: masking shortens the text before it - a long
+ * `token=AAAA…` becomes `token=[REDACTED]` - so the edge of a 16 KB window can
+ * land inside the 4 KB the shared buffer keeps of an entry. So text that has
+ * to be cut is redacted twice, cut and with this much more of it, and only
+ * what the two agree on is sent: a secret the cut splits is whole, and
+ * masked, in the longer text, and the two part where it starts. A secret
+ * longer than this that a cut splits can still leave its start behind.
+ */
+const REDACTION_LOOKAHEAD = 4 * 1024;
 
 /**
  * Longest `context` the collector accepts. It does not cut a longer one down:
@@ -49,8 +76,45 @@ const MAX_PARSED_LINE_LENGTH = 16 * 1024;
  */
 const MAX_CONTEXT_LENGTH = 255;
 
+/**
+ * Most entries one write may add to the log buffer.
+ *
+ * The buffer's caps are shared by the whole process and keep what came first,
+ * so a single logged value full of line breaks - a client's username, a
+ * posted object `util.inspect` prints a property per line - would otherwise
+ * become thousands of entries, push every other request's lines out of the
+ * batch, and hold the event loop while each one was parsed and redacted.
+ * Past this many, the opening lines are kept and one more entry says how many
+ * followed.
+ */
+const MAX_ENTRIES_PER_WRITE = 50;
+
+/**
+ * Most unfinished lines held per stream, one for each execution that has
+ * written one. An execution that ends without writing its newline leaves its
+ * line behind, so past this many the one written to longest ago is forwarded
+ * as it is.
+ */
+const MAX_HELD_LINES = 64;
+
 const FORWARDED_STREAMS = ["stdout", "stderr"] as const;
 type ForwardedStream = (typeof FORWARDED_STREAMS)[number];
+
+type Store = Map<string, any>;
+
+type LogEntry = Parameters<ObserveAgentSharedBuffer["pushLogs"]>[0][number];
+
+/** The start of a line one execution is writing, and what it was written in. */
+interface HeldLine {
+  text: string;
+  /** The async store of the last piece, which the line is filed under. */
+  store: Store | undefined;
+  /**
+   * Set once the line was forwarded at the cap: what follows, up to its
+   * newline, is the rest of it, and is dropped - see `MAX_PARTIAL_LINE_LENGTH`.
+   */
+  overflowed: boolean;
+}
 
 @Injectable()
 export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
@@ -64,10 +128,21 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
    *
    * One fragment per stream: stdout and stderr interleave freely, and joining
    * the tail of one onto the head of the other would fuse two unrelated lines.
+   *
+   * And one per execution, for the same reason: while one request prints a
+   * reply piece by piece, others log. Joined, the pieces written so far went
+   * out under the trace of whoever logged next, in front of a line that no
+   * longer parsed, and a secret still being written was cut in two before it
+   * was redacted. Keyed by the trace, as the registry is, rather than by the
+   * store, which is copied for every span. Writes outside any execution share
+   * the `undefined` key. Kept in the order the lines were last written to.
    */
-  private readonly partialLines: Record<ForwardedStream, string> = {
-    stdout: "",
-    stderr: "",
+  private readonly partialLines: Record<
+    ForwardedStream,
+    Map<unknown, HeldLine>
+  > = {
+    stdout: new Map(),
+    stderr: new Map(),
   };
   private originalWrites: Record<
     ForwardedStream,
@@ -177,51 +252,247 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     for (const name of FORWARDED_STREAMS) {
-      this.flushPartial(name);
+      // Deleting the entry being visited is safe while iterating a Map.
+      for (const writer of this.partialLines[name].keys()) {
+        this.flushPartial(name, writer);
+      }
       process[name].write = this.originalWrites[name];
     }
     this.originalWrites = null;
   }
 
   private consume(chunk: string, name: ForwardedStream = "stdout") {
-    const combined = this.partialLines[name] + chunk;
+    const store: Store | undefined = this.als.getStore();
+    const writer: unknown =
+      store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
+    const held = this.partialLines[name];
+    const heldLine = held.get(writer);
+    let combined = chunk;
+    if (heldLine !== undefined) {
+      // Set again below rather than updated in place, so the map stays in
+      // the order the lines were last written to.
+      held.delete(writer);
+      if (heldLine.overflowed) {
+        const newline = chunk.indexOf("\n");
+        if (newline === -1) {
+          held.set(writer, heldLine);
+          return;
+        }
+        combined = chunk.slice(newline + 1);
+      } else {
+        combined = heldLine.text + chunk;
+      }
+    }
     const segments = combined.split("\n");
 
     // The final segment has no newline yet, so it is either an incomplete line
     // or the empty string left by a chunk that ended cleanly.
-    this.partialLines[name] = segments.pop() ?? "";
+    const tail = segments.pop() ?? "";
 
-    const entries = segments
-      .filter((line) => line.trim().length > 0)
-      .map((line) => this.toLogEntry(line));
+    const entries = this.toLogEntries(
+      segments.filter((line) => line.trim().length > 0),
+      store,
+    );
+    if (tail.length > MAX_PARTIAL_LINE_LENGTH) {
+      if (tail.trim().length > 0) {
+        entries.push(...this.toLogEntries([tail], store, true));
+      }
+      held.set(writer, { text: "", store, overflowed: true });
+    } else if (tail.length > 0) {
+      held.set(writer, { text: tail, store, overflowed: false });
+    }
 
     if (entries.length > 0) {
       this.observeAgentSharedBuffer.pushLogs(entries);
     }
 
-    if (this.partialLines[name].length > MAX_PARTIAL_LINE_LENGTH) {
-      this.flushPartial(name);
+    if (held.size > MAX_HELD_LINES) {
+      this.flushPartial(name, held.keys().next().value);
     }
   }
 
-  private flushPartial(name: ForwardedStream) {
-    const partialLine = this.partialLines[name];
-    this.partialLines[name] = "";
-    if (partialLine.trim().length === 0) {
+  /** Forwards, as it is, the line one execution left unfinished. */
+  private flushPartial(name: ForwardedStream, writer: unknown) {
+    const line = this.partialLines[name].get(writer);
+    this.partialLines[name].delete(writer);
+    if (line === undefined || line.text.trim().length === 0) {
       return;
     }
-    this.observeAgentSharedBuffer.pushLogs([this.toLogEntry(partialLine)]);
+    this.observeAgentSharedBuffer.pushLogs(
+      this.toLogEntries([line.text], line.store),
+    );
   }
 
-  private toLogEntry(rawLine: string) {
-    const line =
-      rawLine.length > MAX_PARSED_LINE_LENGTH
-        ? rawLine.slice(0, MAX_PARSED_LINE_LENGTH)
-        : rawLine;
-    const parsed = parseLogLine(line);
+  /**
+   * The entries for the complete lines of one write - an entry per line, but
+   * with the lines of one message redacted as the one text they were written
+   * as.
+   *
+   * A logger hands over a message in a single write however many lines it
+   * runs to, and only the first carries its prefix: the rest - the stack
+   * under an error, a key in its PEM layout, a value that holds a line break -
+   * arrive plain. Redacted a line at a time, such a secret is never seen
+   * whole. So a line is redacted together with the plain lines under it; a
+   * line with a prefix of its own starts another message, and a JSON record
+   * is always a message by itself. A masked value takes its line breaks with
+   * it, so a message can come back as fewer entries than it had lines.
+   *
+   * At most `MAX_ENTRIES_PER_WRITE` lines are read, and the lines past them
+   * are shown to the redactor with the last message, so a secret the cut
+   * splits is not half-sent. `store` is the one the lines were written in.
+   * `unfinished` for a line that goes on past what was written of it - see
+   * `MAX_PARTIAL_LINE_LENGTH`.
+   */
+  private toLogEntries(
+    lines: string[],
+    store: Store | undefined,
+    unfinished = false,
+  ): LogEntry[] {
+    // Cut before anything is parsed or redacted, which is where the time
+    // goes.
+    const read =
+      lines.length > MAX_ENTRIES_PER_WRITE
+        ? MAX_ENTRIES_PER_WRITE - 1
+        : lines.length;
+    const messages: Array<{
+      head: ParsedLogLine;
+      lines: string[];
+      longest: number;
+    }> = [];
+    for (let index = 0; index < read; index += 1) {
+      const line = lines[index];
+      // Parsed whole: see `MAX_REDACTED_LENGTH`.
+      const parsed = parseLogLine(line);
+      const message = messages.at(-1);
+      if (
+        message !== undefined &&
+        message.head.format !== "json" &&
+        parsed.format === "plain"
+      ) {
+        message.lines.push(parsed.message);
+        message.longest = Math.max(message.longest, line.length);
+      } else {
+        messages.push({
+          head: parsed,
+          // A bracket read as the context is redacted with the message - see
+          // `splitContext`.
+          lines: [parsed.unsplit ?? parsed.message],
+          longest: line.length,
+        });
+      }
+    }
 
-    const store = this.als.getStore();
-    const contextTraceId = store?.get(this.options.traceIdKey);
+    const entries: LogEntry[] = [];
+    for (const [index, message] of messages.entries()) {
+      const { head } = message;
+      let text = message.lines.join("\n");
+      let keep = text.length;
+      if (index === messages.length - 1 && head.format !== "json") {
+        if (read < lines.length) {
+          text += this.linesAfter(lines, read);
+        } else if (unfinished) {
+          keep -= REDACTION_LOOKAHEAD;
+        }
+      }
+      const redacted = this.redact(text, keep);
+      const texts = head.format === "json" ? [redacted] : redacted.split("\n");
+      const first = this.splitContext(head, texts[0]);
+      entries.push(
+        this.toLogEntry(
+          first.text,
+          store,
+          head,
+          first.context,
+          message.longest,
+        ),
+      );
+      // The lines under the first had no prefix of their own.
+      for (let at = 1; at < texts.length; at += 1) {
+        entries.push(this.toLogEntry(texts[at], store));
+      }
+    }
+    if (read < lines.length) {
+      entries.push(
+        this.toLogEntry(
+          `[observe] ${lines.length - read} more lines of this write not forwarded`,
+          store,
+        ),
+      );
+    }
+    return entries;
+  }
+
+  /**
+   * The lines from `from` on, as the redactor is shown them past the last line
+   * that is sent: each after a line break, and only as many as
+   * `REDACTION_LOOKAHEAD` covers.
+   */
+  private linesAfter(lines: string[], from: number): string {
+    let after = "";
+    for (
+      let index = from;
+      index < lines.length && after.length < REDACTION_LOOKAHEAD;
+      index += 1
+    ) {
+      after += "\n" + stripAnsi(lines[index]).trimEnd();
+    }
+    return after;
+  }
+
+  /**
+   * The context and the text of a message's first line, `line` redacted.
+   *
+   * On a text line the context is a guess: the first `[...]` after the level.
+   * A line logged without a context reads the same when its message opens
+   * with `[` - `Logger.log(JSON.stringify(users))` - and the bracket then
+   * closes at the message's first `]`, wherever that falls. Inside a
+   * password, neither half matched a rule redacted apart, and both went out.
+   * So the bracket was redacted together with the message, as written, and
+   * the guess is kept only when the context, redacted by itself, is how the
+   * line still opens. When a mask runs across the bracket the line is sent
+   * whole, without a context. Either way both fields are cut from the line
+   * redacted whole.
+   */
+  private splitContext(
+    head: ParsedLogLine,
+    line: string,
+  ): { context?: string; text: string } {
+    if (head.unsplit === undefined) {
+      return {
+        context:
+          head.context === undefined ? undefined : this.toContext(head.context),
+        text: line,
+      };
+    }
+    const context = this.redact(head.context ?? "");
+    if (!line.startsWith(`[${context}`)) {
+      return { text: line };
+    }
+    return {
+      context: fitToLength(context, MAX_CONTEXT_LENGTH),
+      // A value without quotes runs on to the next space and takes the
+      // bracket's own `]` with it: `[token=abc] login`.
+      text: line.slice(context.length + 1).replace(/^\]?\s*/, ""),
+    };
+  }
+
+  /**
+   * `text` is redacted by now; `parsed` is the line it opens, when that line
+   * said more than its text, and `context` that line's, redacted. `longest`
+   * is the longest line `text` was read from: a line too long for the
+   * redactor's window goes without its attributes, whose length only it
+   * bounds - every string in them would need the window too.
+   */
+  private toLogEntry(
+    text: string,
+    store: Store | undefined,
+    parsed?: ParsedLogLine,
+    context?: string,
+    longest = 0,
+  ): LogEntry {
+    // Not a store whose operation ended a while ago: a line a timer it left
+    // armed writes is no line of that operation's.
+    const contextTraceId = liveTraceId(store, this.options.traceIdKey);
     // The line's own trace id wins: it was captured when the log was written,
     // whereas the async store is read now and may already have moved on.
     //
@@ -230,7 +501,7 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     // `Trace ID:` they like - so it is held to the rule a client-supplied
     // `x-request-id` is. An over-long one would get the whole batch refused.
     const lineTraceId =
-      parsed.traceId !== undefined && REQUEST_ID_PATTERN.test(parsed.traceId)
+      parsed?.traceId !== undefined && REQUEST_ID_PATTERN.test(parsed.traceId)
         ? parsed.traceId
         : undefined;
     const traceId = lineTraceId ?? contextTraceId;
@@ -246,22 +517,56 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
         traceId === contextTraceId
           ? store?.get(CALLER_METADATA_KEY)
           : undefined,
-      level: parsed.level,
-      context:
-        parsed.context === undefined
-          ? undefined
-          : this.toContext(parsed.context),
-      // Redaction happens here, before the entry reaches the shared buffer -
-      // which is also before the buffer truncates oversized lines. That order is
+      level: parsed?.level,
+      context,
+      // Redaction happens before the entry reaches the shared buffer - which
+      // is also before the buffer truncates oversized lines. That order is
       // deliberate: truncating first would cut a long secret in half and ship
       // the surviving half.
-      attributes: this.redactor
-        ? this.redactor.redactAttributes(parsed.attributes)
-        : parsed.attributes,
-      text: this.redactor
-        ? this.redactor.redactMessage(parsed.message)
-        : parsed.message,
+      attributes:
+        parsed?.attributes === undefined || longest > MAX_REDACTED_LENGTH
+          ? undefined
+          : this.redactor
+            ? this.redactor.redactAttributes(parsed.attributes)
+            : parsed.attributes,
+      text,
     };
+  }
+
+  /**
+   * `text` redacted, and cut where it has to be: to its first `keep`
+   * characters, and to what the redactor's window leaves room to send.
+   *
+   * Text that fits whole is redacted whole - the common case, one pass. Text
+   * that has to be cut is redacted cut and with `REDACTION_LOOKAHEAD` more of
+   * it, within the window, and only the prefix the two results share is sent:
+   * a secret the cut splits is masked in the longer one, so the two part
+   * before any of it.
+   */
+  private redact(text: string, keep: number = text.length): string {
+    const shown =
+      text.length > MAX_REDACTED_LENGTH
+        ? text.slice(0, MAX_REDACTED_LENGTH)
+        : text;
+    const sent = Math.max(
+      0,
+      Math.min(
+        keep,
+        shown.length < text.length
+          ? MAX_REDACTED_LENGTH - REDACTION_LOOKAHEAD
+          : text.length,
+      ),
+    );
+    if (!this.redactor) {
+      return sent < text.length ? text.slice(0, sent) : text;
+    }
+    if (sent >= text.length) {
+      return this.redactor.redactMessage(text);
+    }
+    return sharedPrefix(
+      this.redactor.redactMessage(text.slice(0, sent)),
+      this.redactor.redactMessage(shown),
+    );
   }
 
   /**
@@ -272,9 +577,25 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
    * cut to what the collector accepts.
    */
   private toContext(context: string): string {
-    const redacted = this.redactor
-      ? this.redactor.redactMessage(context)
-      : context;
-    return fitToLength(redacted, MAX_CONTEXT_LENGTH);
+    return fitToLength(this.redact(context), MAX_CONTEXT_LENGTH);
   }
+}
+
+/**
+ * The start `cut` and `whole` share, as a slice of `cut`. Never ends between
+ * the two halves of a surrogate pair, which would send half a character.
+ */
+function sharedPrefix(cut: string, whole: string): string {
+  const max = Math.min(cut.length, whole.length);
+  let at = 0;
+  while (at < max && cut.charCodeAt(at) === whole.charCodeAt(at)) {
+    at += 1;
+  }
+  if (at > 0 && at < cut.length) {
+    const last = cut.charCodeAt(at - 1);
+    if (last >= 0xd800 && last <= 0xdbff) {
+      at -= 1;
+    }
+  }
+  return at === cut.length ? cut : cut.slice(0, at);
 }

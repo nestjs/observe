@@ -1,5 +1,6 @@
 import type { OutgoingHttpOptions } from "../outgoing/http.integration.js";
 import type { OutgoingLlmOptions } from "../outgoing/llm/llm-fetch.integration.js";
+import type { OtlpExportOptions } from "../otlp/otlp-options.interface.js";
 import type { HttpCaptureOptions } from "../utils/capture-request.util.js";
 import {
   FactoryProvider,
@@ -72,7 +73,8 @@ export interface CreateObserveModuleOptions {
    * If not provided, a default trace ID generator will be used.
    * For HTTP protocols, the request object is passed to the function.
    * For non-HTTP protocols, the request object will be contextual and may not be available.
-   * The default implementation uses the 'x-request-id' header if available,
+   * The default implementation uses the 'x-request-id' header if available
+   * (for a microservice message, the 'x-request-id' in its packet metadata),
    * or mints a time-ordered UUID (version 7) if not - an id the collector can
    * locate in time without a scan.
    *
@@ -218,6 +220,50 @@ export interface ObserveOptions {
    * @default 'https://observe-api.nestjs.com'
    */
   endpoint?: string;
+
+  /**
+   * Exports traces as OpenTelemetry spans, over OTLP/HTTP, to a receiver of
+   * your own - an OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb,
+   * or any vendor that takes OTLP - beside what is sent to Observe.
+   *
+   * Every operation becomes a SERVER span (CONSUMER for a queue job) with its
+   * provider method calls as INTERNAL spans and its queries and outbound
+   * calls as CLIENT spans, on the same trace ids the W3C `traceparent`
+   * headers carry - so services instrumented with OpenTelemetry land in the
+   * same traces, the operation's span under the caller's. What is exported
+   * is what is recorded, after `tracesSampleRate`, `skipSpans`,
+   * `spanCollapse` and redaction; a request whose caller sampled its trace
+   * out (`traceparent` flags 00) is not exported.
+   *
+   * Part of OpenTelemetry interop, so it takes `openTelemetry: true` too,
+   * which reads the `traceparent` the spans nest under. Without it, `otlp`
+   * stays off and says so at start-up.
+   *
+   * What the app's plan includes is the collector's to say, in its reply to
+   * the agent's batches: every plan exports, a paid one every trace it
+   * records - whatever the collector then keeps of its own copy - and Free
+   * what NestJS Observe keeps: past Free's daily pacing or its monthly
+   * allowance, an operation it keeps without spans is exported without them
+   * too - and nothing a few minutes into an outage, when no reply says what
+   * that is. Export starts with the first batch the collector accepts, and a
+   * collector that grants nothing - one released before export was - leaves
+   * it off, with a line in the log.
+   *
+   * `true` takes everything from the standard `OTEL_EXPORTER_OTLP_*`,
+   * `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` variables, as an
+   * OpenTelemetry SDK would; an object sets any of it in code. Those
+   * variables never turn export on by themselves - an application that also
+   * runs an OpenTelemetry SDK has them set for that SDK, and would send
+   * every trace twice.
+   *
+   * Runs beside reporting to NestJS Observe, never instead of it, and only
+   * while `openTelemetry` interop is on: off with `enabled: false`, and off
+   * without the credentials the hosted collector needs - a proxy at
+   * `endpoint` that adds them on the way still counts. Traces only: metrics
+   * and logs are not exported.
+   * @default false
+   */
+  otlp?: boolean | OtlpExportOptions;
 
   /**
    * Unique identifier for the service.
@@ -485,11 +531,13 @@ export interface ObserveOptions {
      * sends ahead of a cross-origin call.
      *
      * Off by default. A preflight is answered by the CORS middleware before
-     * any route matches, so it has no route to be grouped under. Whenever
-     * middleware registered ahead of CORS (helmet, compression) records a
-     * span for it, it is reported under its URL instead - one "route" per
-     * distinct URL, ids included, for every call a browser client makes. An
-     * `OPTIONS` request without that header is traced either way.
+     * any route matches, so it has no route to be grouped under: on, each one
+     * is reported under its URL - one "route" per distinct URL, ids included,
+     * for every call a browser client makes. That holds whether or not
+     * middleware registered ahead of CORS (helmet, compression) ran for it,
+     * and on Fastify from `@nestjs/platform-fastify` 12.1.3 none does: Nest
+     * answers a preflight there before its middleware. An `OPTIONS` request
+     * without that header is traced either way.
      * @default false
      */
     tracePreflights?: boolean;
@@ -517,7 +565,9 @@ export interface ObserveOptions {
      * Applied *in addition to* the built-in redaction, which always masks the
      * values of well-known sensitive parameters (`token`, `password`, `code`,
      * `signature`, ...) whether or not this is set. Use it for the parameters
-     * only your application knows are sensitive.
+     * only your application knows are sensitive. It is matched against every
+     * URL the agent records: the request's own, a URL in a captured request
+     * header (`referer`, ...) and the URL of an outgoing HTTP call.
      * @default undefined
      */
     queryParamsObfuscateRegex?: RegExp;
@@ -684,7 +734,8 @@ export interface ObserveOptions {
   };
   /**
    * Interoperates with OpenTelemetry. Off by default, and off, the agent
-   * reads and sends `x-request-id` alone, as it always has.
+   * reads and sends `x-request-id` alone, as it always has. To export the
+   * agent's spans over OTLP as well, set `otlp` beside it.
    *
    * On:
    * - A request that arrives in a W3C trace (`traceparent`) is reported under
@@ -699,16 +750,26 @@ export interface ObserveOptions {
    *   reported under the trace of the server span the SDK opened for it, the
    *   request that starts a trace included, and `traceparent` on outbound
    *   calls is left to the SDK.
+   * - A BullMQ or Bull job, and a message over a built-in transport - TCP and
+   *   Redis on `@nestjs/microservices` 12.0.4 and later, NATS, Kafka,
+   *   RabbitMQ, MQTT 5 and gRPC on 12.3.3 and later - carry a W3C
+   *   `traceparent` beside their trace id, for whatever runs them to
+   *   continue: an OpenTelemetry SDK in the Nest process that runs one does,
+   *   in the span an instrumentation such as `bullmq-otel` opens for the
+   *   work, else in the trace handed on - so its spans there, and the calls
+   *   they make, stay in the trace that handed the work on.
    *
    * A `traceIdGenerator` passed to `createObserveModule()` still names the
    * trace; the W3C one is carried on beside it.
    *
-   * It works only beside reporting to NestJS Observe: from the first batch
-   * the collector accepts, and paused - each time with a line in the log -
-   * while the collector refuses the app's credentials, once batches have
-   * failed to get in for a minute, or while the agent's worker is down. It
-   * resumes with the next batch the collector accepts. With `enabled: false`,
-   * or without credentials for the hosted collector, it never turns on.
+   * It works only beside reporting to NestJS Observe. It is on from
+   * start-up, and stays on through collector outages and rate limits, so
+   * traces through the services around this one stay whole from an
+   * instance's first request, and while NestJS Observe is down. It pauses -
+   * each time with a line in the log - only while the collector refuses the
+   * app's credentials or the agent's worker is down, and resumes with the
+   * next batch the collector accepts. With `enabled: false`, or without
+   * credentials for the hosted collector, it never turns on.
    * @default false
    */
   openTelemetry?: boolean;

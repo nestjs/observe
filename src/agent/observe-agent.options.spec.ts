@@ -28,6 +28,7 @@ describe("ObserveAgentWorker options", () => {
     acquireLock: vi.fn(() => true),
     encodeAndWrite: vi.fn(),
     releaseLock: vi.fn(),
+    recordStarted: vi.fn(),
   };
   const metrics = { collectNodeRuntimeMetrics: collect };
 
@@ -156,6 +157,30 @@ describe("ObserveAgentWorker options", () => {
     build({ runtimeMetrics: true }).onModuleInit();
 
     expect(runtimeMetricsStarted()).toBe(true);
+  });
+
+  // `process.memoryUsage()` opens /proc/self/stat, and throws when no file
+  // descriptor is free - which a flood of idle connections can arrange. Out
+  // of a bare timer, that would be an uncaught exception in the host.
+  it("skips a runtime sample that cannot be taken, and takes the next", () => {
+    vi.useFakeTimers();
+    build({ runtimeMetrics: true }).onModuleInit();
+    collect
+      .mockImplementationOnce(() => {
+        throw Object.assign(
+          new Error("EMFILE: too many open files, uv_resident_set_memory"),
+          { code: "EMFILE" },
+        );
+      })
+      .mockImplementationOnce(() => ({ sample: 2 }));
+
+    expect(() => vi.advanceTimersByTime(60_000)).not.toThrow();
+    expect(sharedBuffer.addNodeRuntimeMetrics).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(60_000);
+    expect(sharedBuffer.addNodeRuntimeMetrics).toHaveBeenCalledWith({
+      sample: 2,
+    });
   });
 
   it("does not collect when explicitly switched off", () => {

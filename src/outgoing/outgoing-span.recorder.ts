@@ -122,6 +122,7 @@ export class OutgoingSpanRecorder {
         methodKey,
         spanId,
         error === undefined || error === null ? undefined : (error as Error),
+        true,
       );
       // A held span closes late; the call itself ended at `endedAt`.
       if (node && endedAt !== undefined && startTime !== undefined) {
@@ -213,12 +214,26 @@ export class OutgoingSpanRecorder {
     if (typeof then === "function") {
       (then as PromiseLike<unknown>["then"]).call(
         result,
-        () => span.end(),
-        (error: unknown) => span.end(error),
+        () => endQuietly(span),
+        (error: unknown) => endQuietly(span, error),
       );
     } else {
-      span.end();
+      endQuietly(span);
     }
     return result;
+  }
+}
+
+/**
+ * Ends a span whose closing must not reach the caller: the span is a side
+ * effect of the call, not part of its outcome. Thrown from the side branch a
+ * promise is watched on, it would be a rejection nothing handles, and end the
+ * process; thrown on the spot, it would fail a call that succeeded.
+ */
+function endQuietly(span: OpenOutgoingSpan, error?: unknown): void {
+  try {
+    span.end(error);
+  } catch {
+    // Nothing to record it in.
   }
 }

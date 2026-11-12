@@ -27,6 +27,14 @@ export interface DetachedWorkerConfig {
   pausedPrefix: string;
   /** `NOT_INGESTED_MESSAGE_PREFIX`, as data, for the same reason. */
   notIngestedPrefix: string;
+  /** `OTLP_EXPORT_MESSAGE_PREFIX`, as data, for the same reason. */
+  otlpExportPrefix: string;
+  /**
+   * Whether `otlp` is set up to export, so batches ask the collector what
+   * the app's plan allows it (`OTLP_EXPORT_INGEST_MODE`) and the answer is
+   * posted back. False leaves every batch and every line as they were.
+   */
+  asksForOtlpExport: boolean;
   /**
    * This package's version (`readSdkVersion`), read on the main thread: the
    * worker runs as eval'd source and cannot resolve a manifest of its own.
@@ -98,6 +106,9 @@ export const detachedObserveWorker = (
   const degradedPrefix = config.degradedPrefix;
   const pausedPrefix = config.pausedPrefix;
   const notIngestedPrefix = config.notIngestedPrefix;
+  const otlpExportPrefix = config.otlpExportPrefix;
+  // Read as truthy, so a config without it asks nothing and posts no line.
+  const asksForOtlpExport = config.asksForOtlpExport;
 
   /**
    * Built here, used only when the collector answers 400. The shapes travel
@@ -116,8 +127,12 @@ export const detachedObserveWorker = (
     // degraded-ingest.protocol.ts. A literal rather than data from `config`
     // like the prefixes: nothing in the agent reads it back, and a missing
     // config key would put a broken header on every batch. The value is
-    // pinned by worker-degraded-reply.spec.ts.
-    "x-observe-ingest-modes": "reduced, trimmed, paced, errors-only",
+    // pinned by worker-degraded-reply.spec.ts. `otlp-export`
+    // (`OTLP_EXPORT_INGEST_MODE`) asks what the app's plan allows `otlp` to
+    // export, and is listed only by an agent set up to export.
+    "x-observe-ingest-modes":
+      "reduced, trimmed, paced, errors-only" +
+      (asksForOtlpExport ? ", otlp-export" : ""),
     // Which agent sent the batch, so the collector can tell an application
     // still on an old release that a newer one exists.
     "x-observe-sdk-version": config.sdkVersion,
@@ -321,6 +336,20 @@ export const detachedObserveWorker = (
    */
   const REQUEST_TIMEOUT_MS = 15_000;
 
+  /**
+   * The most of a reply that is read.
+   *
+   * Collector replies are a few hundred bytes; the rest is room for a proxy's
+   * error page, of which 500 characters are ever shown. The reply is held,
+   * decoded and parsed in the application's process, so without a limit its
+   * size - and many times that once parsed - would be the sender's to choose,
+   * up to a heap out of memory that ends the whole process. Past the limit
+   * the reading stops and the connection goes with it. The status still
+   * counts: the collector did answer, and a body cut short does not parse as
+   * JSON, which every reader below already treats as no body at all.
+   */
+  const MAX_REPLY_BYTES = 64 * 1024;
+
   /** What the code below reads from a collector reply. */
   interface CollectorResponse {
     ok: boolean;
@@ -332,11 +361,12 @@ export const detachedObserveWorker = (
   }
 
   /**
-   * One POST, with the reply read to the end before it resolves.
+   * One POST, with the reply read before it resolves - to the end, or as far
+   * as `MAX_REPLY_BYTES`.
    *
    * Read whatever the status: a reply left unread keeps its socket busy, and
    * the next batch opens another connection - the 401/403 path never read
-   * its body under `fetch`. Collector replies are a few hundred bytes.
+   * its body under `fetch`.
    *
    * A transport failure rejects with the failure as `cause`, the shape the
    * reporting below reads (ECONNREFUSED and friends on `err.cause.code`), and
@@ -353,12 +383,12 @@ export const detachedObserveWorker = (
         },
         (res: IncomingMessage) => {
           const chunks: Buffer[] = [];
-          res.on("data", (chunk: Buffer) => chunks.push(chunk));
-          res.on("error", (err: Error) =>
-            reject(new Error("collector reply failed", { cause: err })),
-          );
-          res.on("end", () => {
-            const text = Buffer.concat(chunks).toString("utf8");
+          let received = 0;
+          const settle = () => {
+            const text = Buffer.concat(
+              chunks,
+              Math.min(received, MAX_REPLY_BYTES),
+            ).toString("utf8");
             const status = res.statusCode ?? 0;
             resolve({
               ok: status >= 200 && status < 300,
@@ -376,7 +406,29 @@ export const detachedObserveWorker = (
               text: async () => text,
               json: async () => JSON.parse(text),
             });
+            // A reply can end while the batch is still being written - a
+            // collector or proxy answering off the head and reading no
+            // further. The send is decided; the socket would never be
+            // pooled, timed out or closed again, one more for every flush.
+            if (!req.writableFinished) {
+              req.destroy();
+            }
+          };
+          res.on("data", (chunk: Buffer) => {
+            if (received >= MAX_REPLY_BYTES) {
+              return;
+            }
+            chunks.push(chunk);
+            received += chunk.length;
+            if (received >= MAX_REPLY_BYTES) {
+              res.destroy();
+              settle();
+            }
           });
+          res.on("error", (err: Error) =>
+            reject(new Error("collector reply failed", { cause: err })),
+          );
+          res.on("end", settle);
         },
       );
       req.on("error", (err: Error) =>
@@ -389,6 +441,21 @@ export const detachedObserveWorker = (
           ),
         ),
       );
+      // A 101 with `Connection: Upgrade` is no response to Node: it emits
+      // only this, and destroys the socket without an error. Unheard, the
+      // send would never settle, and the worker would end with the lock
+      // still held. No upgrade was asked for, so it fails like any other
+      // transport failure.
+      req.on("upgrade", (res: IncomingMessage, socket: { destroy(): void }) => {
+        socket.destroy();
+        reject(
+          new Error("request to the collector failed", {
+            cause: new Error(
+              `it answered ${res.statusCode} to a request that asked for no upgrade`,
+            ),
+          }),
+        );
+      });
       req.setTimeout(REQUEST_TIMEOUT_MS, () =>
         req.destroy(
           Object.assign(
@@ -669,7 +736,22 @@ export const detachedObserveWorker = (
         paced?: unknown;
         errorsOnly?: unknown;
         reason?: unknown;
+        otlpExport?: unknown;
       };
+
+      // What the app's plan allows `otlp` to export - see `OtlpExportGrant`.
+      // Every accepted reply says it again, and a reply that says nothing
+      // grants nothing: a collector that predates export, or a plan without
+      // it. Ahead of the verdict below, which the main thread reads as the
+      // collector taking the app's telemetry - by then it knows what export
+      // may do with it.
+      if (asksForOtlpExport) {
+        const grant =
+          reply.otlpExport === "full" || reply.otlpExport === "capped"
+            ? reply.otlpExport
+            : "off";
+        parentPort.postMessage(`${otlpExportPrefix}${grant}`);
+      }
       // `false`, `true`, `trimmed`, `paced` or `errors-only`. `trimmed`,
       // `paced` and `errorsOnly` say only why or how the spans are discarded,
       // so they count only beside `degraded`; a collector that sends none of

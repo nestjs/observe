@@ -12,7 +12,7 @@ import {
   describePeerLoadError,
   loadOptionalPeer,
 } from "../utils/optional-peer.util.js";
-import { JobTraceRunner } from "./job-trace-runner.js";
+import { JobTraceRunner, readJobTimes } from "./job-trace-runner.js";
 
 /** The fields of a Bull (v3/v4) job this agent reads, structurally typed. */
 interface BullJobLike {
@@ -85,19 +85,7 @@ export class BullObserveAgentService<Store extends Record<string, unknown>> {
   }
 
   private readQueueMetadata(job: BullJobLike): Partial<JobSnapshot> {
-    const metadata: Partial<JobSnapshot> = {};
-
-    if (typeof job.timestamp === "number") {
-      metadata.enqueuedAt = new Date(job.timestamp).toISOString();
-      const startedAt =
-        typeof job.processedOn === "number" ? job.processedOn : Date.now();
-      // As with BullMQ: a delay the caller asked for is a schedule, not a
-      // backlog, so the wait is measured from when the job became runnable.
-      // `||`, not `??`: the job's own `delay` reads 0 once Bull has promoted
-      // it, and only the options still say what was asked for.
-      const delay = job.delay || job.opts?.delay || 0;
-      metadata.waitDuration = Math.max(0, startedAt - (job.timestamp + delay));
-    }
+    const metadata = readJobTimes(job);
     if (typeof job.attemptsMade === "number") {
       metadata.attemptsMade = job.attemptsMade;
     }

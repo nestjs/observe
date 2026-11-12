@@ -92,6 +92,8 @@ export function captureRequest(
   req: unknown,
   options: HttpCaptureOptions | false | undefined,
   redactor: LogRedactor | null,
+  /** `http.queryParamsObfuscateRegex`, global. */
+  obfuscateUrl?: RegExp,
 ): CapturedRequest | undefined {
   if (options === false || typeof req !== "object" || req === null) {
     return undefined;
@@ -108,14 +110,24 @@ export function captureRequest(
       if (typeof value !== "string" || value.length === 0) {
         continue;
       }
-      const bounded = value.slice(0, MAX_HEADER_VALUE_LENGTH);
-      // A referer is a URL, and its query string is where the tokens live.
-      headers[key] =
-        key === "referer" ? redactUrlQuery(bounded, redactor) : bounded;
+      // Any header can carry a URL - `referer`, `x-forwarded-uri`,
+      // `x-original-url` - and its query string is where the tokens live.
+      // Masking is by key, so a value that is no URL comes back untouched.
+      headers[key] = redactUrlQuery(value, redactor, obfuscateUrl);
     }
     if (Object.keys(headers).length > 0) {
-      captured.headers = (
-        redactor ? redactor.redactAttributes(headers) : headers
+      // Redacted whole and cut afterwards, as the body is: the rules that
+      // recognise a secret by its end - a JWT's last dot, a closing quote, a
+      // card's last digits - stop matching once the cut goes through it, and
+      // the head of the secret would be sent.
+      const redacted = redactor ? redactor.redactAttributes(headers) : headers;
+      captured.headers = Object.fromEntries(
+        Object.entries(redacted ?? {}).map(([key, value]) => [
+          key,
+          typeof value === "string"
+            ? value.slice(0, MAX_HEADER_VALUE_LENGTH)
+            : value,
+        ]),
       ) as Record<string, string>;
     }
   }
@@ -127,7 +139,7 @@ export function captureRequest(
         : DEFAULT_CAPTURED_BODY_BYTES,
       MAX_CAPTURED_BODY_BYTES,
     );
-    const serialized = serializeBody(request.body, redactor);
+    const serialized = serializeBody(request.body, redactor, maxBytes);
     if (serialized !== undefined) {
       if (Buffer.byteLength(serialized) > maxBytes) {
         const bytes = Buffer.from(serialized);
@@ -153,25 +165,111 @@ export function captureRequest(
  * Redaction runs on the parsed structure, before serialization and before the
  * cut - key-based rules need the keys, and truncating first could ship the
  * surviving half of a secret.
+ *
+ * A body that arrived as a string but is JSON (sent as `text/plain`, say) is
+ * parsed first, so it is held to the same key rules as one the framework
+ * parsed.
  */
 function serializeBody(
   body: unknown,
   redactor: LogRedactor | null,
+  maxBytes: number,
 ): string | undefined {
   if (typeof body === "string") {
-    return redactor ? redactor.redactMessage(body) : body;
+    const parsed = parseJsonDocument(body);
+    if (parsed === undefined) {
+      return redactor ? redactor.redactMessage(body) : body;
+    }
+    body = parsed;
   }
-  if (Buffer.isBuffer(body) || typeof body !== "object") {
+  if (Buffer.isBuffer(body) || typeof body !== "object" || body === null) {
     // A raw buffer is a file or an unparsed stream - nothing readable to show.
     return undefined;
   }
   try {
+    const bounded = boundToCap(body, { nodes: maxBytes }, new Set());
     const redacted = redactor
-      ? redactor.redactAttributes(body as Record<string, unknown>)
-      : body;
+      ? redactor.redactAttributes(bounded as Record<string, unknown>)
+      : bounded;
     return JSON.stringify(redacted);
   } catch {
     // Circular, or a getter that throws. Reporting an error must not raise one.
     return undefined;
+  }
+}
+
+function parseJsonDocument(body: string): object | undefined {
+  const first = body.trimStart()[0];
+  if (first !== "{" && first !== "[") {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return typeof parsed === "object" && parsed !== null ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Deeper than the redactor descends, so nothing it would read is cut off. */
+const MAX_BOUNDED_DEPTH = 10;
+
+/**
+ * A copy of the body holding only the nodes that can still show up in the
+ * first `maxBytes` of its JSON, in the order JSON writes them. Every value
+ * and key takes at least a byte, so past `maxBytes` of them the rest is cut
+ * anyway - and the rest can be enormous: multer turns `f[1000000]=x` into an
+ * array of a million holes, each written out as `null`, from one short field.
+ */
+function boundToCap(
+  value: unknown,
+  budget: { nodes: number },
+  /** The objects above this one, to refuse a cycle as JSON.stringify would. */
+  ancestors: Set<object>,
+): unknown {
+  budget.nodes -= 1;
+  // What JSON.stringify would write for it: a Date its ISO string, and so on.
+  const toJSON: unknown =
+    value !== null && typeof value === "object"
+      ? (value as { toJSON?: unknown }).toJSON
+      : undefined;
+  if (typeof toJSON === "function") {
+    value = (toJSON as () => unknown).call(value);
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (ancestors.has(value)) {
+    throw new TypeError("Converting circular structure to JSON");
+  }
+  if (ancestors.size >= MAX_BOUNDED_DEPTH) {
+    return "[REDACTED]";
+  }
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const items: unknown[] = [];
+      for (let i = 0; i < value.length && budget.nodes > 0; i++) {
+        items.push(boundToCap(value[i], budget, ancestors));
+      }
+      return items;
+    }
+    const entries: Record<string, unknown> = {};
+    for (const key in value) {
+      if (budget.nodes <= 0) {
+        break;
+      }
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        budget.nodes -= 1;
+        entries[key] = boundToCap(
+          (value as Record<string, unknown>)[key],
+          budget,
+          ancestors,
+        );
+      }
+    }
+    return entries;
+  } finally {
+    ancestors.delete(value);
   }
 }
