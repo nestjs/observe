@@ -647,6 +647,38 @@ describe("TracerService", () => {
       expect(upserted).toEqual([]);
     });
 
+    it("reports at most 1,000 metrics, counters, gauges and summaries together", () => {
+      const warn = vi
+        .spyOn((tracer as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      // Named after something a client sent: each new name was kept for the
+      // life of the process and put a `custom` entry of its own in the batch,
+      // which the collector refuses whole past 5,000.
+      for (let index = 0; index < 400; index++) {
+        tracer.counter(`imported.${index}`).increment();
+        tracer.gauge(`queued.${index}`).increment();
+        tracer.summary(`took.${index}`).observe(index);
+      }
+
+      const names = new Set(upserted.map((metric) => metric.name));
+      expect(names.size).toBe(1_000);
+      expect(names.has("imported.333")).toBe(true);
+      expect(names.has("took.333")).toBe(false);
+      expect(warn).toHaveBeenCalledOnce();
+
+      // One the registry already holds keeps working past the limit.
+      tracer.counter("imported.0").increment();
+      expect(tracer.counter("imported.0").getValue()).toBe(2);
+      // One it refused is still a metric the caller can use, just not one
+      // that is reported.
+      const refused = tracer.counter("imported.after");
+      expect(() => refused.increment()).not.toThrow();
+      expect(upserted.map((metric) => metric.name)).not.toContain(
+        "imported.after",
+      );
+    });
+
     it("keeps pushing after a metric is re-retrieved", () => {
       tracer.counter("orders").increment();
       tracer.counter("orders").increment();

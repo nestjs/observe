@@ -200,6 +200,16 @@ interface AgentMetricsPayload {
   jobs?: Array<EncodedJobSnapshot>;
 }
 
+/**
+ * What a metric is told apart by in a batch: its type and the name as sent,
+ * which the encoder cuts to what the collector accepts. Matched on the
+ * metric's own name, two metrics whose names are cut alike would be two
+ * entries of one name.
+ */
+function sentMetricKey(encoded: EncodedCustomMetric): string {
+  return `${encoded.t}:${encoded.n}`;
+}
+
 @Injectable()
 export class ObserveAgentSharedBuffer {
   private readonly _sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
@@ -753,26 +763,50 @@ export class ObserveAgentSharedBuffer {
     this._metricsToEncode.add(metric);
   }
 
-  private placeCustomMetric(metric: Counter<any> | Gauge<any> | Summary<any>) {
+  /**
+   * Encodes every metric changed in the window into the batch's `custom`
+   * section, once each.
+   *
+   * At most `MAX_BATCH_ITEMS` entries: the collector refuses a batch with
+   * more, and everything else of the window with it. A metric left out is
+   * not marked as delivered, so a counter's increase or a summary's window
+   * rides the next batch the metric changes in.
+   */
+  private placeChangedMetrics(): void {
     const custom = this._mainThreadBuffer?.custom;
     if (!custom) {
       return;
     }
 
-    // Matched on the name as sent, which the encoder cuts to what the
-    // collector accepts. Matched on the metric's own, a metric whose name is
-    // cut would be buffered again on every change.
-    const encoded = CustomMetricsEncoder.encode(metric as CustomMetric);
-    const existingMetricIndex = custom.findIndex(
-      (m) => m.n === encoded.n && m.t === encoded.t,
+    const placed = new Map<string, number>();
+    custom.forEach((encoded, index) =>
+      placed.set(sentMetricKey(encoded), index),
     );
-    if (existingMetricIndex !== -1) {
-      custom[existingMetricIndex] = {
-        ...custom[existingMetricIndex],
-        ...encoded,
-      };
-    } else {
-      custom.push(encoded);
+
+    for (const metric of this._metricsToEncode) {
+      let encoded: EncodedCustomMetric;
+      try {
+        encoded = CustomMetricsEncoder.encode(metric as CustomMetric);
+      } catch (error) {
+        // One metric the encoder cannot read - a label name that is not a
+        // string at run time - is left out rather than costing the batch,
+        // and is not marked as delivered.
+        if (metric instanceof Counter || metric instanceof Summary) {
+          this._awaitingFlushAck.delete(metric);
+        }
+        this.reportUnencodableMetric(metric, error);
+        continue;
+      }
+      const key = sentMetricKey(encoded);
+      const existing = placed.get(key);
+      if (existing !== undefined) {
+        custom[existing] = { ...custom[existing], ...encoded };
+      } else if (custom.length < MAX_BATCH_ITEMS) {
+        placed.set(key, custom.length);
+        custom.push(encoded);
+      } else if (metric instanceof Counter || metric instanceof Summary) {
+        this._awaitingFlushAck.delete(metric);
+      }
     }
   }
 
@@ -894,19 +928,7 @@ export class ObserveAgentSharedBuffer {
   encodeAndWrite() {
     this.withholdLogs();
 
-    for (const metric of this._metricsToEncode) {
-      try {
-        this.placeCustomMetric(metric);
-      } catch (error) {
-        // One metric the encoder cannot read - a label name that is not a
-        // string at run time - is left out rather than costing the batch,
-        // and is not marked as delivered.
-        if (metric instanceof Counter || metric instanceof Summary) {
-          this._awaitingFlushAck.delete(metric);
-        }
-        this.reportUnencodableMetric(metric, error);
-      }
-    }
+    this.placeChangedMetrics();
     this._metricsToEncode.clear();
 
     if (this.options.debug) {

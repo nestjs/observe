@@ -1242,6 +1242,51 @@ describe("ObserveAgentSharedBuffer", () => {
       );
     });
 
+    it("writes no more metrics than the collector takes in one batch", () => {
+      const buffer = createBuffer();
+      const counters = Array.from(
+        { length: MAX_BATCH_ITEMS + 1 },
+        (_, index) => new Counter(`imported.${index}`),
+      );
+      for (const counter of counters) {
+        counter.increment();
+        buffer.upsertCustomMetric(counter);
+      }
+
+      buffer.encodeAndWrite();
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toHaveLength(MAX_BATCH_ITEMS);
+      expect(validateTelemetryPayload(batch)).toEqual([]);
+      // The one left out still holds its increase, for a later batch.
+      expect(counters.at(-1)!.getValue()).toBe(1);
+      buffer.resetMainThreadBuffer();
+      new DataView(buffer.sharedBuffer, 4, 4).setUint32(0, 0);
+      counters.at(-1)!.increment();
+      buffer.upsertCustomMetric(counters.at(-1)!);
+      buffer.encodeAndWrite();
+      const next = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(
+            buffer.sharedBuffer,
+            8,
+            new DataView(buffer.sharedBuffer, 4, 4).getUint32(0),
+          ),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(next.custom).toEqual([
+        expect.objectContaining({
+          n: `imported.${MAX_BATCH_ITEMS}`,
+          v: { default: 2 },
+        }),
+      ]);
+    });
+
     it("writes the batch without a metric that cannot be encoded", () => {
       const warn = vi
         .spyOn(Logger.prototype, "warn")

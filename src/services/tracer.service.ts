@@ -20,6 +20,18 @@ import { OperationTraceRegistry } from "./operation-trace.registry.js";
  */
 const MAX_OPERATION_ID_LENGTH = 255;
 
+/**
+ * Most metrics reported, counters, gauges and summaries together.
+ *
+ * A metric is kept for the life of the process and puts an entry of its own
+ * in every batch it changes in, and the collector refuses a batch whose
+ * `custom` section holds more than 5,000 - every request, error, job and log
+ * of the window with it. A name built from what a client sent made one per
+ * request. A fixed set of names is far below this; what varies belongs in a
+ * label, whose series each metric already bounds.
+ */
+const MAX_METRICS = 1_000;
+
 @Injectable()
 export class TracerService<
   Store extends object = Record<string | symbol, unknown>,
@@ -33,6 +45,7 @@ export class TracerService<
   private readonly summaries = new Map<string, Summary<any>>();
   private readonly logger = new Logger(TracerService.name);
   private hasReportedUnusableOperationId = false;
+  private hasReportedMetricLimit = false;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -219,6 +232,9 @@ export class TracerService<
       attributes?.initialValue,
       attributes?.labels,
     );
+    if (!this.admitsMetric(name)) {
+      return counter;
+    }
     this.registerCounterChangeHandler(counter);
     this.counters.set(name, counter);
     return counter;
@@ -285,6 +301,9 @@ export class TracerService<
       return existingRef;
     }
     const gauge = new Gauge<TLabel>(name, attributes ?? {});
+    if (!this.admitsMetric(name)) {
+      return gauge;
+    }
     this.registerGaugeChangeHandler(gauge);
     this.gauges.set(name, gauge);
     return gauge;
@@ -336,6 +355,9 @@ export class TracerService<
       return existingRef;
     }
     const summary = new Summary<TLabel>(name, attributes ?? {});
+    if (!this.admitsMetric(name)) {
+      return summary;
+    }
     this.registerSummaryChangeHandler(summary);
     this.summaries.set(name, summary);
     return summary;
@@ -476,6 +498,28 @@ export class TracerService<
   ): string {
     const traceId = store.get(this.options.traceIdKey);
     return typeof traceId === "string" ? traceId : registryKey;
+  }
+
+  /**
+   * Whether a metric not yet registered is, under `MAX_METRICS`. One that is
+   * not is still handed to the caller, so the code around it runs as it
+   * would, but it is neither reported nor kept: each call gets a new one.
+   * Reported once, as it comes from the same call site every time.
+   */
+  private admitsMetric(name: string): boolean {
+    if (
+      this.counters.size + this.gauges.size + this.summaries.size <
+      MAX_METRICS
+    ) {
+      return true;
+    }
+    if (!this.hasReportedMetricLimit) {
+      this.hasReportedMetricLimit = true;
+      this.logger.warn(
+        `Metric "${name.slice(0, 100)}" is not reported: at most ${MAX_METRICS} metrics are. Name metrics from a fixed set, and put a value that varies - an id, a client's input - in a label. Later metrics past this limit are not reported either, nor logged.`,
+      );
+    }
+    return false;
   }
 
   private registerCounterChangeHandler<TLabel extends string>(
