@@ -4,7 +4,7 @@ import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
 import { Cluster, Redis } from "ioredis";
-import { MongoClient } from "mongodb";
+import { Db, MongoClient } from "mongodb";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
 
@@ -590,6 +590,21 @@ describe("createInstanceDecorator", () => {
       const dbCopy = new Db2();
       expect(decorate(clientCopy)).toBe(clientCopy);
       expect(decorate(dbCopy)).toBe(dbCopy);
+
+      await client.close();
+    });
+
+    it("never instruments a provider class that extends MongoClient or Db", async () => {
+      // `class MongoService extends MongoClient`: proxied, a `Db` made at
+      // bootstrap held the raw client and a session started in a traced
+      // request the proxy, and the driver refused every explicit session.
+      class MongoService extends MongoClient {}
+      const client = new MongoService("mongodb://127.0.0.1:1");
+      class AppDb extends Db {}
+      const db = new AppDb(client, "app");
+
+      expect(decorate(client)).toBe(client);
+      expect(decorate(db)).toBe(db);
 
       await client.close();
     });

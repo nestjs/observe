@@ -66,30 +66,44 @@ function isFrameworkNoise(instance: object): boolean {
  * `MongoClient.startSession` spans are not.
  *
  * Matched by name and shape only: the driver is an optional peer, never
- * imported here, and an application may carry more than one copy of it.
+ * imported here, and an application may carry more than one copy of it. The
+ * name is looked for on every class up the prototype chain, so a provider
+ * class that extends either one - `class MongoService extends MongoClient` -
+ * is left alone too, for the same reason.
  */
 function isMongoDriverHandle(instance: object): boolean {
   const candidate = instance as {
-    constructor?: { name?: unknown };
     startSession?: unknown;
     db?: unknown;
     collection?: unknown;
     databaseName?: unknown;
   };
-  switch (candidate.constructor?.name) {
-    case "MongoClient":
-      return (
-        typeof candidate.startSession === "function" &&
-        typeof candidate.db === "function"
-      );
-    case "Db":
-      return (
-        typeof candidate.collection === "function" &&
-        typeof candidate.databaseName === "string"
-      );
-    default:
-      return false;
+  for (
+    let proto = Object.getPrototypeOf(instance) as {
+      constructor?: { name?: unknown };
+    } | null;
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto) as typeof proto
+  ) {
+    const name = Object.hasOwn(proto, "constructor")
+      ? proto.constructor?.name
+      : undefined;
+    if (
+      name === "MongoClient" &&
+      typeof candidate.startSession === "function" &&
+      typeof candidate.db === "function"
+    ) {
+      return true;
+    }
+    if (
+      name === "Db" &&
+      typeof candidate.collection === "function" &&
+      typeof candidate.databaseName === "string"
+    ) {
+      return true;
+    }
   }
+  return false;
 }
 
 /**
