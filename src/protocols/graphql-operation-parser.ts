@@ -284,8 +284,7 @@ function stripIgnoredTokens(document: string): string {
 
     if (char === '"') {
       if (document.startsWith('"""', index)) {
-        const end = document.indexOf('"""', index + 3);
-        index = end === -1 ? document.length : end + 3;
+        index = endOfBlockString(document, index + 3);
       } else {
         index += 1;
         while (index < document.length && document[index] !== '"') {
@@ -319,6 +318,21 @@ function stripIgnoredTokens(document: string): string {
   }
 
   return out;
+}
+
+/**
+ * Where a block string that opened before `from` ends, its closing quotes
+ * included. `\"""` is three quotes of content, as graphql-js reads it, not the
+ * end: ended there, the rest of the literal was recorded as document syntax.
+ * A block string has no other escape, so a backslash before the quotes always
+ * escapes them.
+ */
+function endOfBlockString(document: string, from: number): number {
+  let end = document.indexOf('"""', from);
+  while (end > from && document[end - 1] === "\\") {
+    end = document.indexOf('"""', end + 3);
+  }
+  return end === -1 ? document.length : end + 3;
 }
 
 function isDigit(char: string): boolean {

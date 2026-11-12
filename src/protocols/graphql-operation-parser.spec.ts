@@ -184,6 +184,24 @@ describe("parseGraphQLOperation", () => {
       ).toBe("query($v1: Int = _) { orders(first: $v1) { id } }");
     });
 
+    it('reads an escaped \\""" as part of its block string', () => {
+      // graphql-js reads `\"""` inside a block string as three quotes of
+      // content; ended there, the rest of the literal was recorded as syntax.
+      expect(
+        parseGraphQLOperation(
+          'mutation { saveNote(text: """a \\""" password=hunter2 \\""" b""", tag: """x""") { id } }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { saveNote(text: _, tag: _) { id } }");
+      expect(
+        parseGraphQLOperation(
+          'query Q($a: String = """\\""" fieldName: """) { real }',
+        ),
+      ).toMatchObject({
+        fieldName: "real",
+        sanitizedDocument: "query Q($a: String = _) { real }",
+      });
+    });
+
     it("drops comments", () => {
       expect(
         parseGraphQLOperation("# top secret\n{ orders { id } }")
