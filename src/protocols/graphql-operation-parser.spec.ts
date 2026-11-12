@@ -130,6 +130,19 @@ describe("parseGraphQLOperation", () => {
     ).toBeUndefined();
   });
 
+  it("leaves a document opening with an inherited key unlabelled", () => {
+    // Looked up in an object literal, `constructor` found Object's own, and
+    // labelling the operation threw inside the request hook: a 500.
+    for (const document of [
+      "constructor { health }",
+      "Constructor { health }",
+      "__proto__ { health }",
+      "toString { health }",
+    ]) {
+      expect(parseGraphQLOperation(document)).toBeUndefined();
+    }
+  });
+
   it("gives up on an unparseable document rather than guessing", () => {
     expect(parseGraphQLOperation("this is not graphql")).toBeUndefined();
     expect(parseGraphQLOperation("{")).toBeUndefined();

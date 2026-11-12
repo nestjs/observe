@@ -14,12 +14,19 @@ import { GraphQLResolveInfoLike } from "../interfaces/index.js";
  * operation definition and never looks at the rest of the document.
  */
 
-/** Operation keywords, mapped to the root type each one resolves against. */
-const ROOT_TYPE_BY_KEYWORD: Record<string, string> = {
-  query: "Query",
-  mutation: "Mutation",
-  subscription: "Subscription",
-};
+/**
+ * Operation keywords, mapped to the root type each one resolves against.
+ *
+ * A `Map`, not an object literal: the key is the first word of a client's
+ * document, and `constructor` or `__proto__` found an inherited member there,
+ * whose labelling then threw inside the request hook - a 500 for a document
+ * the server would have answered.
+ */
+const ROOT_TYPE_BY_KEYWORD = new Map([
+  ["query", "Query"],
+  ["mutation", "Mutation"],
+  ["subscription", "Subscription"],
+]);
 
 /**
  * Parsed results are cached: a client sends the same handful of documents over
@@ -193,7 +200,7 @@ function toOperation(
   }
   // Shorthand - `{ orders { id } }` - has no keyword at all and is a query.
   const keyword = words[0] ? words[0].toLowerCase() : "query";
-  const rootTypeName = ROOT_TYPE_BY_KEYWORD[keyword];
+  const rootTypeName = ROOT_TYPE_BY_KEYWORD.get(keyword);
   if (!rootTypeName) {
     return undefined;
   }
