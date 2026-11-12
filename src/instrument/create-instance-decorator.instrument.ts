@@ -1,5 +1,6 @@
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
+import { types } from "node:util";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import {
@@ -223,6 +224,12 @@ interface TracedCallSpec {
   isActive: () => boolean;
   setActive: (active: boolean) => void;
 
+  /**
+   * Whether the original callable is a native `async` function - the one
+   * kind whose promise nothing but the caller can hold. See `callTraced`.
+   */
+  isAsync: boolean;
+
   /** Invokes the original callable, participating in the trace. */
   call: (thisArg: unknown, args: unknown[]) => unknown;
 
@@ -265,6 +272,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // "Object.<name>".
     const call = spec.call;
     const callUntraced = spec.callUntraced;
+    const isAsync = spec.isAsync;
 
     const endStep = (requestId: string, stepId: string) =>
       operationTraceRegistry.internalEndTraceStep(
@@ -316,18 +324,24 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
               ignoreFailure(() => recordError(requestId, stepId, err));
               throw err;
             };
-            // A plain native promise is swapped for a chained one, just as
-            // the caller's own `.then` would: a rejection the caller drops
-            // still raises `unhandledRejection`, as without the span.
-            if (isPlainPromise(result)) {
+            // The promise of a native `async` method is swapped for a chained
+            // one, just as the caller's own `.then` would: nothing but the
+            // caller can hold it, so a rejection the caller drops still
+            // raises `unhandledRejection`, as without the span.
+            if (isAsync) {
               return result.then(settled, failed);
             }
-            // A promise carrying more than its value (`json()` on a `got`
-            // request, `kill()` on an `execa` child, a subclass and its own
-            // members) is handed back as-is, or the caller loses all that.
-            // It is watched on a side branch instead, the way
-            // `OutgoingSpanRecorder.endWhenSettled` watches outgoing calls.
-            // Watching marks it handled, so a rejection the caller drops no
+            // Any other promise is handed back as-is and watched on a side
+            // branch, the way `OutgoingSpanRecorder.endWhenSettled` watches
+            // outgoing calls. It may be held elsewhere - a `.catch` the method
+            // attached itself, an in-flight promise callers share, the
+            // callback ioredis answers a command through - and a chained copy
+            // rejected where those handlers do not reach: dropped by the
+            // caller, it was an unhandled rejection, and under Node's default
+            // it ended a process that handled the failure. Handed back, it
+            // also keeps what it carries beyond its value (`json()` on a
+            // `got` request, `kill()` on an `execa` child, a subclass).
+            // Watching marks it handled, so a rejection nobody handles no
             // longer raises `unhandledRejection`; the span still records it.
             result.then(settled, (err) =>
               ignoreFailure(() => recordError(requestId, stepId, err)),
@@ -425,6 +439,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       spanId: `${className}#${methodName}`,
       isActive: () => active,
       setActive: (value) => (active = value),
+      isAsync: types.isAsyncFunction(fn),
       call: invoke,
       callUntraced: invoke,
     });
@@ -571,6 +586,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           spanId: generateSpanId(target, methodName),
           isActive: () => active,
           setActive: (value) => (active = value),
+          isAsync: types.isAsyncFunction(originalMethod),
           // Traced calls run against the proxy so that a method calling into
           // itself (`this.other()`) is instrumented as a nested step - except
           // for private-member classes, whose brand checks only the raw
@@ -632,22 +648,6 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     }
     return instance;
   };
-}
-
-/**
- * Whether a promise is a bare native one: no subclass, no members of its own.
- * Such a promise carries nothing but its value, so a chained promise can stand
- * in for it without the caller noticing.
- *
- * Symbol keys do not count: before Node 24, `AsyncLocalStorage` stamps its
- * own (`async_id_symbol`, `kResourceStore`, ...) on every promise created in
- * a context, which every traced call runs in.
- */
-function isPlainPromise(promise: Promise<unknown>): boolean {
-  return (
-    Object.getPrototypeOf(promise) === Promise.prototype &&
-    Object.getOwnPropertyNames(promise).length === 0
-  );
 }
 
 /** Runs span bookkeeping whose failure must not reach the caller. */

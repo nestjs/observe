@@ -370,6 +370,16 @@ describe("createInstanceDecorator", () => {
         withMember<P extends Promise<string>>(promise: P): P {
           return promise;
         }
+
+        async awaited(promise: Promise<string>): Promise<string> {
+          return promise;
+        }
+
+        /** Handles its own failure, so a caller may fire and forget. */
+        selfHandled(promise: Promise<string>): Promise<string> {
+          promise.catch(() => undefined);
+          return promise;
+        }
       }
 
       /** A promise in the style of a `got` request or a cancelable one. */
@@ -397,28 +407,68 @@ describe("createInstanceDecorator", () => {
         return reasons;
       };
 
-      it("chains a plain promise, as the caller's own `.then` would", async () => {
-        const original = Promise.resolve("p");
+      it("chains the promise of an async method, as the caller's own `.then` would", async () => {
         const service = decorate(new PromiseService()) as PromiseService;
 
-        const returned = withTrace(() => service.withMember(original));
+        const returned = withTrace(() => service.awaited(Promise.resolve("p")));
 
-        expect(returned).not.toBe(original);
         await expect(returned).resolves.toBe("p");
-        expect(endedSteps).toEqual([{ spanId: "PromiseService#withMember" }]);
+        expect(endedSteps).toEqual([{ spanId: "PromiseService#awaited" }]);
       });
 
-      it("lets a dropped rejection of a plain promise raise unhandledRejection", async () => {
+      it("lets a dropped rejection of an async method raise unhandledRejection", async () => {
         const failure = new Error("dropped");
         const service = decorate(new PromiseService()) as PromiseService;
 
         const unhandled = await captureUnhandledRejections(async () => {
-          void withTrace(() => service.withMember(Promise.reject(failure)));
+          void withTrace(() => service.awaited(Promise.reject(failure)));
           await settle();
         });
 
         expect(unhandled).toEqual([failure]);
         expect(endedSteps[0].error).toBe(failure);
+      });
+
+      it("returns the very promise a method that is not async returned", async () => {
+        const original = Promise.resolve("p");
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const returned = withTrace(() => service.withMember(original));
+
+        expect(returned).toBe(original);
+        await expect(returned).resolves.toBe("p");
+        await settle();
+        expect(endedSteps).toEqual([{ spanId: "PromiseService#withMember" }]);
+      });
+
+      it("raises no unhandledRejection when the method handled the rejection itself", async () => {
+        const failure = new Error("handled by the method");
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const unhandled = await captureUnhandledRejections(async () => {
+          void withTrace(() => service.selfHandled(Promise.reject(failure)));
+          await settle();
+        });
+
+        expect(unhandled).toEqual([]);
+        expect(endedSteps[0].error).toBe(failure);
+      });
+
+      it("raises no unhandledRejection when another caller handles a shared promise", async () => {
+        const failure = new Error("handled by another caller");
+        const inFlight = Promise.reject<string>(failure);
+        const service = decorate(new PromiseService()) as PromiseService;
+
+        const unhandled = await captureUnhandledRejections(async () => {
+          const handled = withTrace(() => service.withMember(inFlight)).catch(
+            (err: unknown) => err,
+          );
+          void withTrace(() => service.withMember(inFlight));
+          await expect(handled).resolves.toBe(failure);
+          await settle();
+        });
+
+        expect(unhandled).toEqual([]);
       });
 
       it("returns the very promise the method returned, members included", async () => {
@@ -451,15 +501,24 @@ describe("createInstanceDecorator", () => {
         expect(endedSteps[0].error).toBe(failure);
       });
 
-      describe.each([
-        ["a plain promise", <T>(promise: Promise<T>) => promise],
-        ["a promise with members", withMembers],
-      ])("for %s", (_label, shape) => {
+      describe.each<
+        [string, (service: PromiseService, promise: Promise<string>) => unknown]
+      >([
+        ["a plain promise", (service, promise) => service.withMember(promise)],
+        [
+          "a promise with members",
+          (service, promise) => service.withMember(withMembers(promise)),
+        ],
+        [
+          "the promise of an async method",
+          (service, promise) => service.awaited(promise),
+        ],
+      ])("for %s", (_label, callWith) => {
         it("hands the caller the original rejection and records it on the span", async () => {
           const failure = new Error("rejected");
           const service = decorate(new PromiseService()) as PromiseService;
           const returned = withTrace(() =>
-            service.withMember(shape(Promise.reject(failure))),
+            callWith(service, Promise.reject(failure)),
           );
 
           await expect(returned).rejects.toBe(failure);
@@ -476,7 +535,7 @@ describe("createInstanceDecorator", () => {
           });
           const service = decorate(new PromiseService()) as PromiseService;
 
-          void withTrace(() => service.withMember(shape(pending)));
+          void withTrace(() => callWith(service, pending));
           await settle();
           expect(endedSteps).toEqual([]);
 
@@ -490,7 +549,7 @@ describe("createInstanceDecorator", () => {
           const service = decorate(new PromiseService()) as PromiseService;
 
           const returned = withTrace(() =>
-            service.withMember(shape(Promise.resolve("p"))),
+            callWith(service, Promise.resolve("p")),
           );
 
           await expect(returned).resolves.toBe("p");
@@ -503,7 +562,7 @@ describe("createInstanceDecorator", () => {
           const service = decorate(new PromiseService()) as PromiseService;
 
           const returned = withTrace(() =>
-            service.withMember(shape(Promise.reject(failure))),
+            callWith(service, Promise.reject(failure)),
           );
 
           await expect(returned).rejects.toBe(failure);
