@@ -1,5 +1,5 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
-import { admitsFinite } from "./finite-value.util.js";
+import { admitsFinite, admitsReading } from "./finite-value.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -212,9 +212,15 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
     }
 
     const key = label ?? DEFAULT_LABEL;
+    // Before anything is updated, so the count, maximum and sample keep
+    // describing the observations the total does.
+    const sum = (this._sum[key] ?? 0) + value;
+    if (!admitsReading(this.name, sum, this.nonFinite)) {
+      return;
+    }
     const count = (this._count[key] ?? 0) + 1;
     this._count[key] = count;
-    this._sum[key] = (this._sum[key] ?? 0) + value;
+    this._sum[key] = sum;
     this._max[key] = Math.max(this._max[key] ?? value, value);
     this.sample(key, value, count);
     this._lastUpdated = Date.now();

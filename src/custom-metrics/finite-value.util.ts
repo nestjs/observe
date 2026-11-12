@@ -45,3 +45,34 @@ export function admitsFinite(
   }
   return false;
 }
+
+/**
+ * Whether a metric may move to `reading`, which an admitted value takes it to,
+ * when what goes on the wire is its difference from `baseline` - a counter's
+ * increase since the last flush - or the reading itself.
+ *
+ * Asked after `admitsFinite`, about the result rather than the argument: two
+ * finite numbers can add up to an Infinity (`1e308 + 1e308`), which is sent
+ * as null just the same, and which nothing added later would bring back. The
+ * step is ignored and the reading kept, under the same once-per-metric
+ * warning as a non-finite argument.
+ */
+export function admitsReading(
+  metricName: string,
+  reading: number,
+  state: { warned: boolean },
+  baseline = 0,
+): boolean {
+  if (Number.isFinite(reading - baseline)) {
+    return true;
+  }
+
+  if (!state.warned) {
+    state.warned = true;
+    console.warn(
+      `[observe] Metric "${metricName}" ignored a value that would take it past the largest number it can report ` +
+        `(${Number.MAX_VALUE}). Further ones, and non-finite values, are ignored without another warning.`,
+    );
+  }
+  return false;
+}

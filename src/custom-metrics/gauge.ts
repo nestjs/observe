@@ -1,6 +1,6 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
 import { admitsSeries, stringifyLabel } from "./counter.js";
-import { admitsFinite } from "./finite-value.util.js";
+import { admitsFinite, admitsReading } from "./finite-value.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -216,21 +216,29 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const incrementValue = value ?? 1;
+      if (!admitsFinite(this.name, incrementValue, this.nonFinite)) {
+        return;
+      }
+      const reading =
+        (this.value[stringifiedLabel] ?? this._initialValue) + incrementValue;
       if (
-        !admitsFinite(this.name, incrementValue, this.nonFinite) ||
+        !admitsReading(this.name, reading, this.nonFinite) ||
         !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
       ) {
         return;
       }
-      this.value[stringifiedLabel] =
-        (this.value[stringifiedLabel] ?? this._initialValue) + incrementValue;
+      this.value[stringifiedLabel] = reading;
     } else {
       const incrementValue = labelOrValue ?? 1;
       if (!admitsFinite(this.name, incrementValue, this.nonFinite)) {
         return;
       }
-      this.value[DEFAULT_LABEL] =
+      const reading =
         (this.value[DEFAULT_LABEL] ?? this._initialValue) + incrementValue;
+      if (!admitsReading(this.name, reading, this.nonFinite)) {
+        return;
+      }
+      this.value[DEFAULT_LABEL] = reading;
     }
     this._lastUpdated = Date.now();
     if (this._onChange) {
@@ -274,21 +282,29 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const decrementValue = value ?? 1;
+      if (!admitsFinite(this.name, decrementValue, this.nonFinite)) {
+        return;
+      }
+      const reading =
+        (this.value[stringifiedLabel] ?? this._initialValue) - decrementValue;
       if (
-        !admitsFinite(this.name, decrementValue, this.nonFinite) ||
+        !admitsReading(this.name, reading, this.nonFinite) ||
         !admitsSeries(this.name, this.value, stringifiedLabel, this.seriesLimit)
       ) {
         return;
       }
-      this.value[stringifiedLabel] =
-        (this.value[stringifiedLabel] ?? this._initialValue) - decrementValue;
+      this.value[stringifiedLabel] = reading;
     } else {
       const decrementValue = labelOrValue ?? 1;
       if (!admitsFinite(this.name, decrementValue, this.nonFinite)) {
         return;
       }
-      this.value[DEFAULT_LABEL] =
+      const reading =
         (this.value[DEFAULT_LABEL] ?? this._initialValue) - decrementValue;
+      if (!admitsReading(this.name, reading, this.nonFinite)) {
+        return;
+      }
+      this.value[DEFAULT_LABEL] = reading;
     }
     this._lastUpdated = Date.now();
 

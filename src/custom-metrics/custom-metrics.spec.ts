@@ -463,6 +463,88 @@ describe("non-finite values", () => {
     expect(warn.mock.calls[1][0]).toContain('"latency"');
   });
 
+  describe("a finite step that would take a reading past the largest number", () => {
+    /** Finite on its own; twice it is past the largest double. */
+    const HUGE = 1e308;
+
+    it("is ignored by a counter, which keeps its last reading", () => {
+      const counter = new Counter("raised");
+
+      // Each is finite and passes any "positive number" check; added in, the
+      // counter stayed at Infinity - null on the wire - for good.
+      counter.increment(HUGE);
+      counter.increment(HUGE);
+      counter.increment(HUGE);
+
+      expect(counter.getValue()).toBe(HUGE);
+      expect(counter.increase).toEqual({ default: HUGE });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('"raised"');
+      expect(warn.mock.calls[0][0]).toContain("largest");
+    });
+
+    it("is ignored on a label, without opening a series for it", () => {
+      const counter = new Counter<"currency">("raised", "d", HUGE, [
+        "currency",
+      ]);
+      counter.increment({ currency: "eur" }, 0);
+
+      counter.increment({ currency: "eur" }, HUGE);
+      counter.increment({ currency: "usd" }, HUGE);
+
+      expect(counter.value).toEqual({ '{"currency":"eur"}': HUGE });
+    });
+
+    it("keeps a counter's increase since the last flush a number", () => {
+      const counter = new Counter<"account">("balance", "d", ["account"]);
+      counter.increment({ account: "a" }, -HUGE);
+      counter.markFlushed();
+
+      // Both readings are finite, but the rise from -1e308 to 1e308 is not.
+      counter.increment({ account: "a" }, HUGE);
+      counter.increment({ account: "a" }, HUGE);
+
+      expect(counter.getValue({ account: "a" })).toBe(0);
+      expect(counter.increase).toEqual({ '{"account":"a"}': HUGE });
+    });
+
+    it("is ignored by a gauge, up or down", () => {
+      const gauge = new Gauge("level");
+
+      gauge.increment(HUGE);
+      gauge.increment(HUGE);
+      expect(gauge.getValue()).toBe(HUGE);
+
+      gauge.setValue(-HUGE);
+      gauge.decrement(HUGE);
+      expect(gauge.getValue()).toBe(-HUGE);
+    });
+
+    it("is ignored on a gauge's label, up or down", () => {
+      const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
+
+      gauge.increment({ pool: "main" }, HUGE);
+      gauge.increment({ pool: "main" }, HUGE);
+      gauge.decrement({ pool: "replica" }, HUGE);
+      gauge.decrement({ pool: "replica" }, HUGE);
+
+      expect(gauge.getValue({ pool: "main" })).toBe(HUGE);
+      expect(gauge.getValue({ pool: "replica" })).toBe(-HUGE);
+    });
+
+    it("is left out of a summary whole, so its count and total agree", () => {
+      const summary = new Summary("amount");
+
+      summary.observe(HUGE);
+      summary.observe(HUGE);
+      summary.observe(5);
+
+      expect(summary.total.default).toBe(HUGE);
+      expect(summary.observations.default).toBe(2);
+      expect(summary.maximum.default).toBe(HUGE);
+    });
+  });
+
   describe("a value that is not a number at run time", () => {
     // What a field of a request body can hold: JSON parses `{"toString": 1}`
     // into an object no string conversion survives, and a deeply nested array
