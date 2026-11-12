@@ -154,6 +154,111 @@ describe("LogRedactor", () => {
       expect(output).not.toContain("MIIEowIBAAKCAQEAx0Vv0Q");
       expect(output).not.toContain("BEGIN RSA PRIVATE KEY");
     });
+
+    it("masks each PEM block and keeps what is between them", () => {
+      const output = redactor.redactMessage(
+        "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY----- then " +
+          "-----BEGIN EC PRIVATE KEY-----\nBBBB\n-----END EC PRIVATE KEY-----",
+      );
+
+      expect(output).toBe("[REDACTED] then [REDACTED]");
+    });
+
+    it("masks a PEM block whose newlines are JSON-escaped", () => {
+      const output = redactor.redactMessage(
+        '{"key":"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END PRIVATE KEY-----"}',
+      );
+
+      expect(output).toBe('{"key":"[REDACTED]"}');
+    });
+
+    it("masks a PEM key cut off before its END line", () => {
+      const output = redactor.redactMessage(
+        "bad key: -----BEGIN RSA PRIVATE KEY-----\n" +
+          "MIIEowIBAAKCAQEAx0Vv0QZx3mFq9nT2yQ8wJr5LcK1vYb7uPzE4sD6hGf2aWnXe\n" +
+          "kL9pR3tU8vY1oZ6qS",
+      );
+
+      expect(output).toBe("bad key: [REDACTED]");
+    });
+
+    it("leaves a PEM BEGIN marker that heads no key as it was", () => {
+      for (const message of [
+        "expected -----BEGIN PRIVATE KEY----- at the start\nof the file",
+        "-----BEGIN PRIVATE KEY-----\nexpected a key here",
+        'if (!pem.startsWith("-----BEGIN PRIVATE KEY-----")) {',
+      ]) {
+        expect(redactor.redactMessage(message)).toBe(message);
+      }
+      expect(
+        redactor.redactMessage(
+          "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n" +
+            "expected -----BEGIN PRIVATE KEY----- at the start",
+        ),
+      ).toBe("[REDACTED]\nexpected -----BEGIN PRIVATE KEY----- at the start");
+    });
+
+    it("scans a run of unclosed PEM markers in linear time", () => {
+      // An error's message and stack are redacted synchronously, at full
+      // length, before the response is written. Quadratic under the PEM
+      // pattern this replaced: ~6 s for this input.
+      const markers = "-----BEGIN PRIVATE KEY-----".repeat(20_000);
+      const dashes = markers + "-".repeat(500_000);
+      const startedAt = performance.now();
+
+      expect(redactor.redactMessage(markers)).toBe(markers);
+      expect(redactor.redactMessage(dashes)).toBe(dashes);
+      expect(redactor.redactSource(markers.split("-----B"))).toHaveLength(
+        20_001,
+      );
+
+      expect(performance.now() - startedAt).toBeLessThan(250);
+    });
+
+    it("masks a JWT right after a percent escape or a JSON escape", () => {
+      const jwt =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+
+      for (const message of [
+        `next=%2Fverify-email%2F${jwt}`,
+        `{"msg":"issued:\\n${jwt}"}`,
+        `{"msg":"\\u0022${jwt}"}`,
+      ]) {
+        expect(redactor.redactMessage(message), message).not.toContain(
+          "eyJzdWIi",
+        );
+      }
+      // Still not inside a word that merely contains the letters.
+      expect(redactor.redactMessage(`abc${jwt}`)).toBe(`abc${jwt}`);
+    });
+
+    it("masks an encrypted JWT whole", () => {
+      for (const jwe of [
+        // `alg: dir` - no encrypted key, so the second part is empty.
+        "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..bEz8xQp1aWkT2xYc.aGVsbG8gd29ybGQgc2VjcmV0.Wn4bQ9mTq2Xy3Ac1rP0vLw",
+        "eyJhbGciOiJBMjU2S1ciLCJlbmMiOiJBMjU2R0NNIn0.Zm9vYmFyYmF6cXV4.bEz8xQp1aWkT2xYc.aGVsbG8gd29ybGQgc2VjcmV0.Wn4bQ9mTq2Xy3Ac1rP0vLw",
+      ]) {
+        expect(redactor.redactMessage(`sent ${jwe} upstream`)).toBe(
+          "sent [REDACTED] upstream",
+        );
+      }
+    });
+
+    it("does not exhaust the regex stack on a multi-megabyte token", () => {
+      // Each of these overflowed V8's backtrack stack from ~5.6 MB under a
+      // counted quantifier, so the error being recorded was replaced by a
+      // RangeError.
+      const run = "a".repeat(6_000_000);
+      for (const message of [
+        `Bearer ${run}`,
+        `eyJ${run}.abcd.efgh`,
+        `-----BEGIN PRIVATE KEY-----\n${run}`,
+        `password=${run}`,
+      ]) {
+        expect(() => redactor.redactMessage(message)).not.toThrow();
+        expect(redactor.redactMessage(message)).not.toContain("aaaaaaaa");
+      }
+    });
   });
 
   describe("card numbers", () => {
@@ -170,6 +275,17 @@ describe("LogRedactor", () => {
       expect(redactor.redactMessage("4242-4242-4242-4242")).not.toContain(
         "4242-4242-4242-4242",
       );
+    });
+
+    it("masks one right after a JSON-escaped newline", () => {
+      for (const message of [
+        '{"msg":"card:\\n4111111111111111"}',
+        '{"msg":"card:\\n4242 4242 4242 4242"}',
+      ]) {
+        expect(redactor.redactMessage(message), message).toBe(
+          '{"msg":"card:\\n[REDACTED]"}',
+        );
+      }
     });
 
     it("leaves a long number that is not Luhn-valid alone", () => {
@@ -329,6 +445,29 @@ describe("LogRedactor", () => {
       expect(output).toHaveLength(lines.length);
       expect(output.join("\n")).not.toContain("MIIEvQ");
       expect(output[3]).toBe("after();");
+    });
+
+    it("keeps the lines after a PEM BEGIN marker that is never closed", () => {
+      const lines = [
+        'if (!pem.startsWith("-----BEGIN PRIVATE KEY-----")) {',
+        '  throw new Error("not a private key");',
+        "}",
+      ];
+
+      expect(redactor.redactSource(lines)).toEqual(lines);
+    });
+
+    it("masks a key cut off by the end of the frame, keeping the line count", () => {
+      const lines = [
+        "const key = `-----BEGIN PRIVATE KEY-----",
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7",
+        "VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDu",
+      ];
+
+      const output = redactor.redactSource(lines);
+
+      expect(output).toHaveLength(3);
+      expect(output.join("\n")).not.toMatch(/MIIEvQ|VJTUt9/);
     });
   });
 

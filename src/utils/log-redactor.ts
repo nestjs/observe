@@ -53,7 +53,7 @@ const TEXT_KEY_ALTERNATION = [
   "cookie",
 ].join("|");
 
-interface CompiledRule {
+interface PatternRule {
   pattern: RegExp;
   /**
    * Replacement applied to a match. A function lets a rule keep the part that
@@ -61,6 +61,147 @@ interface CompiledRule {
    * the value.
    */
   replace: (replacement: string, ...groups: string[]) => string;
+}
+
+/**
+ * A rule a regex cannot express in linear time, written as a scan instead.
+ * `mask` turns a matched secret into its replacement.
+ */
+interface ScanRule {
+  scan: (text: string, mask: (secret: string) => string) => string;
+}
+
+type CompiledRule = PatternRule | ScanRule;
+
+/**
+ * Where a bare token may start: not inside a word, but also right after a
+ * percent escape (`%2FeyJ...`, a URL-encoded path) or a JSON escape
+ * (`\neyJ...`, `\u0022eyJ...`), whose last character would otherwise read as
+ * the token's own.
+ */
+const TOKEN_START = String.raw`(?:(?<![A-Za-z0-9_-])|(?<=%[0-9A-Fa-f]{2})|(?<=\\[nrtbf])|(?<=\\u[0-9A-Fa-f]{4}))`;
+
+/**
+ * A run of base64url characters at least `min` long. Written as `{min}` and
+ * then `*` rather than `{min,}`: V8 keeps a backtrack entry per character of a
+ * counted quantifier, and a run of ~5.6 MB exhausted its stack, so recording
+ * the error replaced it with a RangeError.
+ */
+const tokenRun = (min: number) =>
+  min === 0 ? "[A-Za-z0-9_-]*" : `[A-Za-z0-9_-]{${min}}[A-Za-z0-9_-]*`;
+
+const PEM_BEGIN = /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/g;
+const PEM_END = /-----END (?:[A-Z ]+ )?PRIVATE KEY-----/g;
+/** The shortest line of base64 taken for the body of a key with no END line. */
+const MIN_PEM_BODY_LINE = 16;
+
+/**
+ * PEM private keys, BEGIN through END.
+ *
+ * A scan rather than `BEGIN[\s\S]*?END`: on a BEGIN marker with no END after
+ * it that lazy run read to the end of the text before failing, and every
+ * later marker read it again - quadratic, on an error message a client can
+ * fill. Here the END markers are found once, and each BEGIN is paired with the
+ * first one after it, as the lazy run did.
+ *
+ * A BEGIN with no END after it is a key cut off - by a truncated message, the
+ * edge of a code frame - and its body is masked as far as it still reads as
+ * one: lines of base64, the first at least `MIN_PEM_BODY_LINE` long. A marker
+ * that heads no such line (quoted in prose, or in code that checks for one) is
+ * left as it was.
+ */
+function scanPemBlocks(text: string, mask: (secret: string) => string) {
+  if (!text.includes("PRIVATE KEY-----")) {
+    return text;
+  }
+  const ends: number[][] = [];
+  for (const match of text.matchAll(PEM_END)) {
+    ends.push([match.index, match.index + match[0].length]);
+  }
+
+  let output = "";
+  let copiedTo = 0;
+  let nextEnd = 0;
+  const begin = new RegExp(PEM_BEGIN.source, "g");
+  let match: RegExpExecArray | null;
+  while ((match = begin.exec(text))) {
+    const bodyFrom = match.index + match[0].length;
+    while (nextEnd < ends.length && ends[nextEnd][0] < bodyFrom) {
+      nextEnd++;
+    }
+    const blockEnd =
+      nextEnd < ends.length ? ends[nextEnd++][1] : pemBodyEnd(text, bodyFrom);
+    if (blockEnd === undefined) {
+      continue;
+    }
+    output +=
+      text.slice(copiedTo, match.index) +
+      mask(text.slice(match.index, blockEnd));
+    copiedTo = blockEnd;
+    begin.lastIndex = blockEnd;
+  }
+  return copiedTo === 0 ? text : output + text.slice(copiedTo);
+}
+
+/**
+ * Where the base64 lines after a BEGIN marker stop, or `undefined` when none
+ * follows it. A line break may be written raw or JSON-escaped.
+ */
+function pemBodyEnd(text: string, from: number): number | undefined {
+  let end: number | undefined;
+  let at = from;
+  for (let line = 0; ; line++) {
+    const breakLength = lineBreakAt(text, at);
+    if (breakLength === 0) {
+      return end;
+    }
+    let runEnd = at + breakLength;
+    while (
+      runEnd < text.length &&
+      (text[runEnd] === " " || text[runEnd] === "\t")
+    ) {
+      runEnd++;
+    }
+    const runStart = runEnd;
+    while (runEnd < text.length && isBase64Char(text.charCodeAt(runEnd))) {
+      runEnd++;
+    }
+    const length = runEnd - runStart;
+    if (length === 0 || (line === 0 && length < MIN_PEM_BODY_LINE)) {
+      return end;
+    }
+    end = runEnd;
+    at = runEnd;
+  }
+}
+
+function lineBreakAt(text: string, at: number): number {
+  if (text[at] === "\n") {
+    return 1;
+  }
+  if (text[at] === "\r") {
+    return text[at + 1] === "\n" ? 2 : 1;
+  }
+  if (text[at] === "\\") {
+    if (text[at + 1] === "n") {
+      return 2;
+    }
+    if (text[at + 1] === "r" && text[at + 2] === "\\" && text[at + 3] === "n") {
+      return 4;
+    }
+  }
+  return 0;
+}
+
+function isBase64Char(code: number): boolean {
+  return (
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    (code >= 48 && code <= 57) ||
+    code === 43 ||
+    code === 47 ||
+    code === 61
+  );
 }
 
 /**
@@ -77,18 +218,15 @@ function buildDefaultRules(literalValuesOnly = false): CompiledRule[] {
   return [
     // PEM blocks first: they span lines and would otherwise be partially eaten
     // by the narrower rules below.
-    {
-      pattern:
-        /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----/g,
-      replace: (replacement) => replacement,
-    },
+    { scan: scanPemBlocks },
     // Authorization schemes: `Bearer eyJ...`, `Basic dXNlcjpwYXNz`.
     //
     // Must precede the key=value rule. That rule's value stops at whitespace, so
     // on `Authorization: Basic dXNlcjpwYXNz` it would consume only the word
     // "Basic" and leave the credential itself sitting in the line.
     {
-      pattern: /\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+      pattern:
+        /\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8}[A-Za-z0-9._~+/=-]*/gi,
       replace: (replacement, scheme) => `${scheme} ${replacement}`,
     },
     // key=value / "key": "value". Keeps the key so the line still says what was
@@ -106,14 +244,20 @@ function buildDefaultRules(literalValuesOnly = false): CompiledRule[] {
       replace: (replacement, prefix) => `${prefix}${replacement}`,
     },
     // Bare JWTs - they show up outside any header often enough to matter.
+    // A signed one has three parts; an encrypted one (JWE) five, the second
+    // of them empty under `alg: dir`.
     //
     // Must not follow a token character, rather than `\b`: a hyphen is a word
     // boundary but also a token character, so under `\b` every `eyJ` in a run
     // like `eyJ-eyJ-eyJ-...` started a match that rescanned the rest of the
     // run - quadratic, on a line a caller can fill.
     {
-      pattern:
-        /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g,
+      pattern: new RegExp(
+        `${TOKEN_START}eyJ${tokenRun(4)}\\.` +
+          `(?:${tokenRun(0)}\\.${tokenRun(4)}\\.${tokenRun(4)}\\.${tokenRun(0)}` +
+          `|${tokenRun(4)}\\.${tokenRun(0)})`,
+        "g",
+      ),
       replace: (replacement) => replacement,
     },
     // AWS access key ids. Distinctive enough to match on sight; the matching
@@ -134,7 +278,7 @@ function buildDefaultRules(literalValuesOnly = false): CompiledRule[] {
  * anything is masked. That turns a rule which would otherwise shred numeric log
  * data into one that only fires on something genuinely card-shaped.
  */
-const CARD_CANDIDATE = /\b\d(?:[ -]?\d){12,18}\b/g;
+const CARD_CANDIDATE = /(?:\b|(?<=\\[nrtbf]))\d(?:[ -]?\d){12,18}\b/g;
 
 function isLuhnValid(digits: string): boolean {
   let sum = 0;
@@ -231,6 +375,10 @@ export class LogRedactor {
         : masked;
 
     for (const rule of rules) {
+      if ("scan" in rule) {
+        output = rule.scan(output, (secret) => keep(secret, this.replacement));
+        continue;
+      }
       output = output.replace(rule.pattern, (...args) => {
         // String.replace passes offset and the whole string after the groups.
         const groups = args.slice(1, -2).map((group) => group ?? "");
