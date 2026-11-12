@@ -46,6 +46,43 @@ const MAX_FRAMES = 20;
  */
 const sourceCache = new Map<string, string[] | null>();
 
+export interface SourceRedactor {
+  redactSource(lines: string[]): string[];
+}
+
+/** Each redactor's copy of a cached source, held as long as the source is. */
+const redactedSources = new WeakMap<
+  SourceRedactor,
+  WeakMap<string[], string[]>
+>();
+
+/**
+ * The whole file redacted, rather than the frame cut from it. A rule that
+ * knows a secret by both its ends - a PEM key's BEGIN and END lines - finds
+ * neither in a frame whose edge falls inside the key, and the lines between
+ * would ship as they are. Cached against the source's own array, which the
+ * file and source-map caches keep stable, so each file is redacted once.
+ */
+function redactedSource(
+  source: string[],
+  redactor: SourceRedactor | undefined,
+): string[] {
+  if (!redactor) {
+    return source;
+  }
+  let byRedactor = redactedSources.get(redactor);
+  if (!byRedactor) {
+    byRedactor = new WeakMap();
+    redactedSources.set(redactor, byRedactor);
+  }
+  let redacted = byRedactor.get(source);
+  if (!redacted) {
+    redacted = redactor.redactSource(source);
+    byRedactor.set(source, redacted);
+  }
+  return redacted;
+}
+
 /** What opens every V8 frame line. */
 const FRAME_PREFIX = /^\s*at\s+/;
 
@@ -310,6 +347,11 @@ export function collectCodeFrames(
      * a stack that came off an error.
      */
     message?: string;
+    /**
+     * Redacts the source before a frame is cut from it - see
+     * `redactedSource`.
+     */
+    redactor?: SourceRedactor;
   } = {},
 ): CodeFrame[] | undefined {
   if (!stack) {
@@ -392,7 +434,10 @@ export function collectCodeFrames(
         file,
         line,
         firstLine,
-        lines: source.slice(firstLine - 1, lastLine),
+        lines: redactedSource(source, options.redactor).slice(
+          firstLine - 1,
+          lastLine,
+        ),
       });
     }
 

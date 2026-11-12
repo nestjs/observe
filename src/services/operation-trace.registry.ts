@@ -281,20 +281,15 @@ export class OperationTraceRegistry {
       // Read off the raw stack with the raw message: the message is what marks
       // where the frames start, and it only matches the stack it came from.
       // Nothing of either is shipped from here - just the file positions.
+      // Source is as likely to hold a literal secret as a message is, and
+      // goes to the same place.
       const codeFrames = collectCodeFrames(raw.stack, {
         ...settings,
         message: raw.message,
+        redactor: this.redactor ?? undefined,
       });
       if (codeFrames) {
-        // Source is as likely to hold a literal secret as a message is, and
-        // goes to the same place.
-        const redactor = this.redactor;
-        result.codeFrames = redactor
-          ? codeFrames.map((frame) => ({
-              ...frame,
-              lines: redactor.redactSource(frame.lines),
-            }))
-          : codeFrames;
+        result.codeFrames = codeFrames;
       }
     }
 

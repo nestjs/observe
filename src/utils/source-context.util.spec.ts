@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, join, relative } from "path";
 import { pathToFileURL } from "url";
+import { LogRedactor } from "./log-redactor.js";
 import { collectCodeFrames } from "./source-context.util.js";
 import { resetSourceMapCache } from "./source-map-resolver.util.js";
 
@@ -193,6 +194,37 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
         firstLine: 1,
         lines: ['throw new Error("boom");', ""],
       },
+    ]);
+  });
+
+  it("redacts the whole file before cutting a frame out of it", () => {
+    // The frame starts inside the key: its BEGIN line is above the window and
+    // its END line below, so a frame redacted on its own shows neither.
+    const keyed = join(inside, "keyed.js");
+    writeFileSync(
+      keyed,
+      [
+        "const key = `-----BEGIN PRIVATE KEY-----",
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7",
+        "VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDu",
+        "-----END PRIVATE KEY-----`;",
+        'throw new Error("boom");',
+        "",
+      ].join("\n"),
+    );
+
+    const frames = collectCodeFrames(`Error: boom\n    at run (${keyed}:5:7)`, {
+      message: "boom",
+      linesOfContext: 2,
+      redactor: new LogRedactor(),
+    });
+
+    expect(frames?.[0].firstLine).toBe(3);
+    expect(frames?.[0].lines).toEqual([
+      "",
+      "`;",
+      'throw new Error("boom");',
+      "",
     ]);
   });
 
