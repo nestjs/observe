@@ -1,4 +1,5 @@
 import { writeAgentNotes } from "./agent-notes.js";
+import { webAddress } from "./open-url.js";
 import {
   addDependencyCommand,
   detectPackageManager,
@@ -116,8 +117,18 @@ export async function link(
     return 1;
   }
 
+  // Printed and opened as parsed, and only as a web address: the page is
+  // whatever the service answered, and it is opened before any approval.
+  const page = webAddress(started.verificationUri);
+  if (!page) {
+    deps.log(
+      `NestJS Observe at ${options.endpoint} answered with a link page that is not a web address. Nothing was written.`,
+    );
+    return 1;
+  }
+
   deps.log("");
-  deps.log(`  Open      ${started.verificationUri}`);
+  deps.log(`  Open      ${page}`);
   deps.log(`  and type  ${started.userCode}`);
   deps.log("");
   deps.log(
@@ -130,7 +141,7 @@ export async function link(
   if (options.openBrowser) {
     // The page only, never the code: the code is typed, so a link that
     // carries it cannot approve anything on its own.
-    deps.openUrl(started.verificationUri);
+    deps.openUrl(page);
   }
 
   const credentials = await waitForApproval(deps, options.endpoint, started);

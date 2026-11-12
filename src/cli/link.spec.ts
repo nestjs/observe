@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -36,7 +37,10 @@ const LINKED = {
  */
 function harness(
   polls: Array<{ status: number; body: unknown } | "network">,
-  { installExit = 0 }: { installExit?: number } = {},
+  {
+    installExit = 0,
+    started = STARTED,
+  }: { installExit?: number; started?: Record<string, unknown> } = {},
 ) {
   const lines: string[] = [];
   const opened: string[] = [];
@@ -50,7 +54,7 @@ function harness(
     fetch: (async (url: string, init?: RequestInit) => {
       requests.push({ url, body: JSON.parse(init?.body as string) });
       if (url.endsWith("/cli-link/sessions")) {
-        return new Response(JSON.stringify(STARTED), { status: 201 });
+        return new Response(JSON.stringify(started), { status: 201 });
       }
       const reply = replies.shift() ?? {
         status: 400,
@@ -225,6 +229,53 @@ describe("npx @nestjs/observe link", () => {
     expect(read("src/app.module.ts")).toBe(OBSERVED_MODULE);
     expect(h.lines.at(-1)).toBe(
       "  Start the app and it reports to NestJS Observe. In production, set OBSERVE_APP_KEY and OBSERVE_APP_SECRET in the environment instead.",
+    );
+  });
+
+  // Whoever answers the link request picks the page, and the opener is
+  // started before anything is approved: only a web address is opened.
+  it.each([
+    ["a local file", "file:///etc/passwd"],
+    ["a script", "javascript:alert(1)"],
+    ["a path", "/etc/passwd"],
+    ["a Windows path", "C:\\Windows\\System32\\calc.exe"],
+    ["a scheme-less address", "observe.nestjs.com/link"],
+    ["a missing page", undefined],
+    ["a number", 42],
+  ])(
+    "opens, prints and polls nothing when the link page is %s",
+    async (_name, verificationUri) => {
+      const h = harness([{ status: 200, body: LINKED }], {
+        started: { ...STARTED, verificationUri },
+      });
+
+      expect(await run(h)).toBe(1);
+
+      expect(h.opened).toEqual([]);
+      expect(h.requests.map((request) => request.url)).toEqual([
+        "https://api.test/cli-link/sessions",
+      ]);
+      expect(h.lines.join("\n")).toContain("not a web address");
+      expect(h.lines.join("\n")).not.toContain(String(verificationUri));
+      expect(existsSync(join(cwd, ".env"))).toBe(false);
+    },
+  );
+
+  it("opens the link page as parsed, query and all", async () => {
+    const h = harness([{ status: 200, body: LINKED }], {
+      started: {
+        ...STARTED,
+        verificationUri: "https://observe.nestjs.com/link?from=cli&x=1 2",
+      },
+    });
+
+    expect(await run(h)).toBe(0);
+
+    expect(h.opened).toEqual([
+      "https://observe.nestjs.com/link?from=cli&x=1%202",
+    ]);
+    expect(h.lines).toContain(
+      "  Open      https://observe.nestjs.com/link?from=cli&x=1%202",
     );
   });
 
