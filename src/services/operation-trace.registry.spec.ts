@@ -160,6 +160,28 @@ describe("OperationTraceRegistry", () => {
       await expect(registry.pluckSnapshot("t2a")).resolves.toBeUndefined();
     });
 
+    it("completes a trace whose user id cannot be made a string, without one", async () => {
+      startRequest("t2u");
+      const spanId = registry.internalStartTraceStep(
+        "t2u",
+        "Svc",
+        "handle",
+        undefined,
+      );
+      registry.internalEndTraceStep("t2u", spanId, "Svc", "handle", spanId);
+      // Thrown here, between ending the trace and plucking it, this left the
+      // trace registered for the life of the process.
+      const userId = JSON.parse('{"toString": 1}') as string;
+
+      expect(() =>
+        registry.endTrace("t2u", { statusCode: 200, userId }),
+      ).not.toThrow();
+      const snapshot = (await registry.pluckSnapshot("t2u")) as RequestSnapshot;
+      expect(snapshot).toBeDefined();
+      expect(snapshot).not.toHaveProperty("userId");
+      expect(registry.hasTrace("t2u")).toBe(false);
+    });
+
     /** A CORS preflight as the HTTP agent starts it: no route matched it. */
     const startPreflight = (traceId: string) =>
       registry.startTrace(traceId, {

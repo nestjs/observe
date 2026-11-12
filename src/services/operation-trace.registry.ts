@@ -445,8 +445,20 @@ export class OperationTraceRegistry {
     }
 
     if ("userId" in opts && typeof opts.userId !== "undefined") {
-      const requestSnapshot = snapshot as RequestSnapshot;
-      requestSnapshot.userId = String(opts.userId);
+      // Typed as a string, but a transport passes on what `getUserId`
+      // returned, and `String()` throws on `{"toString": 1}`. Thrown here,
+      // between ending the trace and plucking it, it left the trace
+      // registered for good; the trace goes without a user id instead.
+      let userId: string | undefined;
+      try {
+        // oxlint-disable-next-line typescript/no-unnecessary-type-conversion -- typed a string, but whatever `getUserId` returned
+        userId = String(opts.userId);
+      } catch {
+        userId = undefined;
+      }
+      if (userId !== undefined) {
+        (snapshot as RequestSnapshot).userId = userId;
+      }
     }
 
     delete snapshot.startTimestamp; // Clean up to avoid confusion

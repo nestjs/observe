@@ -44,15 +44,32 @@ export function invokeUserCallbackSafely<
   try {
     return callback.apply(receiver, args);
   } catch (error) {
-    if (!reportedCallbacks.has(callback)) {
-      reportedCallbacks.add(callback);
-      warnSafely(
-        logger,
-        `"${name}" threw; ${outcome}. Later failures are not reported: ${describeFailure(error)}`,
-      );
-    }
+    reportCallbackFailure(callback, logger, name, "threw", outcome, error);
     return fallback();
   }
+}
+
+/**
+ * Reports the first failure of a callback, whichever way it failed: a
+ * callback that both throws and returns what cannot be used still says so
+ * once.
+ */
+function reportCallbackFailure(
+  callback: Function,
+  logger: Logger,
+  name: string,
+  failure: string,
+  outcome: string,
+  error: unknown,
+): void {
+  if (reportedCallbacks.has(callback)) {
+    return;
+  }
+  reportedCallbacks.add(callback);
+  warnSafely(
+    logger,
+    `"${name}" ${failure}; ${outcome}. Later failures are not reported: ${describeFailure(error)}`,
+  );
 }
 
 /**
@@ -132,7 +149,15 @@ export function shouldIgnoreSafely<TArgs extends unknown[]>(
   );
 }
 
-/** A bad identity callback must not prevent the trace from being closed. */
+/**
+ * A bad identity callback must not prevent the trace from being closed.
+ *
+ * Made a string here, inside the guard, rather than by whoever records it: a
+ * callback typed to return a string can still hand back what a message
+ * carried - a TCP packet's metadata is whatever `JSON.parse` made of it - and
+ * `String()` throws on `{"toString": 1}`. Thrown between ending the trace and
+ * plucking it, that left the trace registered for the life of the process.
+ */
 export function getUserIdSafely<TArgs extends unknown[]>(
   callback: ((...args: TArgs) => string | undefined) | undefined,
   args: TArgs,
@@ -143,15 +168,34 @@ export function getUserIdSafely<TArgs extends unknown[]>(
   if (!callback) {
     return undefined;
   }
-  return invokeUserCallbackSafely(
+  const name = `${transport}.getUserId`;
+  const outcome = "completing the trace without a user id";
+  const userId: unknown = invokeUserCallbackSafely(
     callback,
     args,
     receiver,
     () => undefined,
     logger,
-    `${transport}.getUserId`,
-    "completing the trace without a user id",
+    name,
+    outcome,
   );
+  if (userId === undefined || typeof userId === "string") {
+    return userId;
+  }
+  try {
+    // oxlint-disable-next-line typescript/no-base-to-string -- recorded as `String()` always recorded it
+    return String(userId);
+  } catch (error) {
+    reportCallbackFailure(
+      callback,
+      logger,
+      name,
+      "returned a value that cannot be made a string",
+      outcome,
+      error,
+    );
+    return undefined;
+  }
 }
 
 /**
