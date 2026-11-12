@@ -282,11 +282,15 @@ function appendNodeSpans(
     traceId,
     spanId: complete.spanId ? w3cSpanIdOf(complete.spanId) : randomSpanId(),
     parentSpanId,
+    // A manual span's name is whatever `createSpan` was given. Held to a
+    // string, as `toAttributes` holds the tags: anything else would fail
+    // the encoding, and with it the whole batch of every request's spans.
     name:
-      complete.name ??
-      (client
-        ? complete.methodKey
-        : `${complete.className}.${complete.methodKey}`),
+      typeof complete.name === "string"
+        ? complete.name
+        : client
+          ? complete.methodKey
+          : `${complete.className}.${complete.methodKey}`,
     kind: client ? SpanKind.CLIENT : SpanKind.INTERNAL,
     startTimeUnixNano: startNs,
     endTimeUnixNano: endNs,

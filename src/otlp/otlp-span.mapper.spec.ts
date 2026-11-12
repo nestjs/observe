@@ -2,6 +2,7 @@ import type { JobSnapshot } from "../interfaces/job-snapshot.interface.js";
 import type { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { w3cSpanIdOf } from "../utils/trace-context.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
+import { encodeOtlpProtobuf } from "./otlp-encoders.js";
 import {
   jobSnapshotSpans,
   OtlpSpan,
@@ -148,6 +149,25 @@ describe("requestSnapshotSpans", () => {
       SpanKind.INTERNAL,
     ]);
   });
+
+  // `createSpan(body.feed, ...)` with a number in the body: a name that is
+  // not a string would throw at encode time, and cost the whole batch -
+  // every span of every request flushed with it.
+  it.each([7, true, ["csv", "tsv"], { feed: "csv" }])(
+    "names a manual span by its method when its name is %j, and encodes it",
+    (name) => {
+      const request = orderRequest();
+      const manual: { name?: unknown } =
+        request.traces[0].children[0].children[2];
+      manual.name = name;
+      const spans = requestSnapshotSpans(request, undefined);
+
+      expect(spans[5].name).toBe("OrdersService.findOne");
+      expect(() =>
+        encodeOtlpProtobuf([], { name: "n", version: "1" }, spans),
+      ).not.toThrow();
+    },
+  );
 
   it("places every span on the trace's clock by its offset", () => {
     const [server, controller, service, fetchSpan] = requestSnapshotSpans(
