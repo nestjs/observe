@@ -1426,6 +1426,60 @@ describe("OperationTraceRegistry", () => {
       });
     });
 
+    it("holds a name no longer than the collector takes", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      vi.spyOn(
+        (registry as unknown as { logger: Logger }).logger,
+        "warn",
+      ).mockImplementation(() => undefined);
+      startRequest("m-names");
+      const parent = registry.internalStartTraceStep(
+        "m-names",
+        "ImportService",
+        "import",
+        undefined,
+      );
+      // A span per row, named after a string of the client's: the tree held
+      // every name whole until the flush, which then read each in full.
+      const source = "s".repeat(70_000);
+      const names = [
+        "row 1",
+        `row 2 from ${"t".repeat(2_000)}`,
+        `row 3 from ${source}`,
+      ];
+      const delegates: Array<string | undefined> = [];
+      for (const name of names) {
+        await als.run(new Map([[CALLER_METADATA_KEY, parent]]), () =>
+          registry.createManualSpan("m-names", parent, name, (span) => {
+            delegates.push(span.name);
+            return registry.getActiveSpan(
+              "m-names",
+              als.getStore()!.get(CALLER_METADATA_KEY) as string,
+            )?.name;
+          }),
+        );
+      }
+      registry.internalEndTraceStep(
+        "m-names",
+        parent,
+        "ImportService",
+        "import",
+        parent,
+      );
+      registry.endTrace("m-names");
+
+      const snapshot = await registry.pluckSnapshot("m-names");
+      const recorded = (
+        snapshot!.traces[0] as { children: Array<{ name: string }> }
+      ).children.map((child) => child.name);
+      expect(recorded[0]).toBe("row 1");
+      expect(recorded[1]).toHaveLength(255);
+      expect(recorded[1].startsWith("row 2 from ttt")).toBe(true);
+      expect(recorded[2]).toBe("[span name of 70011 characters]");
+      // The callback still sees the name it gave.
+      expect(delegates).toEqual(names);
+    });
+
     it("re-throws from the callback and records the failure", async () => {
       startRequest("m3");
       const parent = registry.internalStartTraceStep(

@@ -13,6 +13,7 @@ import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { CodeFrame, collectCodeFrames } from "../utils/source-context.util.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
+import { fitToLength } from "../utils/fit-to-length.util.js";
 import { LogRedactor } from "../utils/log-redactor.js";
 import type { TraceContext } from "../utils/trace-context.util.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
@@ -195,6 +196,34 @@ function fitErrorStack(stack: string | undefined): string | undefined {
       ERROR_TEXT_CUT +
       stack.slice(tailStart),
   );
+}
+
+/**
+ * Longest span name the collector takes - the encoder's own limit, which it
+ * cuts every name to on the way out.
+ */
+const MAX_SPAN_NAME_LENGTH = 255;
+
+/**
+ * Longest manual span name that is read to be cut. A name is as long as the
+ * code that opened the span made it, often from a string of a client's, and
+ * a name built by concatenation is written out whole the first time any of
+ * it is read - so a span per row of a client's list, each named after a long
+ * string, cost rows x length on the request thread, however little of each
+ * name was kept. A longer one is recorded by its length alone.
+ */
+const MAX_READ_SPAN_NAME_LENGTH = 4 * 1024;
+
+/** A manual span's name, as its node holds it until the trace ships. */
+function fitManualSpanName(name: string): string {
+  // Typed, but passed from code nothing checks at run time; left as it is.
+  if (typeof name !== "string" || name.length <= MAX_SPAN_NAME_LENGTH) {
+    return name;
+  }
+  if (name.length > MAX_READ_SPAN_NAME_LENGTH) {
+    return `[span name of ${name.length} characters]`;
+  }
+  return fitToLength(name, MAX_SPAN_NAME_LENGTH);
 }
 
 /** A node and everything below it. */
@@ -1301,7 +1330,9 @@ export class OperationTraceRegistry {
       // registered under, so a log line written inside this span carries an id
       // that resolves back to this node.
       spanId: newNodeId,
-      name,
+      // Cut as the span opens, so the tree never holds a long name; the
+      // callback's delegate keeps the one it was given.
+      name: fitManualSpanName(name),
       origin: "manual",
       type: "start",
       className: activeSpan.className,
@@ -1340,7 +1371,7 @@ export class OperationTraceRegistry {
     };
 
     const tags = {} as Record<string, string | number | boolean>;
-    const delegate = new TraceSpanDelegate(newNodeId, manualSpan.name, tags);
+    const delegate = new TraceSpanDelegate(newNodeId, name, tags);
     manualSpan.tags = tags;
     const store = this.als.getStore();
     return this.als.run(
