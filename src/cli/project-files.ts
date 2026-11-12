@@ -13,6 +13,28 @@ export const SECRET_VARIABLE = "OBSERVE_APP_SECRET";
 const CONVENTIONAL_START_SCRIPTS = new Set(["start", "start:dev"]);
 
 /**
+ * Printable ASCII without whitespace, a single quote or a backslash: what
+ * stands between single quotes in `.env` and reads the same to every loader.
+ * Key and secret are drawn from letters, digits and `!$%^&`, well inside it.
+ */
+const ENV_FILE_VALUE = /^[\x21-\x26\x28-\x5b\x5d-\x7e]+$/;
+
+/**
+ * Whether `value` can be written into `.env` as `writeEnvFile` writes it.
+ *
+ * The pair comes from the link service's reply, and `.env` is loaded into
+ * the app on every start: a quote and a line break would end the value and
+ * add a line of the reply's choosing - `NODE_OPTIONS=--import ...`, or a
+ * `DATABASE_URL` that wins over the project's own. Refused rather than
+ * escaped: no escape for a quote or a line break reads the same in Node's
+ * `--env-file`, `dotenv` and a shell, and `dotenv` reads `\'` as an escaped
+ * quote where Node ends the value.
+ */
+export function isEnvFileValue(value: unknown): value is string {
+  return typeof value === "string" && ENV_FILE_VALUE.test(value);
+}
+
+/**
  * Writes the key pair into `<cwd>/.env`, replacing an earlier pair and keeping
  * every other line as it was. Created owner-only when it does not exist.
  *
@@ -21,9 +43,15 @@ const CONVENTIONAL_START_SCRIPTS = new Set(["start", "start:dev"]);
  * variables (`dotenv-expand`, `ConfigModule` with `expandVariables`) rewrites
  * everything after a `$`, and a shell sourcing the file stops at the `&`.
  * Node's own `--env-file` reads either form literally. Single quotes are
- * literal in all of them, and the alphabet has no quote in it to escape.
+ * literal in all of them, and a value with a quote - or anything else
+ * `isEnvFileValue` refuses - is not written at all.
  */
 export function writeEnvFile(cwd: string, appKey: string, appSecret: string) {
+  if (!isEnvFileValue(appKey) || !isEnvFileValue(appSecret)) {
+    throw new TypeError(
+      "The key pair can hold only printable ASCII without whitespace, quotes or backslashes.",
+    );
+  }
   const path = join(cwd, ".env");
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
   const kept = existing

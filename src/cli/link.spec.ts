@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import * as ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { link, LinkDependencies } from "./link.js";
+import { writeEnvFile } from "./project-files.js";
 
 const STARTED = {
   deviceCode: "device-code",
@@ -277,6 +278,48 @@ describe("npx @nestjs/observe link", () => {
     expect(h.lines).toContain(
       "  Open      https://observe.nestjs.com/link?from=cli&x=1%202",
     );
+  });
+
+  // The pair goes into .env between single quotes, and `--env-file .env`
+  // into every start script: a quote and a line break in it would be a line
+  // of the reply's own - `NODE_OPTIONS=--import data:...`, run on the next
+  // start. Refused, not escaped: no escape reads the same in Node's
+  // --env-file, dotenv and a shell.
+  it.each([
+    [
+      "a quote and a line break",
+      {
+        appKey:
+          "kK'\nNODE_OPTIONS='--import data:text/javascript,process.exit(7)'\n#",
+      },
+    ],
+    [
+      "a line break",
+      { appSecret: "s3cret\nDATABASE_URL=postgres://elsewhere" },
+    ],
+    ["a carriage return", { appKey: "kK\rX=1" }],
+    ["a quote", { appSecret: "it's" }],
+    ["a backslash", { appKey: "kK\\" }],
+    ["a space", { appSecret: "s3cr t" }],
+    ["an array", { appKey: ["kK$kK&kKkKkKkKkKk"] }],
+  ])("writes nothing when the pair holds %s", async (_name, override) => {
+    const before = read("package.json");
+    const h = harness([{ status: 200, body: { ...LINKED, ...override } }]);
+
+    expect(await run(h)).toBe(1);
+
+    expect(h.lines).toContain(
+      "https://api.test answered with something other than a key pair. Nothing was written.",
+    );
+    expect(existsSync(join(cwd, ".env"))).toBe(false);
+    expect(read("package.json")).toBe(before);
+  });
+
+  it("will not write a pair into .env that cannot stand between its quotes", () => {
+    expect(() => writeEnvFile(cwd, "kK'\nNODE_OPTIONS=x", "s")).toThrow(
+      TypeError,
+    );
+    expect(existsSync(join(cwd, ".env"))).toBe(false);
   });
 
   it("replaces an earlier pair and keeps the rest of .env", async () => {

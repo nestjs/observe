@@ -8,6 +8,7 @@ import {
 import {
   addEnvFileToStartScripts,
   ensureEnvIgnored,
+  isEnvFileValue,
   readPackageName,
   writeEnvFile,
 } from "./project-files.js";
@@ -314,6 +315,11 @@ async function waitForApproval(
     } & Partial<LinkedCredentials>;
 
     if (response.ok && body.appKey && body.appSecret) {
+      // Checked before anything is written: the pair goes into .env, which
+      // every start of the app loads.
+      if (!isEnvFileValue(body.appKey) || !isEnvFileValue(body.appSecret)) {
+        return `${endpoint} answered with something other than a key pair. Nothing was written.`;
+      }
       return body as LinkedCredentials;
     }
     switch (body.error) {
