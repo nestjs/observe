@@ -268,6 +268,39 @@ describe("createInstanceDecorator", () => {
       expect(short.stack).not.toContain("Proxy.find");
     });
 
+    it("throws the method's own error when its stack cannot be read", () => {
+      const thrown = new Error("upstream refused");
+      Object.defineProperty(thrown, "stack", {
+        get() {
+          throw new TypeError("stack getter failed");
+        },
+      });
+      class UpstreamService {
+        call() {
+          throw thrown;
+        }
+      }
+      const service = createInstanceDecorator(
+        als,
+        {
+          internalStartTraceStep: () => "step-1",
+          internalEndTraceStep: () => undefined,
+        } as unknown as OperationTraceRegistry,
+        { traceIdKey: TRACE_ID_KEY, skipInstrumentation: () => false },
+      )(new UpstreamService()) as UpstreamService;
+
+      let caught: unknown;
+      withTrace(() => {
+        try {
+          service.call();
+        } catch (err) {
+          caught = err;
+        }
+      });
+
+      expect(caught).toBe(thrown);
+    });
+
     it("keeps the original method name on the returned wrapper", () => {
       const service = decorate(new UserService()) as UserService;
 

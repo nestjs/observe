@@ -691,28 +691,33 @@ function relabelProxyFrame(
   className: string,
   methodName: string,
 ): void {
-  // Measured first: reading `stack` is what writes it out.
-  if (
-    !(err instanceof Error) ||
-    stackHeaderLength(err) > MAX_RELABELLED_HEADER_LENGTH ||
-    typeof err.stack !== "string"
-  ) {
-    return;
-  }
-  // `async` prefixes the type name on frames resumed from an await. Spaces
-  // and tabs only after the newline, not `\s`: a newline matched there too,
-  // and a message of newlines then rescanned the run after each one.
-  const frame = new RegExp(
-    `(\\n[ \\t]*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
-  );
-  if (!frame.test(err.stack)) {
-    return;
-  }
+  // The label is cosmetic, so nothing here may take the place of the error
+  // the method threw: a `stack` that is a getter can throw on being read, as
+  // a read-only one throws on being written.
   try {
-    err.stack = err.stack.replace(frame, `$1${className}.${methodName}`);
+    // Measured first: reading `stack` is what writes it out.
+    if (
+      !(err instanceof Error) ||
+      stackHeaderLength(err) > MAX_RELABELLED_HEADER_LENGTH
+    ) {
+      return;
+    }
+    const stack: unknown = err.stack;
+    if (typeof stack !== "string") {
+      return;
+    }
+    // `async` prefixes the type name on frames resumed from an await. Spaces
+    // and tabs only after the newline, not `\s`: a newline matched there too,
+    // and a message of newlines then rescanned the run after each one.
+    const frame = new RegExp(
+      `(\\n[ \\t]*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
+    );
+    if (!frame.test(stack)) {
+      return;
+    }
+    err.stack = stack.replace(frame, `$1${className}.${methodName}`);
   } catch {
-    // Some errors ship a read-only `stack`; the label is cosmetic, so leaving
-    // it as-is beats masking the original failure.
+    // Left as it is.
   }
 }
 
