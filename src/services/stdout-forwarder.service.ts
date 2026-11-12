@@ -10,7 +10,11 @@ import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.j
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { REQUEST_ID_PATTERN } from "../utils/default-trace-id-generator.util.js";
 import { fitToLength } from "../utils/fit-to-length.util.js";
-import { parseLogLine } from "../utils/log-line.parser.js";
+import {
+  ParsedLogLine,
+  parseLogLine,
+  stripAnsi,
+} from "../utils/log-line.parser.js";
 import { LogRedactor } from "../utils/log-redactor.js";
 import {
   CALLER_METADATA_KEY,
@@ -32,9 +36,10 @@ import {
 const MAX_PARTIAL_LINE_LENGTH = 8 * 1024;
 
 /**
- * Most text the redactor is ever given in one go.
+ * Most text the redactor is ever given in one go - a line, or a message and
+ * the lines under it. Text past it is not sent: see `REDACTION_LOOKAHEAD`.
  *
- * Everything in `toLogEntry` runs synchronously inside the patched
+ * Everything in `toLogEntries` runs synchronously inside the patched
  * `process.stdout.write`, on the application's own hot path, and the redactor
  * is a set of regular expressions whose cost grows with input length. A single
  * multi-megabyte line - a dumped payload, and payloads can carry content an
@@ -95,6 +100,8 @@ const FORWARDED_STREAMS = ["stdout", "stderr"] as const;
 type ForwardedStream = (typeof FORWARDED_STREAMS)[number];
 
 type Store = Map<string, any>;
+
+type LogEntry = Parameters<ObserveAgentSharedBuffer["pushLogs"]>[0][number];
 
 /** The start of a line one execution is writing, and what it was written in. */
 interface HeldLine {
@@ -281,18 +288,13 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     // or the empty string left by a chunk that ended cleanly.
     const tail = segments.pop() ?? "";
 
-    const lines = segments.filter((line) => line.trim().length > 0);
-    if (lines.length > MAX_ENTRIES_PER_WRITE) {
-      // Cut before anything is parsed or redacted, which is where the time
-      // goes.
-      const omitted = lines.length - (MAX_ENTRIES_PER_WRITE - 1);
-      lines.length = MAX_ENTRIES_PER_WRITE - 1;
-      lines.push(`[observe] ${omitted} more lines of this write not forwarded`);
-    }
-    const entries = lines.map((text) => this.toLogEntry(text, store));
+    const entries = this.toLogEntries(
+      segments.filter((line) => line.trim().length > 0),
+      store,
+    );
     if (tail.length > MAX_PARTIAL_LINE_LENGTH) {
       if (tail.trim().length > 0) {
-        entries.push(this.toLogEntry(tail, store, true));
+        entries.push(...this.toLogEntries([tail], store, true));
       }
       held.set(writer, { text: "", store, overflowed: true });
     } else if (tail.length > 0) {
@@ -315,28 +317,132 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     if (line === undefined || line.text.trim().length === 0) {
       return;
     }
-    this.observeAgentSharedBuffer.pushLogs([
-      this.toLogEntry(line.text, line.store),
-    ]);
+    this.observeAgentSharedBuffer.pushLogs(
+      this.toLogEntries([line.text], line.store),
+    );
   }
 
   /**
-   * `store` is the one the line was written in - the current one, except for
-   * a line forwarded on behalf of the execution that left it unfinished.
+   * The entries for the complete lines of one write - an entry per line, but
+   * with the lines of one message redacted as the one text they were written
+   * as.
    *
-   * `unfinished` for a line that goes on past `line`, unseen: its last
-   * `REDACTION_LOOKAHEAD` characters are only shown to the redactor, so a
-   * secret that starts there and runs on is not half-sent. A JSON record has
-   * ended whatever follows it.
+   * A logger hands over a message in a single write however many lines it
+   * runs to, and only the first carries its prefix: the rest - the stack
+   * under an error, a key in its PEM layout, a value that holds a line break -
+   * arrive plain. Redacted a line at a time, such a secret is never seen
+   * whole. So a line is redacted together with the plain lines under it; a
+   * line with a prefix of its own starts another message, and a JSON record
+   * is always a message by itself. A masked value takes its line breaks with
+   * it, so a message can come back as fewer entries than it had lines.
+   *
+   * At most `MAX_ENTRIES_PER_WRITE` lines are read, and the lines past them
+   * are shown to the redactor with the last message, so a secret the cut
+   * splits is not half-sent. `store` is the one the lines were written in.
+   * `unfinished` for a line that goes on past what was written of it - see
+   * `MAX_PARTIAL_LINE_LENGTH`.
    */
-  private toLogEntry(
-    line: string,
+  private toLogEntries(
+    lines: string[],
     store: Store | undefined,
     unfinished = false,
-  ) {
-    // Parsed whole: see `MAX_REDACTED_LENGTH`.
-    const parsed = parseLogLine(line);
+  ): LogEntry[] {
+    // Cut before anything is parsed or redacted, which is where the time
+    // goes.
+    const read =
+      lines.length > MAX_ENTRIES_PER_WRITE
+        ? MAX_ENTRIES_PER_WRITE - 1
+        : lines.length;
+    const messages: Array<{
+      head: ParsedLogLine;
+      lines: string[];
+      longest: number;
+    }> = [];
+    for (let index = 0; index < read; index += 1) {
+      const line = lines[index];
+      // Parsed whole: see `MAX_REDACTED_LENGTH`.
+      const parsed = parseLogLine(line);
+      const message = messages.at(-1);
+      if (
+        message !== undefined &&
+        message.head.format !== "json" &&
+        parsed.format === "plain"
+      ) {
+        message.lines.push(parsed.message);
+        message.longest = Math.max(message.longest, line.length);
+      } else {
+        messages.push({
+          head: parsed,
+          lines: [parsed.message],
+          longest: line.length,
+        });
+      }
+    }
 
+    const entries: LogEntry[] = [];
+    for (const [index, message] of messages.entries()) {
+      const { head } = message;
+      let text = message.lines.join("\n");
+      let keep = text.length;
+      if (index === messages.length - 1 && head.format !== "json") {
+        if (read < lines.length) {
+          text += this.linesAfter(lines, read);
+        } else if (unfinished) {
+          keep -= REDACTION_LOOKAHEAD;
+        }
+      }
+      const redacted = this.redact(text, keep);
+      const texts = head.format === "json" ? [redacted] : redacted.split("\n");
+      for (const [at, part] of texts.entries()) {
+        entries.push(
+          // The lines under the first had no prefix of their own.
+          at === 0
+            ? this.toLogEntry(part, store, head, message.longest)
+            : this.toLogEntry(part, store),
+        );
+      }
+    }
+    if (read < lines.length) {
+      entries.push(
+        this.toLogEntry(
+          `[observe] ${lines.length - read} more lines of this write not forwarded`,
+          store,
+        ),
+      );
+    }
+    return entries;
+  }
+
+  /**
+   * The lines from `from` on, as the redactor is shown them past the last line
+   * that is sent: each after a line break, and only as many as
+   * `REDACTION_LOOKAHEAD` covers.
+   */
+  private linesAfter(lines: string[], from: number): string {
+    let after = "";
+    for (
+      let index = from;
+      index < lines.length && after.length < REDACTION_LOOKAHEAD;
+      index += 1
+    ) {
+      after += "\n" + stripAnsi(lines[index]).trimEnd();
+    }
+    return after;
+  }
+
+  /**
+   * `text` is redacted by now; `parsed` is the line it opens, when that line
+   * said more than its text. `longest` is the longest line `text` was read
+   * from: a line too long for the redactor's window goes without its
+   * attributes, whose length only it bounds - every string in them would need
+   * the window too.
+   */
+  private toLogEntry(
+    text: string,
+    store: Store | undefined,
+    parsed?: ParsedLogLine,
+    longest = 0,
+  ): LogEntry {
     const contextTraceId = store?.get(this.options.traceIdKey);
     // The line's own trace id wins: it was captured when the log was written,
     // whereas the async store is read now and may already have moved on.
@@ -346,7 +452,7 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     // `Trace ID:` they like - so it is held to the rule a client-supplied
     // `x-request-id` is. An over-long one would get the whole batch refused.
     const lineTraceId =
-      parsed.traceId !== undefined && REQUEST_ID_PATTERN.test(parsed.traceId)
+      parsed?.traceId !== undefined && REQUEST_ID_PATTERN.test(parsed.traceId)
         ? parsed.traceId
         : undefined;
     const traceId = lineTraceId ?? contextTraceId;
@@ -362,32 +468,22 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
         traceId === contextTraceId
           ? store?.get(CALLER_METADATA_KEY)
           : undefined,
-      level: parsed.level,
+      level: parsed?.level,
       context:
-        parsed.context === undefined
+        parsed?.context === undefined
           ? undefined
           : this.toContext(parsed.context),
-      // Redaction happens here, before the entry reaches the shared buffer -
-      // which is also before the buffer truncates oversized lines. That order is
+      // Redaction happens before the entry reaches the shared buffer - which
+      // is also before the buffer truncates oversized lines. That order is
       // deliberate: truncating first would cut a long secret in half and ship
       // the surviving half.
-      //
-      // A line too long for the redactor's window goes without its attributes:
-      // its length is the only bound on theirs, and every string in them would
-      // need the window too.
       attributes:
-        line.length > MAX_REDACTED_LENGTH
+        parsed?.attributes === undefined || longest > MAX_REDACTED_LENGTH
           ? undefined
           : this.redactor
             ? this.redactor.redactAttributes(parsed.attributes)
             : parsed.attributes,
-      text:
-        unfinished && parsed.format !== "json"
-          ? this.redact(
-              parsed.message,
-              parsed.message.length - REDACTION_LOOKAHEAD,
-            )
-          : this.redact(parsed.message),
+      text,
     };
   }
 

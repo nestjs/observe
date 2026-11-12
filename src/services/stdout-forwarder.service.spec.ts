@@ -594,6 +594,103 @@ describe("StdoutForwarderService", () => {
       expect(buffer.entries[0].text).toContain("***");
     });
 
+    describe("a message written over several lines", () => {
+      const NEST = "[Nest] 1  - 07/29/2026, 10:42:18 AM";
+      const body = [
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj",
+        "MzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu",
+        "NMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s+CLOyS56YyCFGeJZ",
+      ];
+      const pem = [
+        "-----BEGIN PRIVATE KEY-----",
+        ...body,
+        "-----END PRIVATE KEY-----",
+      ].join("\n");
+
+      it("redacts a private key logged in its own layout", () => {
+        const service = build();
+
+        // Redacted a line at a time, the key's lines were never seen
+        // together, and each one shipped - while the trace of the same
+        // request, redacted whole, had it masked.
+        write(service, `${NEST}    WARN [Deploy] Cannot import key: ${pem}\n`);
+
+        const sent = JSON.stringify(buffer.entries);
+        for (const line of body) {
+          expect(sent).not.toContain(line.slice(0, 16));
+        }
+        expect(buffer.entries[0]).toMatchObject({
+          level: "warn",
+          context: "Deploy",
+        });
+        expect(buffer.entries[0].text).toMatch(/^Cannot import key: /);
+      });
+
+      it("redacts a quoted value cut by a line break as far as the redactor reads it", () => {
+        const service = build();
+
+        write(
+          service,
+          'Error: secret="aGVsbG8gd29ybGQgaGVsbG8g\nd29ybGQ=" is not base64url\n    at main (/app/main.js:1:1)\n',
+        );
+
+        // The lines go to the redactor as the one text they were written as;
+        // how far a quoted value runs is its rule's to say, and it ends one
+        // left open at the end of its line - so the line under it is the
+        // redactor's to mask, not the forwarder's.
+        const sent = JSON.stringify(buffer.entries);
+        expect(sent).not.toContain("aGVsbG8");
+        expect(buffer.entries[0].text).toBe("Error: secret=[REDACTED]");
+      });
+
+      it("keeps a line that has a prefix of its own apart", () => {
+        const service = build();
+
+        write(
+          service,
+          `${NEST}     LOG [First] password:\n${NEST}     LOG [Second] ready\n`,
+        );
+
+        expect(buffer.entries).toMatchObject([
+          { context: "First", text: "password:" },
+          { context: "Second", text: "ready", level: "log" },
+        ]);
+      });
+
+      it("keeps a JSON record one entry, and apart from the lines under it", () => {
+        const service = build();
+
+        write(
+          service,
+          `${JSON.stringify({ level: "info", message: "a\nb" })}\nplain under it\n`,
+        );
+
+        expect(buffer.entries.map((entry) => entry.text)).toEqual([
+          "a\nb",
+          "plain under it",
+        ]);
+      });
+
+      it("redacts a value the per-write cap cut, with the lines past it", () => {
+        const service = build();
+
+        const filler = Array.from({ length: 48 }, (_, i) => `step ${i}`);
+        write(
+          service,
+          [
+            ...filler,
+            'secret="aGVsbG8gd29ybGQgaGVsbG8g',
+            'd29ybGQ="',
+            ...filler,
+          ].join("\n") + "\n",
+        );
+
+        expect(buffer.entries).toHaveLength(50);
+        expect(JSON.stringify(buffer.entries)).not.toContain("aGVsbG8");
+        expect(buffer.entries[48].text).toBe("secret=[REDACTED]");
+      });
+    });
+
     describe("an over-long line", () => {
       const password = "Pw-0123456789abcdef0123456789abcdef";
 
