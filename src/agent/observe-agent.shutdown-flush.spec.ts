@@ -165,6 +165,41 @@ describe("ObserveAgentWorker shutdown flush", () => {
     vi.restoreAllMocks();
   });
 
+  // A thread that dies mid-send - an uncaught exception, an out-of-memory -
+  // never reaches the `finally` that lets go of the lock. The main thread
+  // holds it only inside one synchronous flush, so a lock still held when the
+  // exit is handled was the dead thread's.
+  it("takes back the lock a worker died holding, so its successor gets the next batch", async () => {
+    const { agent, buffer, thread, initializeWorker, internals } = boot();
+    thread.stop();
+    // Mid-send: the slot taken, a batch in it.
+    Atomics.store(new Int32Array(buffer.sharedBuffer, 0, 1), 0, 1);
+    const stale = new TextEncoder().encode(
+      JSON.stringify({ logs: [{ text: "died-with-it" }] }),
+    );
+    new Uint8Array(buffer.sharedBuffer).set(stale, 8);
+    new DataView(buffer.sharedBuffer, 4, 4).setUint32(0, stale.length);
+
+    const successor = new FakeWorkerThread(buffer.sharedBuffer);
+    initializeWorker.mockImplementation(() => {
+      internals.worker = successor;
+      internals.watchWorker(successor);
+    });
+    thread.crash();
+
+    try {
+      buffer.pushLogs(logLines(1, "after-restart"));
+      agent.flush();
+      await sleep(50);
+
+      expect(successor.batches.map((batch) => batch.logs?.[0]?.text)).toEqual([
+        "after-restart-0",
+      ]);
+    } finally {
+      successor.stop();
+    }
+  });
+
   it("sends what is buffered before terminating the worker", async () => {
     const { agent, buffer, thread } = boot();
     buffer.pushLogs(logLines(3, "last-words"));

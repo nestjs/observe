@@ -650,6 +650,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
       // Whatever comes next, this worker gets nothing in any more: a
       // restarted one has to get a batch in again first.
       this.observeAgentSharedBuffer.recordStopped();
+      this.reclaimSlotOfStoppedWorker();
       this.reportOpenTelemetryInterop("stopped");
       if (code !== 0) {
         this.logger.error(
@@ -660,6 +661,30 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
         this.logger.debug("Worker exited gracefully.");
       }
     });
+  }
+
+  /**
+   * Frees the shared slot when the worker died holding it.
+   *
+   * A worker that dies mid-send - an uncaught exception, an out-of-memory -
+   * never reaches the `finally` that lets go of the lock, and its successor,
+   * started on the same buffer, could never take it: every later flush would
+   * be skipped for the life of the process. The main thread holds the lock
+   * only inside one synchronous `flush`, so a lock still held when the exit
+   * is handled can only be the dead worker's. Its batch is dropped, as on
+   * every failed send, so a batch that ends the worker cannot end the next
+   * one too. A slot that is not locked is left alone: its batch is still
+   * waiting, and goes to the next worker.
+   */
+  private reclaimSlotOfStoppedWorker() {
+    const buffer = this.observeAgentSharedBuffer;
+    if (!buffer.isBufferLocked()) {
+      return;
+    }
+    // The batch's length, after the lock word - what the worker zeroes
+    // before it lets go.
+    new DataView(buffer.sharedBuffer, 4, 4).setUint32(0, 0);
+    buffer.releaseLock();
   }
 
   handleMessage(msg: string) {
