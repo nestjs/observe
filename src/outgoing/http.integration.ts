@@ -206,11 +206,14 @@ export function subscribeOutgoingHttp(
       sendsTraceContext() &&
       !hasUndiciHeader(request.headers, TRACEPARENT_HEADER)
     ) {
+      // Sampled when the operation is recorded, as for node:http, not when
+      // this call got a span: one that opened as many spans as it may is
+      // still recorded, and its callee must not drop the trace.
       const span = spans.get(request);
       const headers = traceContextHeaders(
         trace,
         span?.spanId,
-        span !== undefined,
+        recorder.isRecording(),
       );
       request.addHeader(TRACEPARENT_HEADER, headers.traceparent);
       if (

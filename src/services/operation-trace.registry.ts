@@ -57,6 +57,28 @@ type TrackedNode = OngoingTraceEventNode & { depth: number };
  */
 export const UNFINISHED_SPANS_TAG = "observe.unfinishedSpans";
 
+/**
+ * Tag under which a snapshot records how many spans were never opened because
+ * it had already opened `MAX_SPANS_PER_TRACE`. A tag for the reason
+ * `UNFINISHED_SPANS_TAG` is one. Absent on a snapshot that stayed under it.
+ */
+export const UNRECORDED_SPANS_TAG = "observe.unrecordedSpans";
+
+/**
+ * Most spans one operation opens, manual ones included. Past it a traced
+ * call runs as it would untraced, and is counted under `UNRECORDED_SPANS_TAG`.
+ *
+ * Every span is a node, an id and a map entry the registry holds until the
+ * operation ends - about 300 bytes - and `spanCollapse` bounds only what is
+ * shipped, once it has ended. So a handler that calls a provider once per
+ * element of a list it was sent let the sender decide how much the agent
+ * held: one 12 MB WebSocket message ran a process out of heap, and an HTTP
+ * body within the default limit stalled the event loop for seconds as its
+ * spans were collapsed. Ten thousand is far past what a request makes and
+ * what the collapsed tree shows, and about 3 MB per open operation.
+ */
+const MAX_SPANS_PER_TRACE = 10_000;
+
 type TraceId = string;
 type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
   /**
@@ -95,6 +117,12 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    * see `MAX_CAPTURED_ERRORS_PER_TRACE`. Absent until the first.
    */
   capturedErrors?: number;
+  /**
+   * How many spans were not opened because the operation had already opened
+   * `MAX_SPANS_PER_TRACE` - shipped as `UNRECORDED_SPANS_TAG`. Absent until
+   * the first.
+   */
+  unrecordedSpans?: number;
 };
 
 /**
@@ -389,6 +417,8 @@ export class OperationTraceRegistry {
   private hasReportedSpanDepthLimit = false;
   /** See `reportCapturedErrorLimit`. */
   private hasReportedCapturedErrorLimit = false;
+  /** See `countUnrecordedSpan`. */
+  private hasReportedSpanLimit = false;
   /**
    * Applied to every tree as it is plucked. Defaults are live from
    * construction rather than waiting for `configureSpanCollapse`, so a
@@ -796,6 +826,12 @@ export class OperationTraceRegistry {
     if (!snapshot) {
       return undefined;
     }
+    // No step, as for an operation that is not recorded: every caller then
+    // runs the call untraced and closes nothing.
+    if (snapshot.refsCounter >= MAX_SPANS_PER_TRACE) {
+      this.countUnrecordedSpan(snapshot);
+      return undefined;
+    }
     snapshot.refsCounter += 1;
 
     const newNodeId = spanId ?? uuidv7();
@@ -1147,6 +1183,22 @@ export class OperationTraceRegistry {
   }
 
   /**
+   * Counts a span left unopened by `MAX_SPANS_PER_TRACE`. Warned once for
+   * the process: an operation that gets there does so on every request it is
+   * given the same input.
+   */
+  private countUnrecordedSpan(snapshot: SnapshotWithSignal): void {
+    snapshot.unrecordedSpans = (snapshot.unrecordedSpans ?? 0) + 1;
+    if (this.hasReportedSpanLimit) {
+      return;
+    }
+    this.hasReportedSpanLimit = true;
+    this.logger.warn(
+      `Trace "${snapshot.traceId}" opened ${MAX_SPANS_PER_TRACE} spans; the calls it makes after that run untraced, and the snapshot counts them under the "${UNRECORDED_SPANS_TAG}" tag. Later traces past this limit are not reported.`,
+    );
+  }
+
+  /**
    * Reports the trace even if it ends with no span recorded under it.
    *
    * `endTrace` drops such a trace, as a request no handler ran for. A CORS
@@ -1218,10 +1270,20 @@ export class OperationTraceRegistry {
       }
       cleanup();
 
-      // These six are what distinguish the registry's working copy from the
+      // These seven are what distinguish the registry's working copy from the
       // snapshot the API receives, so removing them is the hand-off.
       const bookkeeping = snapshot as Partial<SnapshotWithSignal>;
       const customOperationId = bookkeeping.customOperationId;
+      const unrecordedSpans = bookkeeping.unrecordedSpans;
+      if (unrecordedSpans !== undefined) {
+        // A copy: the object `startTrace` was given is the transport's `tags`
+        // option, shared by every operation it reports.
+        snapshot.tags = {
+          ...snapshot.tags,
+          [UNRECORDED_SPANS_TAG]: unrecordedSpans,
+        };
+      }
+      delete bookkeeping.unrecordedSpans;
       delete bookkeeping.refsCounter;
       delete bookkeeping.refsMarkedAsComplete;
       delete bookkeeping.errorStatusCode;
@@ -1403,6 +1465,10 @@ export class OperationTraceRegistry {
     const activeSpan = this.getActiveSpan(traceId, callerId);
     const snapshot = this.traceSnapshots.get(traceId);
     if (!activeSpan || !snapshot) {
+      return spanFunction(new TraceSpanDelegate("", name, {}));
+    }
+    if (snapshot.refsCounter >= MAX_SPANS_PER_TRACE) {
+      this.countUnrecordedSpan(snapshot);
       return spanFunction(new TraceSpanDelegate("", name, {}));
     }
 

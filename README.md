@@ -379,6 +379,13 @@ children, `s` spanId and `so` startOffset. A collector that does not know the
 tag stores it like any other and attributes the node as one call of its class
 rather than as the number it carries.
 
+Collapsing bounds what is shipped, not what is held while the operation runs,
+so one operation opens at most 10,000 spans, manual ones included. Calls past
+that run as they would untraced, and the operation's `observe.unrecordedSpans`
+tag says how many there were. A handler that calls a provider once per element
+of a list it was sent would otherwise let the sender decide how much memory
+the agent holds.
+
 ## Skipping spans for expected outcomes
 
 Nest applications answer "not found", "not allowed" and "invalid input" by

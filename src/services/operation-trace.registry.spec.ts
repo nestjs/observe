@@ -17,6 +17,7 @@ import { SPAN_COLLAPSED_TAG } from "./collapse-repeated-spans.util.js";
 import {
   OperationTraceRegistry,
   UNFINISHED_SPANS_TAG,
+  UNRECORDED_SPANS_TAG,
 } from "./operation-trace.registry.js";
 import { resolveSkipSpans } from "./skip-spans.util.js";
 
@@ -1051,6 +1052,120 @@ describe("OperationTraceRegistry", () => {
       const root = snapshot!.traces[0] as { error?: unknown };
       // A string throw carries no stack, so the root records only that it failed.
       expect(root.error).toBe(true);
+    });
+  });
+
+  describe("spans past the per-trace limit", () => {
+    const quietWarnings = () =>
+      vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+    /** Opens and closes `count` sibling spans under `parent`. */
+    const openAndClose = (traceId: string, parent: string, count: number) => {
+      const opened: Array<string | undefined> = [];
+      for (let i = 0; i < count; i++) {
+        const spanId = registry.internalStartTraceStep(
+          traceId,
+          "InboxService",
+          "markRead",
+          parent,
+        );
+        opened.push(spanId);
+        if (spanId !== undefined) {
+          registry.internalEndTraceStep(
+            traceId,
+            spanId,
+            "InboxService",
+            "markRead",
+            spanId,
+          );
+        }
+      }
+      return opened;
+    };
+
+    it("opens at most 10,000 spans in one operation and counts the rest", async () => {
+      const warn = quietWarnings();
+      startRequest("cap-1");
+      const root = registry.internalStartTraceStep(
+        "cap-1",
+        "InboxGateway",
+        "markRead",
+        undefined,
+      )!;
+
+      // A handler calling a provider once per element of the list it was
+      // sent: every span is held until the operation ends.
+      const opened = openAndClose("cap-1", root, 12_000);
+      registry.internalEndTraceStep(
+        "cap-1",
+        root,
+        "InboxGateway",
+        "markRead",
+        root,
+      );
+      registry.endTrace("cap-1", { statusCode: 200 });
+      const snapshot = (await registry.pluckSnapshot(
+        "cap-1",
+      )) as RequestSnapshot;
+
+      expect(opened.filter((id) => id !== undefined)).toHaveLength(9_999);
+      expect(opened.slice(9_999).every((id) => id === undefined)).toBe(true);
+      expect(snapshot.tags).toEqual({ [UNRECORDED_SPANS_TAG]: 2_001 });
+      expect(snapshot.attributes?.statusCode).toBe(200);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("runs a manual span past the limit without recording it", async () => {
+      quietWarnings();
+      startRequest("cap-2");
+      const root = registry.internalStartTraceStep(
+        "cap-2",
+        "ReportService",
+        "build",
+        undefined,
+      )!;
+      openAndClose("cap-2", root, 9_999);
+
+      const result = await registry.createManualSpan(
+        "cap-2",
+        root,
+        "render page",
+        (span) => {
+          span.setTag("page", 1);
+          return "rendered";
+        },
+      );
+      registry.internalEndTraceStep(
+        "cap-2",
+        root,
+        "ReportService",
+        "build",
+        root,
+      );
+      registry.endTrace("cap-2");
+      const snapshot = (await registry.pluckSnapshot(
+        "cap-2",
+      )) as RequestSnapshot;
+
+      expect(result).toBe("rendered");
+      expect(snapshot.tags).toEqual({ [UNRECORDED_SPANS_TAG]: 1 });
+      expect(JSON.stringify(snapshot.traces)).not.toContain("render page");
+    });
+
+    it("counts each operation against the limit on its own", async () => {
+      quietWarnings();
+      startRequest("cap-3");
+      startRequest("cap-4");
+      openAndClose("cap-3", undefined as never, 10_000);
+
+      expect(
+        registry.internalStartTraceStep("cap-4", "Svc", "m", undefined),
+      ).toBeDefined();
+      expect(
+        registry.internalStartTraceStep("cap-3", "Svc", "m", undefined),
+      ).toBeUndefined();
     });
   });
 

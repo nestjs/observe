@@ -387,9 +387,10 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           callerId,
         );
 
-        // No step means the registry holds no snapshot for this trace id: the
-        // request was dropped by `http.ignore` or sampled out, but its store
-        // still carries the id - log correlation needs it there. Nothing was
+        // No step means the registry holds no snapshot for this trace id -
+        // the request was dropped by `http.ignore` or sampled out, but its
+        // store still carries the id, which log correlation needs there - or
+        // the operation has opened as many spans as one may. Nothing was
         // opened, so nothing must be closed; without this bail-out every
         // provider call on an ignored route logged a registry error.
         if (newStepId === undefined) {

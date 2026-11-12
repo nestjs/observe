@@ -66,6 +66,8 @@ class CallerService {
   viaNodeHttp(path: string, headers?: Record<string, string>) {
     return nodeHttp(`${downstreamUrl}${path}`, headers);
   }
+
+  tick(): void {}
 }
 
 @Controller()
@@ -78,6 +80,15 @@ class CallerController {
       path,
       own ? { traceparent: own, tracestate: "caller=own" } : undefined,
     );
+  }
+
+  /** Past the spans one operation may open, then a call out. */
+  @Get("fetch-after-many")
+  async fetchAfterMany(@Query("path") path: string) {
+    for (let i = 0; i < 10_000; i += 1) {
+      this.caller.tick();
+    }
+    return this.caller.viaFetch(path);
   }
 
   @Get("node")
@@ -320,6 +331,20 @@ describe("ObserveModule: W3C trace context", () => {
         expect(callTo("/node-own").headers.traceparent).toBe(own);
       },
     );
+
+    it("still marks a fetch sampled when its operation has opened every span it may", async () => {
+      await request(url)
+        .get("/fetch-after-many")
+        .query({ path: "/after-many" })
+        .expect(200);
+
+      const snapshot = await snapshotFor("/after-many");
+      const context = readTraceContext(callTo("/after-many").headers);
+
+      expect(snapshot.tags?.["observe.unrecordedSpans"]).toBeGreaterThan(0);
+      expect(context?.traceId).toBe(snapshot.traceId.replace(/-/g, ""));
+      expect(context?.sampled).toBe(true);
+    });
 
     it("passes on an unsampled caller's decision", async () => {
       await request(url)
