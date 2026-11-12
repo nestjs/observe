@@ -88,8 +88,11 @@ export function readTraceContext(
     return undefined;
   }
   const context: TraceContext = {
-    traceId,
-    parentSpanId,
+    // Copied: a capture is a slice of the header, and would keep all of it
+    // alive for as long as the context - in the OTLP retry queue, that can
+    // be long. A version past 00 may carry anything after its flags.
+    traceId: copyOf(traceId),
+    parentSpanId: copyOf(parentSpanId),
     sampled: (parseInt(flags, 16) & 0x01) === 0x01,
   };
   const traceState = fitTraceState(headers?.["tracestate"]);
@@ -113,8 +116,10 @@ function fitTraceState(value: unknown): string | undefined {
   if (!trimmed || !TRACE_STATE_PATTERN.test(trimmed)) {
     return undefined;
   }
+  // Copied, here and below: what `trim` and `split` give back are slices of
+  // the value, however long it was.
   if (trimmed.length <= MAX_TRACE_STATE_LENGTH) {
-    return trimmed;
+    return copyOf(trimmed);
   }
   let fitted = "";
   for (const entry of trimmed.split(",")) {
@@ -128,7 +133,16 @@ function fitTraceState(value: unknown): string | undefined {
     }
     fitted = next;
   }
-  return fitted || undefined;
+  return fitted ? copyOf(fitted) : undefined;
+}
+
+/**
+ * `text`, which is printable ASCII, as a string that shares no memory with
+ * what it was cut from. V8 keeps a substring as a slice of its source, so a
+ * 32-character trace id would otherwise hold a header of any length.
+ */
+function copyOf(text: string): string {
+  return Buffer.from(text, "latin1").toString("latin1");
 }
 
 /**
@@ -231,8 +245,10 @@ function traceContextOfSpan(
     return undefined;
   }
   const context: TraceContext = {
-    traceId: spanContext.traceId,
-    parentSpanId: spanContext.spanId,
+    // Copied: the SDK's ids for a span with a remote parent are substrings
+    // of the carrier its propagator read, and would keep all of it alive.
+    traceId: copyOf(spanContext.traceId),
+    parentSpanId: copyOf(spanContext.spanId),
     sampled: (spanContext.traceFlags & 0x01) === 0x01,
   };
   let traceState: string | undefined;
