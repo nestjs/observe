@@ -173,6 +173,13 @@ function findExec(source: string, start: number) {
   return undefined;
 }
 
+/**
+ * The number of a procedure in a group, `EXEC dbo.Activate;2 'key'` - by now
+ * usually `;?`, or a digit a word runs on from. The call goes on after it: no
+ * statement opens with either, so this `;` cannot be the end of one.
+ */
+const PROCEDURE_NUMBER = /;\s*[?\d]/y;
+
 function redactExecArguments(sql: string): string {
   let text = sql;
   let searchFrom = 0;
@@ -202,7 +209,10 @@ function redactExecArguments(sql: string): string {
       } else if (text[end] === '"') {
         inQuotedIdentifier = true;
       } else if (text[end] === ";") {
-        break;
+        PROCEDURE_NUMBER.lastIndex = end;
+        if (!PROCEDURE_NUMBER.test(text)) {
+          break;
+        }
       }
       end++;
     }

@@ -663,6 +663,23 @@ describe("MSSQL statement sanitization", () => {
     );
   });
 
+  // `;2` numbers a procedure in a group; the statement goes on after it.
+  it.each([
+    ["EXEC dbo.ActivateLicence;2 PrivateLicence; SELECT 1"],
+    ["EXEC dbo.ActivateLicence;2 @key = PrivateLicence; SELECT 1"],
+    ["EXEC dbo.ActivateLicence;2 [PrivateLicence]; SELECT 1"],
+    ['EXEC dbo.ActivateLicence; 2 "PrivateLicence"; SELECT 1'],
+    ["EXEC dbo.ActivateLicence;2PrivateLicence; SELECT 1"],
+    ["EXEC dbo.ActivateLicence;2; SELECT 1"],
+  ])("redacts the arguments of a numbered procedure: %s", async (sql) => {
+    const h = harness();
+    await h.run(() => new h.Request().query(sql));
+    expect(h.nodes[0].tags?.["db.statement"]).toBe(
+      "EXEC dbo.ActivateLicence ?; SELECT ?",
+    );
+    expect(h.nodes[0].operation).toBe("EXEC dbo.ActivateLicence");
+  });
+
   it.each(["query", "batch"] as const)(
     "redacts every EXEC argument after a long first argument in %s calls",
     async (method) => {
