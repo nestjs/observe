@@ -100,6 +100,48 @@ describe("captureRequest", () => {
     );
   });
 
+  it("redacts a JSON body that arrived as a string by key, as a parsed one", () => {
+    const captured = captureRequest(
+      {
+        body: JSON.stringify({
+          tenantRef: "acme",
+          profile: { passwordConfirmation: "Tr0ub4dor", signature: "sig-9f3c" },
+          note: "hello",
+        }),
+      },
+      { headers: false, body: true },
+      new LogRedactor({ keys: ["tenant_ref"] }),
+    );
+
+    expect(JSON.parse(captured?.body ?? "")).toEqual({
+      tenantRef: "[REDACTED]",
+      profile: { passwordConfirmation: "[REDACTED]", signature: "[REDACTED]" },
+      note: "hello",
+    });
+  });
+
+  it("serializes no more of a sparse array than the cap can hold", () => {
+    // multer turns `f[1000000]=x` into an array with a million holes, and each
+    // hole serializes as `null`.
+    const sparse: unknown[] = [];
+    sparse[5_000_000] = "x";
+    const nested: unknown[] = [];
+    nested[2_000] = [];
+    (nested[2_000] as unknown[])[2_000] = [];
+    const startedAt = performance.now();
+
+    const captured = captureRequest(
+      { body: { f: sparse, g: nested, password: "hunter2" } },
+      { headers: false, body: true },
+      redactor,
+    );
+
+    expect(performance.now() - startedAt).toBeLessThan(50);
+    expect(captured?.bodyTruncated).toBe(true);
+    expect(Buffer.byteLength(captured?.body ?? "")).toBeLessThanOrEqual(2048);
+    expect(captured?.body).not.toContain("hunter2");
+  });
+
   it("records a body only on request, redacted by key before serialization", () => {
     const captured = captureRequest(req, { body: true }, redactor);
     const body = JSON.parse(captured!.body!);
