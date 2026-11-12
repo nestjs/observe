@@ -326,8 +326,6 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           recordError(requestId, stepId, err);
           // Re-throw the error to maintain original behavior
           throw err;
-        } finally {
-          spec.setActive(false);
         }
       },
     );
@@ -347,42 +345,45 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       if (!requestId) {
         return callUntraced(thisArg, args);
       }
+      // Cleared in the frame that set it, whatever throws in between: opening
+      // the step, copying the store and entering it can each run out of
+      // stack, and a flag left set sent every later call of this method, from
+      // any request, down the untraced path until the process restarted.
       spec.setActive(true);
+      try {
+        const callerId = store?.get(CALLER_METADATA_KEY) as string | undefined;
+        const newStepId = operationTraceRegistry.internalStartTraceStep(
+          requestId,
+          className,
+          methodName,
+          callerId,
+        );
 
-      const callerId = store?.get(CALLER_METADATA_KEY) as string | undefined;
-      const newStepId = operationTraceRegistry.internalStartTraceStep(
-        requestId,
-        className,
-        methodName,
-        callerId,
-      );
-
-      // No step means the registry holds no snapshot for this trace id: the
-      // request was dropped by `http.ignore` or sampled out, but its store
-      // still carries the id - log correlation needs it there. Nothing was
-      // opened, so nothing must be closed; without this bail-out every
-      // provider call on an ignored route logged a registry error.
-      if (newStepId === undefined) {
-        try {
+        // No step means the registry holds no snapshot for this trace id: the
+        // request was dropped by `http.ignore` or sampled out, but its store
+        // still carries the id - log correlation needs it there. Nothing was
+        // opened, so nothing must be closed; without this bail-out every
+        // provider call on an ignored route logged a registry error.
+        if (newStepId === undefined) {
           return callUntraced(thisArg, args);
-        } finally {
-          spec.setActive(false);
         }
-      }
 
-      // Everything the caller's context holds, with this span as the caller
-      // of whatever it calls. A copy, so the caller's context still names the
-      // caller once this call returns.
-      const spanStore = new Map(store);
-      spanStore.set(CALLER_METADATA_KEY, newStepId);
-      return als.run(
-        spanStore,
-        callTraced,
-        thisArg,
-        args,
-        requestId,
-        newStepId,
-      );
+        // Everything the caller's context holds, with this span as the caller
+        // of whatever it calls. A copy, so the caller's context still names
+        // the caller once this call returns.
+        const spanStore = new Map(store);
+        spanStore.set(CALLER_METADATA_KEY, newStepId);
+        return als.run(
+          spanStore,
+          callTraced,
+          thisArg,
+          args,
+          requestId,
+          newStepId,
+        );
+      } finally {
+        spec.setActive(false);
+      }
     });
   };
 

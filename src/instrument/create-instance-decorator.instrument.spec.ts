@@ -960,6 +960,43 @@ describe("createInstanceDecorator", () => {
     });
   });
 
+  describe("when opening a step throws", () => {
+    class EscapeService {
+      escape(text: string) {
+        return text.replace(/</g, "&lt;");
+      }
+    }
+
+    it("still traces the method's later calls", () => {
+      // A request nested a few levels past the deepest body an application
+      // accepts runs out of stack between setting the re-entrancy flag and
+      // entering the span: the flag stayed set, and the method was never
+      // traced again until the process restarted.
+      let overflow = true;
+      const started: string[] = [];
+      const registry = {
+        internalStartTraceStep: (_: string, __: string, methodName: string) => {
+          if (overflow) {
+            overflow = false;
+            throw new RangeError("Maximum call stack size exceeded");
+          }
+          started.push(methodName);
+          return `step-${started.length}`;
+        },
+        internalEndTraceStep: () => undefined,
+      } as unknown as OperationTraceRegistry;
+      const service = createInstanceDecorator(als, registry, {
+        traceIdKey: TRACE_ID_KEY,
+        skipInstrumentation: () => false,
+      })(new EscapeService()) as EscapeService;
+
+      expect(() => withTrace(() => service.escape("<a>"))).toThrow(RangeError);
+      expect(withTrace(() => service.escape("<b>"))).toBe("&lt;b>");
+
+      expect(started).toEqual(["escape"]);
+    });
+  });
+
   describe("when decorating a pipe", () => {
     class CreateOrderDto {}
 
