@@ -204,6 +204,14 @@ describe("StdoutForwarderService", () => {
         expect(buffer.entries[1].text).toBe("next line");
       });
 
+      it("forwards nothing for a cut line of only whitespace", () => {
+        const service = build();
+
+        write(service, " ".repeat(9 * 1024));
+
+        expect(buffer.entries).toHaveLength(0);
+      });
+
       it("keeps a stream's cut line apart from the other stream", () => {
         const service = build();
 
@@ -326,6 +334,103 @@ describe("StdoutForwarderService", () => {
       expect(
         (buffer.entries[0] as unknown as { timestamp: number }).timestamp,
       ).toEqual(expect.any(Number));
+    });
+  });
+
+  describe("lines written in pieces by several executions", () => {
+    const inTrace = (traceId: string, run: () => void) =>
+      als.run(new Map([[TRACE_ID_KEY, traceId]]), run);
+
+    it("joins a piece only to the line its own execution started", () => {
+      const service = build();
+
+      // One request prints a reply piece by piece while another logs. Joined
+      // to the other's line, the first pieces went out under its trace, in
+      // front of a line that no longer parsed - and the rest of a secret
+      // still being written went out alone, matching no rule.
+      inTrace("trace-alice", () => write(service, "reply: password=hun"));
+      inTrace("trace-bob", () =>
+        write(
+          service,
+          "[Nest] 1  - 07/29/2026, 10:42:18 AM    WARN [Auth] login failed for bob\n",
+        ),
+      );
+      inTrace("trace-alice", () => write(service, "ter2secret done\n"));
+
+      expect(JSON.stringify(buffer.entries)).not.toContain("ter2secret");
+      expect(buffer.entries).toMatchObject([
+        {
+          traceId: "trace-bob",
+          level: "warn",
+          context: "Auth",
+          text: "login failed for bob",
+        },
+        { traceId: "trace-alice", text: "reply: password=[REDACTED] done" },
+      ]);
+    });
+
+    it("joins the pieces one execution writes from different spans", () => {
+      const service = build();
+
+      // The store is copied for every span, so it is the trace that says
+      // whose line a piece belongs to, not the store object.
+      als.run(new Map([[TRACE_ID_KEY, "trace-1"]]), () =>
+        write(service, "hel"),
+      );
+      als.run(
+        new Map([
+          [TRACE_ID_KEY, "trace-1"],
+          [CALLER_METADATA_KEY, "span-2"],
+        ]),
+        () => write(service, "lo\n"),
+      );
+
+      expect(buffer.entries).toMatchObject([
+        { text: "hello", traceId: "trace-1", spanId: "span-2" },
+      ]);
+    });
+
+    it("drops the rest of a line cut at the cap for its own execution only", () => {
+      const service = build();
+
+      inTrace("trace-alice", () => write(service, "y".repeat(9 * 1024)));
+      inTrace("trace-bob", () => write(service, "from bob\n"));
+      inTrace("trace-alice", () => write(service, "rest of it\nnext\n"));
+
+      expect(
+        buffer.entries.map((entry) => [entry.traceId, entry.text.slice(0, 8)]),
+      ).toEqual([
+        ["trace-alice", "yyyyyyyy"],
+        ["trace-bob", "from bob"],
+        ["trace-alice", "next"],
+      ]);
+    });
+
+    it("forwards the line held longest once too many are held", () => {
+      const service = build();
+
+      // An execution that ends without its newline leaves its line behind.
+      for (let i = 0; i < 65; i++) {
+        inTrace(`trace-${i}`, () => write(service, `piece ${i}`));
+      }
+
+      expect(buffer.entries).toMatchObject([
+        { text: "piece 0", traceId: "trace-0" },
+      ]);
+    });
+
+    it("files a line forwarded on shutdown under the trace that wrote it", () => {
+      const service = build();
+
+      service.start();
+      inTrace("trace-late", () => {
+        process.stdout.write("no newline yet");
+      });
+      service.onModuleDestroy();
+
+      expect(
+        buffer.entries.find((entry) => entry.text === "no newline yet"),
+      ).toMatchObject({ traceId: "trace-late" });
     });
   });
 

@@ -12,7 +12,11 @@ import { REQUEST_ID_PATTERN } from "../utils/default-trace-id-generator.util.js"
 import { fitToLength } from "../utils/fit-to-length.util.js";
 import { parseLogLine } from "../utils/log-line.parser.js";
 import { LogRedactor } from "../utils/log-redactor.js";
-import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "../observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  OBSERVE_OPTIONS,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 
 /**
  * Cap on the unterminated tail held between writes.
@@ -79,8 +83,30 @@ const MAX_CONTEXT_LENGTH = 255;
  */
 const MAX_ENTRIES_PER_WRITE = 50;
 
+/**
+ * Most unfinished lines held per stream, one for each execution that has
+ * written one. An execution that ends without writing its newline leaves its
+ * line behind, so past this many the one written to longest ago is forwarded
+ * as it is.
+ */
+const MAX_HELD_LINES = 64;
+
 const FORWARDED_STREAMS = ["stdout", "stderr"] as const;
 type ForwardedStream = (typeof FORWARDED_STREAMS)[number];
+
+type Store = Map<string, any>;
+
+/** The start of a line one execution is writing, and what it was written in. */
+interface HeldLine {
+  text: string;
+  /** The async store of the last piece, which the line is filed under. */
+  store: Store | undefined;
+  /**
+   * Set once the line was forwarded at the cap: what follows, up to its
+   * newline, is the rest of it, and is dropped - see `MAX_PARTIAL_LINE_LENGTH`.
+   */
+  overflowed: boolean;
+}
 
 @Injectable()
 export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
@@ -94,18 +120,21 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
    *
    * One fragment per stream: stdout and stderr interleave freely, and joining
    * the tail of one onto the head of the other would fuse two unrelated lines.
+   *
+   * And one per execution, for the same reason: while one request prints a
+   * reply piece by piece, others log. Joined, the pieces written so far went
+   * out under the trace of whoever logged next, in front of a line that no
+   * longer parsed, and a secret still being written was cut in two before it
+   * was redacted. Keyed by the trace, as the registry is, rather than by the
+   * store, which is copied for every span. Writes outside any execution share
+   * the `undefined` key. Kept in the order the lines were last written to.
    */
-  private readonly partialLines: Record<ForwardedStream, string> = {
-    stdout: "",
-    stderr: "",
-  };
-  /**
-   * Set once a stream's held line was forwarded at the cap: what it writes up
-   * to its next newline is the rest of that line, and is dropped.
-   */
-  private readonly overflowed: Record<ForwardedStream, boolean> = {
-    stdout: false,
-    stderr: false,
+  private readonly partialLines: Record<
+    ForwardedStream,
+    Map<unknown, HeldLine>
+  > = {
+    stdout: new Map(),
+    stderr: new Map(),
   };
   private originalWrites: Record<
     ForwardedStream,
@@ -215,27 +244,42 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     for (const name of FORWARDED_STREAMS) {
-      this.flushPartial(name);
+      // Deleting the entry being visited is safe while iterating a Map.
+      for (const writer of this.partialLines[name].keys()) {
+        this.flushPartial(name, writer);
+      }
       process[name].write = this.originalWrites[name];
     }
     this.originalWrites = null;
   }
 
   private consume(chunk: string, name: ForwardedStream = "stdout") {
-    if (this.overflowed[name]) {
-      const newline = chunk.indexOf("\n");
-      if (newline === -1) {
-        return;
+    const store: Store | undefined = this.als.getStore();
+    const writer: unknown =
+      store?.get(TRACE_REGISTRY_KEY) ?? store?.get(this.options.traceIdKey);
+    const held = this.partialLines[name];
+    const heldLine = held.get(writer);
+    let combined = chunk;
+    if (heldLine !== undefined) {
+      // Set again below rather than updated in place, so the map stays in
+      // the order the lines were last written to.
+      held.delete(writer);
+      if (heldLine.overflowed) {
+        const newline = chunk.indexOf("\n");
+        if (newline === -1) {
+          held.set(writer, heldLine);
+          return;
+        }
+        combined = chunk.slice(newline + 1);
+      } else {
+        combined = heldLine.text + chunk;
       }
-      this.overflowed[name] = false;
-      chunk = chunk.slice(newline + 1);
     }
-    const combined = this.partialLines[name] + chunk;
     const segments = combined.split("\n");
 
     // The final segment has no newline yet, so it is either an incomplete line
     // or the empty string left by a chunk that ended cleanly.
-    this.partialLines[name] = segments.pop() ?? "";
+    const tail = segments.pop() ?? "";
 
     const lines = segments.filter((line) => line.trim().length > 0);
     if (lines.length > MAX_ENTRIES_PER_WRITE) {
@@ -245,45 +289,54 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       lines.length = MAX_ENTRIES_PER_WRITE - 1;
       lines.push(`[observe] ${omitted} more lines of this write not forwarded`);
     }
-    const entries = lines.map((line) => this.toLogEntry(line));
+    const entries = lines.map((text) => this.toLogEntry(text, store));
+    if (tail.length > MAX_PARTIAL_LINE_LENGTH) {
+      if (tail.trim().length > 0) {
+        entries.push(this.toLogEntry(tail, store, true));
+      }
+      held.set(writer, { text: "", store, overflowed: true });
+    } else if (tail.length > 0) {
+      held.set(writer, { text: tail, store, overflowed: false });
+    }
 
     if (entries.length > 0) {
       this.observeAgentSharedBuffer.pushLogs(entries);
     }
 
-    if (this.partialLines[name].length > MAX_PARTIAL_LINE_LENGTH) {
-      this.flushPartial(name, true);
+    if (held.size > MAX_HELD_LINES) {
+      this.flushPartial(name, held.keys().next().value);
     }
   }
 
-  /**
-   * Forwards the line a stream is holding. `atCap` when its length forced
-   * that: the line goes on past what is forwarded - see
-   * `MAX_PARTIAL_LINE_LENGTH`.
-   */
-  private flushPartial(name: ForwardedStream, atCap = false) {
-    const partialLine = this.partialLines[name];
-    this.partialLines[name] = "";
-    this.overflowed[name] = atCap;
-    if (partialLine.trim().length === 0) {
+  /** Forwards, as it is, the line one execution left unfinished. */
+  private flushPartial(name: ForwardedStream, writer: unknown) {
+    const line = this.partialLines[name].get(writer);
+    this.partialLines[name].delete(writer);
+    if (line === undefined || line.text.trim().length === 0) {
       return;
     }
     this.observeAgentSharedBuffer.pushLogs([
-      this.toLogEntry(partialLine, atCap),
+      this.toLogEntry(line.text, line.store),
     ]);
   }
 
   /**
+   * `store` is the one the line was written in - the current one, except for
+   * a line forwarded on behalf of the execution that left it unfinished.
+   *
    * `unfinished` for a line that goes on past `line`, unseen: its last
    * `REDACTION_LOOKAHEAD` characters are only shown to the redactor, so a
    * secret that starts there and runs on is not half-sent. A JSON record has
    * ended whatever follows it.
    */
-  private toLogEntry(line: string, unfinished = false) {
+  private toLogEntry(
+    line: string,
+    store: Store | undefined,
+    unfinished = false,
+  ) {
     // Parsed whole: see `MAX_REDACTED_LENGTH`.
     const parsed = parseLogLine(line);
 
-    const store = this.als.getStore();
     const contextTraceId = store?.get(this.options.traceIdKey);
     // The line's own trace id wins: it was captured when the log was written,
     // whereas the async store is read now and may already have moved on.
