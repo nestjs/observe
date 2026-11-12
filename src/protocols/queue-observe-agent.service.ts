@@ -167,10 +167,23 @@ export class QueueObserveAgentService<Store extends Record<string, unknown>> {
     // The worker calls the processor with `(job, token, signal)`, and all of it
     // is passed on: a processor that moves its own job (`moveToDelayed`,
     // `extendLock`) needs the token to prove it holds the lock.
-    ProcessorDecoratorService.prototype["decorate"] =
-      (processor: JobProcessor) =>
-      (job: Job, ...rest: unknown[]) =>
+    //
+    // And the wrapper declares as many parameters as the processor does: the
+    // worker builds a job's abort signal only for a processor that declares
+    // three, so a rest parameter, whose `length` is 1, left every
+    // `process(job, token, signal)` without one and `cancelJob()` with
+    // nothing to abort.
+    ProcessorDecoratorService.prototype["decorate"] = (
+      processor: JobProcessor,
+    ) => {
+      const decorated = (job: Job, ...rest: unknown[]) =>
         this.runner.run(this.describeJob(job), () => processor(job, ...rest));
+      Object.defineProperty(decorated, "length", {
+        value: processor.length,
+        configurable: true,
+      });
+      return decorated;
+    };
 
     this.patchQueue();
   }

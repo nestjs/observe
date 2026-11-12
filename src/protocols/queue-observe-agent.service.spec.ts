@@ -78,6 +78,25 @@ describe("QueueObserveAgentService", () => {
 
     expect(processor).toHaveBeenCalledWith(job, "lock-token", signal);
   });
+
+  it("declares the parameters of the processor it stands in for", () => {
+    // BullMQ's worker builds an abort signal for a job - and `cancelJob()`
+    // has something to abort - only for a processor that declares three
+    // parameters, and `@nestjs/bullmq` hands it the decorated one.
+    createAgent();
+    const decorate = prototype.decorate as (processor: unknown) => {
+      length: number;
+    };
+    class ExportProcessor {
+      process(_job: unknown, _token?: string, _signal?: AbortSignal) {
+        return Promise.resolve();
+      }
+    }
+    const instance = new ExportProcessor();
+
+    expect(decorate(instance.process.bind(instance)).length).toBe(3);
+    expect(decorate((_job: unknown) => undefined).length).toBe(1);
+  });
 });
 
 /**
