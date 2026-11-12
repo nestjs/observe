@@ -9,7 +9,11 @@ import {
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
-import { JobRunDescriptor, JobTraceRunner } from "./job-trace-runner.js";
+import {
+  JobRunDescriptor,
+  JobTraceRunner,
+  readJobTimes,
+} from "./job-trace-runner.js";
 import {
   describePeerLoadError,
   loadOptionalPeer,
@@ -86,27 +90,7 @@ export class QueueObserveAgentService<Store extends Record<string, unknown>> {
    * omitted rather than reported as zero.
    */
   private readQueueMetadata(job: Job): Partial<JobSnapshot> {
-    const metadata: Partial<JobSnapshot> = {};
-
-    if (typeof job.timestamp === "number") {
-      metadata.enqueuedAt = new Date(job.timestamp).toISOString();
-
-      // processedOn is set by the worker immediately before the processor runs.
-      // Falling back to now() keeps the measurement honest if it is missing.
-      const startedAt =
-        typeof job.processedOn === "number" ? job.processedOn : Date.now();
-
-      // `timestamp` is when the job was created, not when it became runnable, so
-      // for a delayed job the gap between the two is a schedule the caller asked
-      // for - not a queue that fell behind. Counting it would report a job dated
-      // a week out as a week of backlog and drag `job_wait_p95` with it.
-      //
-      // Read off the options when `job.delay` is zero: BullMQ resets that
-      // field as it promotes a delayed job, so by the time a worker holds the
-      // job it says 0 whatever was asked for.
-      const availableAt = job.timestamp + (job.delay || job.opts?.delay || 0);
-      metadata.waitDuration = Math.max(0, startedAt - availableAt);
-    }
+    const metadata = readJobTimes(job);
 
     if (typeof job.attemptsMade === "number") {
       metadata.attemptsMade = job.attemptsMade;

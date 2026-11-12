@@ -79,6 +79,35 @@ describe("QueueObserveAgentService", () => {
     expect(processor).toHaveBeenCalledWith(job, "lock-token", signal);
   });
 
+  it.each([
+    ["a timestamp past what a Date holds", { timestamp: 8.64e15 + 1 }],
+    ["a timestamp that is no number", { timestamp: Number.NaN }],
+    [
+      "a delay option that is an object",
+      // What BullMQ hands back for options written straight to Redis.
+      {
+        timestamp: 1_700_000_000_000,
+        delay: 0,
+        opts: { delay: JSON.parse('{"toString":1}') },
+      },
+    ],
+  ])("still runs a job with %s", async (_, fields) => {
+    // Formatting the job's times threw before the processor was called, and
+    // the worker failed a job that completes without the agent.
+    createTracingAgent();
+    const processor = vi.fn(async () => "done");
+    const decorated = (
+      prototype.decorate as (
+        processor: unknown,
+      ) => (...args: unknown[]) => Promise<unknown>
+    )(processor);
+
+    await expect(
+      decorated({ queueName: "emails", name: "welcome", id: "1", ...fields }),
+    ).resolves.toBe("done");
+    expect(processor).toHaveBeenCalledOnce();
+  });
+
   it("declares the parameters of the processor it stands in for", () => {
     // BullMQ's worker builds an abort signal for a job - and `cancelJob()`
     // has something to abort - only for a processor that declares three

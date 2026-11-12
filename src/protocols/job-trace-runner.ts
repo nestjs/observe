@@ -39,6 +39,63 @@ export interface JobRunDescriptor {
 
 type JobStatus = NonNullable<JobSnapshot["status"]>;
 
+/** The later of the two ends of the range a `Date` can hold, in ms. */
+const MAX_DATE_TIMESTAMP = 8.64e15;
+
+/** What a queue driver read back of a job's times. */
+interface JobTimes {
+  /** When the job was created. */
+  timestamp?: unknown;
+  /** When the worker took it, set just before the processor runs. */
+  processedOn?: unknown;
+  /** The delay still pending, which BullMQ and Bull reset on promotion. */
+  delay?: unknown;
+  opts?: { delay?: unknown };
+}
+
+/**
+ * When a job was enqueued, and how long it waited for a worker once it could
+ * run - left out when its times are not ones a `Date` can hold.
+ *
+ * Job fields are read back from Redis, which anything with access to it can
+ * write, and BullMQ takes a caller's `timestamp` option unchecked:
+ * `new Date(8.64e15 + 1).toISOString()` throws, and adding an object-valued
+ * `delay` to a number throws too. Both ran before the processor, so the
+ * worker failed a job that completes without the agent.
+ *
+ * `timestamp` is when the job was created, not when it became runnable, so for
+ * a delayed job the gap between the two is a schedule the caller asked for -
+ * not a queue that fell behind. Counting it would report a job dated a week
+ * out as a week of backlog and drag `job_wait_p95` with it. The delay is read
+ * off the options when the job's own reads 0: it is reset as a delayed job is
+ * promoted, so by the time a worker holds the job it says 0 whatever was
+ * asked for. `||`, not `??`, for that reason.
+ */
+export function readJobTimes(job: JobTimes): Partial<JobSnapshot> {
+  const { timestamp } = job;
+  if (!isDateTimestamp(timestamp)) {
+    return {};
+  }
+  // Falling back to now() keeps the measurement honest if it is missing.
+  const startedAt = isDateTimestamp(job.processedOn)
+    ? job.processedOn
+    : Date.now();
+  const asked = job.delay || job.opts?.delay;
+  const delay = typeof asked === "number" && Number.isFinite(asked) ? asked : 0;
+  return {
+    enqueuedAt: new Date(timestamp).toISOString(),
+    waitDuration: Math.max(0, startedAt - (timestamp + delay)),
+  };
+}
+
+function isDateTimestamp(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Math.abs(value) <= MAX_DATE_TIMESTAMP
+  );
+}
+
 /** The slice of a queue's prototype the enqueue patch touches. */
 interface QueuePrototypeLike {
   add?: (...args: any[]) => unknown;
