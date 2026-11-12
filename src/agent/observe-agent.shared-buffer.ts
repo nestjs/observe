@@ -208,6 +208,8 @@ export class ObserveAgentSharedBuffer {
   private readonly encoder = new TextEncoder();
   private readonly logger = new Logger(ObserveAgentSharedBuffer.name);
   private _mainThreadBuffer: AgentMetricsPayload | null = null;
+  /** See `reportUnencodableMetric`. */
+  private hasReportedUnencodableMetric = false;
 
   /**
    * Log lines that did not fit the current batch, oldest first. Survives
@@ -223,8 +225,10 @@ export class ObserveAgentSharedBuffer {
    */
   private readonly _awaitingFlushAck = new Set<Counter<any> | Summary<any>>();
 
-  /** Summaries observed into the current buffer, encoded as it is written. */
-  private readonly _summariesToEncode = new Set<Summary<any>>();
+  /** Metrics changed in the current buffer, encoded as it is written. */
+  private readonly _metricsToEncode = new Set<
+    Counter<any> | Gauge<any> | Summary<any>
+  >();
 
   get sharedBuffer() {
     return this._sharedBuffer;
@@ -740,15 +744,13 @@ export class ObserveAgentSharedBuffer {
       this._awaitingFlushAck.add(metric);
     }
 
-    // Encoded when the batch is written, not on every observation: encoding a
-    // summary sorts its sample once per quantile, and a summary is observed
-    // on the request path, where sorting on every `observe` costs the main
-    // thread more the fuller the window gets.
-    if (metric instanceof Summary) {
-      this._summariesToEncode.add(metric);
-      return;
-    }
-    this.placeCustomMetric(metric);
+    // Encoded when the batch is written, not on every change: a metric is
+    // changed on the request path, and encoding one reads all of it - a
+    // summary sorts its sample once per quantile, a counter or gauge at its
+    // series cap copies a thousand series - so encoding on every change cost
+    // the main thread more the fuller the window got, for an entry the next
+    // change replaced.
+    this._metricsToEncode.add(metric);
   }
 
   private placeCustomMetric(metric: Counter<any> | Gauge<any> | Summary<any>) {
@@ -772,6 +774,28 @@ export class ObserveAgentSharedBuffer {
     } else {
       custom.push(encoded);
     }
+  }
+
+  /** Once for the process: the same metric fails the same way every window. */
+  private reportUnencodableMetric(
+    metric: Counter<any> | Gauge<any> | Summary<any>,
+    error: unknown,
+  ): void {
+    if (this.hasReportedUnencodableMetric) {
+      return;
+    }
+    this.hasReportedUnencodableMetric = true;
+    let reason: string;
+    try {
+      reason = error instanceof Error ? error.message : String(error);
+    } catch {
+      reason = "an unprintable error";
+    }
+    // Typed as a string, and as unchecked at run time as what failed.
+    const name: unknown = metric.name;
+    this.logger.warn(
+      `Custom metric "${typeof name === "string" ? name.slice(0, 100) : typeof name}" could not be encoded and is left out of the batch. Later metrics that cannot be encoded are not reported: ${reason}`,
+    );
   }
 
   /**
@@ -870,10 +894,20 @@ export class ObserveAgentSharedBuffer {
   encodeAndWrite() {
     this.withholdLogs();
 
-    for (const summary of this._summariesToEncode) {
-      this.placeCustomMetric(summary);
+    for (const metric of this._metricsToEncode) {
+      try {
+        this.placeCustomMetric(metric);
+      } catch (error) {
+        // One metric the encoder cannot read - a label name that is not a
+        // string at run time - is left out rather than costing the batch,
+        // and is not marked as delivered.
+        if (metric instanceof Counter || metric instanceof Summary) {
+          this._awaitingFlushAck.delete(metric);
+        }
+        this.reportUnencodableMetric(metric, error);
+      }
     }
-    this._summariesToEncode.clear();
+    this._metricsToEncode.clear();
 
     if (this.options.debug) {
       if (this._mainThreadBuffer?.snapshots) {
@@ -1030,7 +1064,7 @@ export class ObserveAgentSharedBuffer {
 
   resetMainThreadBuffer() {
     this._mainThreadBuffer = null;
-    this._summariesToEncode.clear();
+    this._metricsToEncode.clear();
     this.withheldSnapshots = 0;
     this.withheldJobs = 0;
   }

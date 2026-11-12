@@ -1198,12 +1198,110 @@ describe("ObserveAgentSharedBuffer", () => {
 
       // Matched against the name as sent, the second change updates the
       // first entry instead of buffering the metric twice.
-      const { custom } = batchOf(buffer) as unknown as {
-        custom: Array<{ n: string; v: Record<string, number> }>;
-      };
+      buffer.encodeAndWrite();
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const { custom } = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: Array<{ n: string; v: Record<string, number> }> };
       expect(custom).toHaveLength(1);
       expect(custom[0].n).toHaveLength(100);
       expect(custom[0].v).toEqual({ default: 2 });
+    });
+
+    it("encodes a counter and a gauge once per batch rather than on every change", () => {
+      const buffer = createBuffer();
+      // At the series cap, encoding a metric reads every one of its series:
+      // a change that re-encoded it cost the request thread the whole of it.
+      const counter = new Counter<"route">("http.hits", "", ["route"]);
+      const gauge = new Gauge("queue.depth");
+      const encode = vi.spyOn(CustomMetricsEncoder, "encode");
+
+      for (let hit = 0; hit < 100; hit++) {
+        counter.increment({ route: `/r/${hit % 10}` });
+        buffer.upsertCustomMetric(counter);
+        gauge.setValue(hit);
+        buffer.upsertCustomMetric(gauge);
+      }
+      expect(encode).not.toHaveBeenCalled();
+      expect(buffer.isBufferEmpty()).toBe(false);
+
+      buffer.encodeAndWrite();
+      expect(encode).toHaveBeenCalledTimes(2);
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toHaveLength(2);
+      expect(batch.custom.find((metric) => metric.n === "queue.depth")).toEqual(
+        expect.objectContaining({ v: { default: 99 } }),
+      );
+    });
+
+    it("writes the batch without a metric that cannot be encoded", () => {
+      const warn = vi
+        .spyOn(Logger.prototype, "warn")
+        .mockImplementation(() => undefined);
+      const buffer = createBuffer();
+      buffer.insertRequestSnapshot({
+        traceId: "bystander",
+        protocol: "http",
+        operationId: "/orders",
+        attributes: { method: "GET", statusCode: 200 },
+        duration: 1,
+        traces: [],
+      });
+      // A label name nothing checked at run time - `labels: [7]` - throws as
+      // the encoder cuts the labels. Encoded at the write, it threw there,
+      // and took every other entry of the window with it.
+      const encode = CustomMetricsEncoder.encode.bind(CustomMetricsEncoder);
+      vi.spyOn(CustomMetricsEncoder, "encode").mockImplementation((metric) => {
+        if (metric.name === "orders.broken") {
+          throw new TypeError("label.slice is not a function");
+        }
+        return encode(metric);
+      });
+      const broken = new Counter("orders.broken");
+      broken.increment();
+      buffer.upsertCustomMetric(broken);
+      const named = new Counter("orders.placed");
+      named.increment();
+      buffer.upsertCustomMetric(named);
+
+      expect(() => buffer.encodeAndWrite()).not.toThrow();
+
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as {
+        snapshots: Array<{ ti: string }>;
+        custom: EncodedCustomMetric[];
+      };
+      expect(batch.snapshots.map((snapshot) => snapshot.ti)).toEqual([
+        "bystander",
+      ]);
+      expect(batch.custom.map((metric) => metric.n)).toEqual(["orders.placed"]);
+      expect(warn).toHaveBeenCalledOnce();
+    });
+
+    it("encodes nothing of a batch that is dropped unwritten", () => {
+      const buffer = createBuffer();
+      const counter = new Counter("orders.placed");
+      const encode = vi.spyOn(CustomMetricsEncoder, "encode");
+
+      counter.increment();
+      buffer.upsertCustomMetric(counter);
+      // What a flush does when the agent sends nothing.
+      buffer.resetMainThreadBuffer();
+      buffer.encodeAndWrite();
+
+      expect(encode).not.toHaveBeenCalled();
     });
 
     it("encodes a summary once per batch rather than on every observation", () => {
