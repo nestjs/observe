@@ -258,20 +258,44 @@ describe("HttpObserveAgentService", () => {
       }) as { run(callback: () => Promise<void>): Promise<void> };
       const run = (name: string, callback: () => Promise<void>) =>
         new Promise<void>((resolve, reject) => {
-          agent.startHttpRequestTracing(
-            { url: `/${name}`, method: "GET", protocol: "http" },
-            {},
-            () => {
-              tracer.setOperationId(name);
-              handler
-                .run(callback)
-                .finally(() => {
-                  agent.endHttpRequestTracing({}, { statusCode: 200 });
-                })
-                .then(resolve, reject);
-            },
+          // One object to both hooks, as every adapter hands them.
+          const req = { url: `/${name}`, method: "GET", protocol: "http" };
+          agent.startHttpRequestTracing(req, {}, () => {
+            tracer.setOperationId(name);
+            handler
+              .run(callback)
+              .finally(() => {
+                agent.endHttpRequestTracing(req, { statusCode: 200 });
+              })
+              .then(resolve, reject);
+          });
+        });
+      /**
+       * Starts a request whose handler has run, and hands back its response
+       * hook, to be called wherever the test likes.
+       */
+      const startAnswered = (name: string) => {
+        const req = { url: `/${name}`, method: "GET", protocol: "http" };
+        agent.startHttpRequestTracing(req, {}, () => {
+          tracer.setOperationId(name);
+          const registryKey = als.getStore()!.get(TRACE_REGISTRY_KEY);
+          const spanId = registry.internalStartTraceStep(
+            registryKey,
+            "OrdersController",
+            name,
+            undefined,
+          );
+          registry.internalEndTraceStep(
+            registryKey,
+            spanId,
+            "OrdersController",
+            name,
+            spanId,
           );
         });
+        return (statusCode: number) =>
+          agent.endHttpRequestTracing(req, { statusCode });
+      };
       return {
         als,
         registry,
@@ -281,6 +305,7 @@ describe("HttpObserveAgentService", () => {
         options,
         getUserId,
         run,
+        startAnswered,
       };
     }
 
@@ -435,6 +460,42 @@ describe("HttpObserveAgentService", () => {
       expect([...keys].every((key) => !context.registry.hasTrace(key))).toBe(
         true,
       );
+    });
+
+    it("completes the request its response hook is handed, wherever that runs", async () => {
+      // The adapters run the hook from `finish`, in the async context of
+      // whatever ended the response: a pipelined request's is emitted from
+      // the earlier one's, a stream's from its source's.
+      const context = createContext();
+      const endWaiter = context.startAnswered("waiter");
+      const endPublisher = context.startAnswered("publisher");
+
+      // The waiter's response is ended from no context at all...
+      context.als.exit(() => endWaiter(200));
+      await waitFor(
+        () => context.snapshots.length === 1,
+        1000,
+        "the waiter's snapshot",
+      );
+      // ...and the publisher's from a context that is not its own.
+      context.als.run(new Map([[TRACE_REGISTRY_KEY, "elsewhere"]]), () =>
+        endPublisher(201),
+      );
+      await waitFor(
+        () => context.snapshots.length === 2,
+        1000,
+        "the publisher's snapshot",
+      );
+
+      expect(
+        context.snapshots.map((snapshot) => [
+          snapshot.operationId,
+          snapshot.attributes?.statusCode,
+        ]),
+      ).toEqual([
+        ["waiter", 200],
+        ["publisher", 201],
+      ]);
     });
 
     it("holds completion while a span of its own is still open", async () => {

@@ -10,7 +10,7 @@ import {
 } from "@nestjs/microservices";
 import { credentials, loadPackageDefinition } from "@grpc/grpc-js";
 import { loadSync } from "@grpc/proto-loader";
-import { firstValueFrom } from "rxjs";
+import { firstValueFrom, Subject, take } from "rxjs";
 import { createObserveModule } from "../observe.module.js";
 import { TracerService } from "../services/tracer.service.js";
 import {
@@ -39,6 +39,9 @@ interface Execution {
 
 const executions = new Map<string, Execution>();
 
+/** Fed by the test itself, outside every operation's async context. */
+const feed = new Subject<{ id: string; name: string }>();
+
 @Controller()
 class OrdersController {
   constructor(private readonly tracer: TracerService) {}
@@ -61,6 +64,16 @@ class OrdersController {
   @GrpcMethod("Orders", "Ping")
   ping(data: { id: string }) {
     return this.run(data);
+  }
+
+  @MessagePattern("orders.fed")
+  fedMessage() {
+    return feed.pipe(take(1));
+  }
+
+  @GrpcMethod("Orders", "Decline")
+  fedCall() {
+    return feed.pipe(take(1));
   }
 
   private async run(data: { id: string }) {
@@ -86,6 +99,7 @@ describe.each([
   let app: INestMicroservice;
   let collected: CollectedSnapshots;
   let invoke: (id: string) => Promise<{ id: string; name: string }>;
+  let invokeFed: () => Promise<{ id: string; name: string }>;
   let closeClient: () => void;
 
   beforeAll(async () => {
@@ -127,6 +141,7 @@ describe.each([
       });
       await client.connect();
       invoke = (id) => firstValueFrom(client.send(`orders.${id}`, { id }));
+      invokeFed = () => firstValueFrom(client.send("orders.fed", {}));
       closeClient = () => client.close();
     } else {
       const definition = loadSync(protoPath, { defaults: true });
@@ -139,6 +154,14 @@ describe.each([
         new Promise((resolve, reject) => {
           client[id === "first" ? "FindOne" : "Ping"](
             { id },
+            (error: unknown, response: { id: string; name: string }) =>
+              error ? reject(error) : resolve(response),
+          );
+        });
+      invokeFed = () =>
+        new Promise((resolve, reject) => {
+          client.Decline(
+            { id: "fed" },
             (error: unknown, response: { id: string; name: string }) =>
               error ? reject(error) : resolve(response),
           );
@@ -217,4 +240,17 @@ describe.each([
       }
     },
   );
+  it("completes an operation whose reply is sent outside its context", async () => {
+    // Nest runs the end hook from the teardown of the handler's reply
+    // stream, so in the async context of whatever ended that stream - here
+    // none at all. Read from the store there, the operation was never
+    // completed, and its trace stayed in the registry unreported.
+    const reply = invokeFed();
+    await waitFor(() => feed.observed, 3000, "the handler to subscribe");
+    feed.next({ id: "fed", name: "fed" });
+
+    await expect(reply).resolves.toEqual({ id: "fed", name: "fed" });
+    await waitForSnapshot(collected, () => true);
+    expect(collected.items).toHaveLength(1);
+  });
 });

@@ -61,6 +61,17 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
   private httpAdapterInitSubscription: Subscription | undefined;
 
   /**
+   * The registry key each request was started under, by the request object -
+   * which every adapter hands to both of its hooks. The response hook cannot
+   * ask the async store: it runs from `finish`, in the async context of
+   * whatever ended the response, and that need not be the request's own. A
+   * request pipelined behind another has its `finish` emitted from the
+   * earlier one's; a stream piped into the response ends it where its source
+   * emits - for a pooled database connection, in the request that opened it.
+   */
+  private readonly registryKeys = new WeakMap<object, string>();
+
+  /**
    * `http.queryParamsObfuscateRegex`, rebuilt with the global flag when it was
    * supplied without one. It is applied with `replaceAll`, which throws on a
    * non-global RegExp - inside the request hook, so every traced request would
@@ -182,6 +193,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // lookups stay off a recorded request sharing its id.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
+      this.registryKeys.set(req, registryKey);
 
       // With OpenTelemetry interop on, read whatever produced the trace id: a
       // `traceIdGenerator` of the application's own decides what Observe
@@ -254,15 +266,16 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
   }
 
   endHttpRequestTracing(req: unknown, res: { statusCode: number }): void {
-    const store = this.asyncLocalStorage.getStore();
-    if (!store) {
-      return;
-    }
-    // Only this execution's own key: a stale store left by a finished request
-    // must not complete a later one that reuses its id.
-    const registryKey = store.get(TRACE_REGISTRY_KEY);
+    // This request's own key, never the one in the async store: the store
+    // here is that of whatever ended the response, a finished request's or
+    // another one still running, and neither may be completed in this one's
+    // place, nor leave this one open.
+    const registryKey =
+      typeof req === "object" && req !== null
+        ? this.registryKeys.get(req)
+        : undefined;
     if (
-      typeof registryKey !== "string" ||
+      registryKey === undefined ||
       !this.operationTraceRegistry.hasTrace(registryKey)
     ) {
       return;

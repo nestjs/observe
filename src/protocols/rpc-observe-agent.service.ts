@@ -70,6 +70,16 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
    */
   private microservices: Microservices | undefined;
 
+  /**
+   * The registry key each operation was started under, by the context Nest
+   * hands its end hook. That hook cannot ask the async store: Nest runs it
+   * from the teardown of the handler's reply stream, in the async context of
+   * whatever ended the stream - a TCP socket's `close`, a gRPC cancellation,
+   * a subject another message's handler emitted into. As
+   * `HttpObserveAgentService` keeps its keys by request.
+   */
+  private readonly registryKeys = new WeakMap<object, string>();
+
   constructor(
     private readonly asyncLocalStorage: AsyncLocalStorage<
       Map<KeyOf<Store>, any>
@@ -193,6 +203,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       // execution before option callbacks can reach another operation's trace.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
+      this.rememberRegistryKey(ctx, registryKey);
 
       // With OpenTelemetry interop on, the handler runs in the W3C trace
       // context the message was sent in, for an OpenTelemetry SDK in this
@@ -285,6 +296,10 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       // The key must precede callbacks here too.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
+      // Nest ends a gRPC call with its request message rather than the
+      // context it started it with, so the key is kept by both.
+      this.rememberRegistryKey(call, registryKey);
+      this.rememberRegistryKey(call?.request, registryKey);
 
       // As for a message: the call's span goes under the caller's for `otlp`,
       // and the calls the handler makes carry its decision on. Read now, while
@@ -349,11 +364,15 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     transportId: Transport | symbol,
     ctx: BaseRpcContext | GrpcCall,
   ): void {
-    const store = this.asyncLocalStorage.getStore();
-    if (!store) {
-      return;
-    }
-    const registryKey = store.get(TRACE_REGISTRY_KEY);
+    // The key this context was started under, wherever its reply stream
+    // ended. The store answers only for a context no key could be kept by:
+    // a gRPC call with no request message of its own, as a client stream has
+    // none.
+    const registryKey =
+      (typeof ctx === "object" && ctx !== null
+        ? this.registryKeys.get(ctx)
+        : undefined) ??
+      this.asyncLocalStorage.getStore()?.get(TRACE_REGISTRY_KEY);
     if (
       typeof registryKey !== "string" ||
       !this.operationTraceRegistry.hasTrace(registryKey)
@@ -398,6 +417,17 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       isGrpc ? "grpc" : "rpc",
       () => this.operationTraceRegistry.hasOpenSpans(registryKey),
     );
+  }
+
+  /**
+   * Keeps `registryKey` for the end hook to find by `ctx`. A custom
+   * transporter delivers a context of its own making, and a gRPC call need not
+   * carry a request message: what cannot key a `WeakMap` is left to the store.
+   */
+  private rememberRegistryKey(ctx: unknown, registryKey: string): void {
+    if (typeof ctx === "object" && ctx !== null) {
+      this.registryKeys.set(ctx, registryKey);
+    }
   }
 
   private getOperationIdFromContext(ctx: BaseRpcContext): string {

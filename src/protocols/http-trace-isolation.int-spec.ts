@@ -1,4 +1,5 @@
 import { AsyncResource } from "node:async_hooks";
+import { connect } from "node:net";
 import { Controller, Get, INestApplication, Module } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
@@ -54,6 +55,11 @@ class OrdersController {
   @Get("second")
   second() {
     return this.run("second");
+  }
+
+  @Get("quick")
+  quick() {
+    return { ok: true };
   }
 
   @Get("leaves-callback")
@@ -208,6 +214,42 @@ describe.each<Platform>(onPlatforms(["express", "node", "fastify"]))(
         }
       },
     );
+
+    it("completes every request pipelined on one connection", async () => {
+      // Node writes a pipelined response, and emits its `finish`, from the
+      // earlier response's own: in the first request's async context. Read
+      // from the store there, every request behind the first found an
+      // already completed trace, and stayed in the registry unreported.
+      const { port } = app.getHttpServer().address() as { port: number };
+      const ids = ["pipelined-1", "pipelined-2", "pipelined-3"];
+      const socket = connect(port, "127.0.0.1");
+      let answered = "";
+      socket.on("data", (chunk: Buffer) => (answered += chunk.toString()));
+      try {
+        socket.write(
+          ids
+            .map(
+              (id) =>
+                `GET /quick HTTP/1.1\r\nHost: localhost\r\nx-request-id: ${id}\r\n\r\n`,
+            )
+            .join(""),
+        );
+        await waitFor(
+          () => (answered.match(/HTTP\/1\.1 200/g) ?? []).length === 3,
+          3000,
+          "three answers",
+        );
+        await waitFor(
+          () => collected.items.length === 3,
+          3000,
+          "a snapshot for every pipelined request",
+        );
+      } finally {
+        socket.destroy();
+      }
+
+      expect(collected.items.map((item) => item.traceId).sort()).toEqual(ids);
+    });
 
     it("does not let a finished request rename a later one with the same id", async () => {
       await get("/leaves-callback").expect(200);
