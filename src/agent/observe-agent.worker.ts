@@ -225,10 +225,12 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
 
     this.lastRuntimeSampleAt = Date.now();
     this.runtimeMetricsInterval = setInterval(() => {
-      this.lastRuntimeSampleAt = Date.now();
-      this.observeAgentSharedBuffer.addNodeRuntimeMetrics(
-        this.nodeRuntimeMetricsService.collectNodeRuntimeMetrics(),
-      );
+      // Moved on only by a sample that was taken: one that could not be
+      // leaves its window open, and the next sample - or the final one -
+      // covers it.
+      if (this.addRuntimeMetrics()) {
+        this.lastRuntimeSampleAt = Date.now();
+      }
     }, interval);
 
     if (this.options.debug) {
@@ -492,7 +494,7 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
             // window since the previous one, so taking this earlier could
             // replace an unsent sample and lose its window.
             sampleRuntimeMetrics = false;
-            this.addFinalRuntimeMetrics();
+            this.addRuntimeMetrics();
             continue;
           }
         }
@@ -533,24 +535,32 @@ export class ObserveAgentWorker implements OnModuleInit, OnApplicationShutdown {
     if (this.observeAgentSharedBuffer.hasRuntimeMetrics()) {
       return true;
     }
-    this.addFinalRuntimeMetrics();
+    this.addRuntimeMetrics();
     return false;
   }
 
   /**
-   * The runtime-metrics window between the last scheduled sample and now.
+   * The runtime-metrics window between the last sample and now - scheduled
+   * or final - and whether it was taken.
+   *
+   * Never throws. Sampling reads `/proc` and the like, and fails when the
+   * process has no file descriptor to spare (`EMFILE`), which a flood of idle
+   * connections can arrange: out of a timer, that would be an uncaught
+   * exception in the host, and the end of it.
    */
-  private addFinalRuntimeMetrics() {
+  private addRuntimeMetrics(): boolean {
     try {
       this.observeAgentSharedBuffer.addNodeRuntimeMetrics(
         this.nodeRuntimeMetricsService.collectNodeRuntimeMetrics(),
       );
+      return true;
     } catch (error) {
       if (this.options.debug) {
         this.logger.debug(
-          `Could not collect final runtime metrics: ${String(error)}`,
+          `Could not collect runtime metrics: ${String(error)}`,
         );
       }
+      return false;
     }
   }
 
