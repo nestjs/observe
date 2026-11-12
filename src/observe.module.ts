@@ -14,6 +14,7 @@ import {
   ModulesContainer,
 } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
+import { isObservable, Observable } from "rxjs";
 import { ObserveAgentSharedBuffer } from "./agent/observe-agent.shared-buffer.js";
 import { ObserveAgentWorker } from "./agent/observe-agent.worker.js";
 import { ObjectivesRegistry } from "./objectives/objectives.registry.js";
@@ -476,6 +477,7 @@ export function createObserveModule<Store extends Record<string, unknown>>(
           },
         );
         return (instance: unknown) => {
+          deliverRepliesToTheirCaller(instance, asyncLocalStorage);
           propagateTraceIdThrough(
             instance,
             () =>
@@ -550,6 +552,100 @@ function propagateTraceIdThrough(
         packet.metadata = { ...packet.metadata, traceparent };
       }
     }
+  });
+}
+
+/**
+ * Makes what a microservice client's call emits arrive in the async context
+ * of the caller that subscribed to it.
+ *
+ * A client's replies come from events of its connection, and Node runs those
+ * in the async context the connection was opened in: a `ClientProxy`
+ * connects on first use, in the request that used it first, and grpc-js
+ * starts the calls made while its channel connects from the first one's
+ * attempt. Whatever a later caller chained onto its reply - a log line, a
+ * span, the next call's packet - read that request's store, and carried its
+ * trace id, for as long as the connection lived.
+ *
+ * Only what the client hands out is wrapped: the `Observable` of
+ * `ClientProxy#send`, and of each method a `ClientGrpc#getService` service
+ * has. Matched by shape, as the optional peer is never imported here; an
+ * instance that cannot be inspected or written to is left as it is.
+ */
+function deliverRepliesToTheirCaller(
+  instance: unknown,
+  asyncLocalStorage: AsyncLocalStorage<unknown>,
+): void {
+  const client = instance as {
+    send?: (...args: unknown[]) => unknown;
+    emit?: unknown;
+    connect?: unknown;
+    close?: unknown;
+    dispatchEvent?: unknown;
+    getService?: (...args: unknown[]) => unknown;
+    getClientByServiceName?: unknown;
+  };
+  const inCaller = (replies: unknown) =>
+    isObservable(replies)
+      ? inSubscriberContext(replies, asyncLocalStorage)
+      : replies;
+  try {
+    const { send, getService } = client ?? {};
+    if (
+      typeof getService === "function" &&
+      typeof client.getClientByServiceName === "function"
+    ) {
+      client.getService = function (this: unknown, ...args: unknown[]) {
+        const service = getService.apply(this, args);
+        if (typeof service === "object" && service !== null) {
+          const methods = service as Record<string, unknown>;
+          for (const name of Object.keys(methods)) {
+            const method = methods[name];
+            if (typeof method === "function") {
+              methods[name] = function (this: unknown, ...callArgs: unknown[]) {
+                return inCaller(method.apply(this, callArgs));
+              };
+            }
+          }
+        }
+        return service;
+      };
+    } else if (
+      typeof send === "function" &&
+      typeof client.emit === "function" &&
+      typeof client.connect === "function" &&
+      typeof client.close === "function" &&
+      typeof client.dispatchEvent === "function"
+    ) {
+      client.send = function (this: unknown, ...args: unknown[]) {
+        return inCaller(send.apply(this, args));
+      };
+    }
+  } catch {
+    // A provider that throws on inspection, or cannot be written to, is not
+    // a client this can help - the decorator's own exclusions deal with it.
+  }
+}
+
+/**
+ * `source`, with each value, error and completion delivered in the store the
+ * subscriber subscribed in. The store is re-entered rather than every async
+ * context with it: the agent's own is what its trace id is read from, and a
+ * reply whose context is already that store pays nothing more.
+ */
+function inSubscriberContext<T>(
+  source: Observable<T>,
+  asyncLocalStorage: AsyncLocalStorage<unknown>,
+): Observable<T> {
+  return new Observable<T>((subscriber) => {
+    const store = asyncLocalStorage.getStore();
+    return source.subscribe({
+      next: (value) =>
+        asyncLocalStorage.run(store, () => subscriber.next(value)),
+      error: (error: unknown) =>
+        asyncLocalStorage.run(store, () => subscriber.error(error)),
+      complete: () => asyncLocalStorage.run(store, () => subscriber.complete()),
+    });
   });
 }
 

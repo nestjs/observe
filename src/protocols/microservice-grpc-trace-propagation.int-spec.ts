@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { join } from "node:path";
 import {
   Controller,
@@ -17,7 +18,7 @@ import {
   Transport,
 } from "@nestjs/microservices";
 import { Metadata } from "@grpc/grpc-js";
-import { firstValueFrom, Observable } from "rxjs";
+import { firstValueFrom, map, Observable } from "rxjs";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
 import {
@@ -99,6 +100,18 @@ class ApiController implements OnModuleInit {
   }
 }
 
+/** A client with a channel of its own, nothing else connects. */
+@Controller()
+class IdleChannelController implements OnModuleInit {
+  orders!: OrdersService;
+
+  constructor(@Inject("ORDERS_IDLE") private readonly client: ClientGrpc) {}
+
+  onModuleInit() {
+    this.orders = this.client.getService<OrdersService>("Orders");
+  }
+}
+
 @Module({
   imports: [
     api.ObserveModule.forRoot(testObserveOptions()),
@@ -112,9 +125,21 @@ class ApiController implements OnModuleInit {
           url: GRPC_URL,
         },
       },
+      {
+        name: "ORDERS_IDLE",
+        transport: Transport.GRPC,
+        options: {
+          package: "orderstest",
+          protoPath: PROTO_PATH,
+          url: GRPC_URL,
+          // Not the process-wide pool, where the other client's connection
+          // would be found ready.
+          channelOptions: { "grpc.use_local_subchannel_pool": 1 },
+        },
+      },
     ]),
   ],
-  controllers: [ApiController],
+  controllers: [ApiController, IdleChannelController],
 })
 class ApiModule {}
 
@@ -156,6 +181,30 @@ describe("ObserveModule: a trace from HTTP into a gRPC service", () => {
   beforeEach(() => {
     apiSnapshots.clear();
     ordersSnapshots.clear();
+  });
+
+  it("delivers each reply in the context of the call that asked for it, while the channel connects", async () => {
+    // grpc-js parks the calls made before its channel is ready, then starts
+    // all of them from the callback that continues the first one's
+    // connection attempt: every reply came back in the first caller's
+    // context, and what the others chained onto it ran under its trace id.
+    const als =
+      apiApp.get<AsyncLocalStorage<Map<string, unknown>>>(AsyncLocalStorage);
+    const { orders: idle } = apiApp.get(IdleChannelController);
+
+    const seen = await Promise.all(
+      ["first", "second", "third"].map((caller) =>
+        als.run(new Map([["caller", caller]]), () =>
+          firstValueFrom(
+            idle
+              .findOne({ id: caller })
+              .pipe(map(() => als.getStore()?.get("caller"))),
+          ),
+        ),
+      ),
+    );
+
+    expect(seen).toEqual(["first", "second", "third"]);
   });
 
   const isFindOne = (item: { operationId?: unknown }) =>

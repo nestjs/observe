@@ -16,10 +16,11 @@ import {
   Payload,
   Transport,
 } from "@nestjs/microservices";
-import { firstValueFrom } from "rxjs";
+import { firstValueFrom, map, switchMap } from "rxjs";
 import request from "supertest";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createObserveModule } from "../observe.module.js";
+import { TracerService } from "../services/tracer.service.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -84,6 +85,30 @@ class ApiController {
   }
 }
 
+/**
+ * Chains a second call onto the first one's reply, on a client nothing else
+ * uses - so the request that opens its connection is known.
+ */
+@Controller()
+class ChainedController {
+  constructor(
+    @Inject("MATH_CHAINED") private readonly client: ClientProxy,
+    private readonly tracer: TracerService,
+  ) {}
+
+  @Get("chained")
+  chained() {
+    return this.client.send<number>("sum", [1, 2]).pipe(
+      map(() => this.tracer.currentTraceId()),
+      switchMap((seen) =>
+        this.client
+          .send<number>("sum", [3, 4])
+          .pipe(map((total) => ({ seen, total }))),
+      ),
+    );
+  }
+}
+
 @Module({
   imports: [
     api.ObserveModule.forRoot(testObserveOptions()),
@@ -93,9 +118,14 @@ class ApiController {
         transport: Transport.TCP,
         options: { host: "127.0.0.1", port: TCP_PORT },
       },
+      {
+        name: "MATH_CHAINED",
+        transport: Transport.TCP,
+        options: { host: "127.0.0.1", port: TCP_PORT },
+      },
     ]),
   ],
-  controllers: [ApiController],
+  controllers: [ApiController, ChainedController],
 })
 class ApiModule {}
 
@@ -193,6 +223,37 @@ describe("ObserveModule: a trace from HTTP into a microservice", () => {
       );
       expect(rpc.traceId).toMatch(UUID);
       expect(rpc.traceId).not.toBe("rpc-hop-trace-2");
+    },
+  );
+
+  it.runIf(frameworkCarriesMetadata)(
+    "carries on from a reply under the trace of the call that asked for it",
+    async () => {
+      // A client connects on first use, in the request that uses it first,
+      // and Node delivers every reply from that connection in that request's
+      // async context: what a later caller chained onto its own reply ran,
+      // and sent its next packet, under the first request's trace id.
+      await request(apiApp.getHttpServer())
+        .get("/chained")
+        .set("x-request-id", "opens-the-connection")
+        .expect(200);
+      const response = await request(apiApp.getHttpServer())
+        .get("/chained")
+        .set("x-request-id", "chains-a-call")
+        .expect(200);
+
+      expect(response.body).toEqual({ seen: "chains-a-call", total: 7 });
+      await waitForSnapshot(
+        mathSnapshots,
+        () =>
+          mathSnapshots.items.filter((item) => item.operationId === "sum")
+            .length === 4,
+      );
+      expect(
+        mathSnapshots.items
+          .filter((item) => item.traceId === "chains-a-call")
+          .map((item) => item.operationId),
+      ).toEqual(["sum", "sum"]);
     },
   );
 
