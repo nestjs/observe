@@ -1154,6 +1154,36 @@ describe("OperationTraceRegistry", () => {
       expect(JSON.stringify(snapshot.traces)).not.toContain("render page");
     });
 
+    it("runs a root span past the limit without recording it", async () => {
+      quietWarnings();
+      const labels = { className: "kafka", methodKey: "orders.created" };
+      registry.startTrace("cap-job", {
+        id: "run-1",
+        traceId: "cap-job",
+        queueName: "kafka",
+        name: "orders.created",
+        traces: [],
+      });
+      await registry.createRootSpan("cap-job", labels, "first", () => {
+        const callerId = als.getStore()?.get(CALLER_METADATA_KEY) as string;
+        openAndClose("cap-job", callerId, 9_999);
+      });
+
+      const result = await registry.createRootSpan(
+        "cap-job",
+        labels,
+        "second",
+        () => "handled",
+      );
+      registry.endTrace("cap-job", { status: "completed" });
+      const snapshot = await registry.pluckSnapshot("cap-job");
+
+      expect(result).toBe("handled");
+      expect(registry.hasOpenSpans("cap-job")).toBe(false);
+      expect(snapshot!.tags).toEqual({ [UNRECORDED_SPANS_TAG]: 1 });
+      expect(snapshot!.traces.map((node) => node.name)).toEqual(["first"]);
+    });
+
     it("counts each operation against the limit on its own", async () => {
       quietWarnings();
       startRequest("cap-3");
