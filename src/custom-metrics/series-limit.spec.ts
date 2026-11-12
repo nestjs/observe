@@ -203,3 +203,93 @@ describe("series key length", () => {
     expect(Object.keys(gauge.value)).toEqual(["default"]);
   });
 });
+
+/**
+ * A label value is a string or a number, but a handler that passes a field of
+ * a JSON body on unchecked can hand a metric anything JSON parses to. An array
+ * nested a few thousand levels deep overflowed the stack where the series key
+ * was made, and a bigint threw there too, out of the metric call and into the
+ * request being measured.
+ */
+describe("label values no series can be keyed by", () => {
+  let warn: MockInstance;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  const deeplyNested = () => {
+    let nested: unknown = [];
+    for (let i = 0; i < 20_000; i++) {
+      nested = [nested];
+    }
+    return nested;
+  };
+  const unusable = (): unknown[] => [deeplyNested(), { toString: 1 }, 10n];
+  const asLabel = (value: unknown) => ({ catalog: value as string });
+
+  it("are ignored by a counter rather than thrown", () => {
+    const counter = new Counter<"catalog">("searches", "d", ["catalog"]);
+
+    for (const value of unusable()) {
+      expect(() => counter.increment(asLabel(value))).not.toThrow();
+    }
+    counter.increment({ catalog: "books" });
+
+    expect(Object.keys(counter.value)).toEqual(['{"catalog":"books"}']);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('"searches"');
+  });
+
+  it("are ignored by a gauge in every operation", () => {
+    const gauge = new Gauge<"catalog">("open", { labels: ["catalog"] });
+
+    for (const value of unusable()) {
+      expect(() => gauge.increment(asLabel(value))).not.toThrow();
+      expect(() => gauge.decrement(asLabel(value))).not.toThrow();
+      expect(() => gauge.setValue(asLabel(value), 3)).not.toThrow();
+    }
+
+    expect(gauge.value).toEqual({ default: 0 });
+  });
+
+  it("are ignored in place of the value on a metric without labels", () => {
+    const counter = new Counter("orders");
+
+    // Taken for a label set, as any object is.
+    expect(() => counter.increment(deeplyNested() as number)).not.toThrow();
+
+    expect(counter.value).toEqual({ default: 0 });
+  });
+
+  it("are ignored as a summary's own label", () => {
+    const summary = new Summary<string>("search_ms");
+
+    for (const value of unusable()) {
+      expect(() => summary.observe(1, value as string)).not.toThrow();
+    }
+    summary.observe(1, "books");
+
+    expect(summary.observations).toEqual({ books: 1 });
+  });
+
+  it("still key strings, numbers, booleans and nulls as before", () => {
+    const counter = new Counter<"a" | "b" | "c" | "d">("mixed", "d", [
+      "a",
+      "b",
+      "c",
+      "d",
+    ]);
+
+    counter.increment({ a: "x", b: 1, c: true as never, d: null as never });
+
+    expect(Object.keys(counter.value)).toEqual([
+      '{"a":"x","b":1,"c":true,"d":null}',
+    ]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+});

@@ -1,7 +1,7 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
 import { admitsSeries, stringifyLabel } from "./counter.js";
 import { admitsFinite, admitsReading } from "./finite-value.util.js";
-import { isLabelSet } from "./label-values.util.js";
+import { admitsLabelValues, isLabelSet } from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -25,6 +25,9 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
 
   /** Whether a non-finite value has already been reported, likewise. */
   private readonly nonFinite = { warned: false };
+
+  /** Whether a label value no key can be made from has been reported. */
+  private readonly labelValues = { warned: false };
 
   /**
    * The name of the gauge.
@@ -214,6 +217,9 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
 
     if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
+      }
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const incrementValue = value ?? 1;
@@ -280,6 +286,9 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
       );
     } else if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
+      }
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const decrementValue = value ?? 1;
@@ -339,6 +348,9 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
       );
     } else if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
+      if (!admitsLabelValues(this.name, labelOrValue, this.labelValues)) {
+        return;
+      }
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
       const newValue = value ?? this._initialValue;

@@ -35,10 +35,15 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
   private readonly nonFinite = { warned: false };
 
   /**
-   * Whether a label past the cap, or one too long, has been reported: once
-   * per metric, though the cap is reached again in every window it fills.
+   * Whether a label past the cap, one too long, or one that is not a string
+   * has been reported: once per metric, though the cap is reached again in
+   * every window it fills.
    */
-  private readonly labelLimit = { capWarned: false, longWarned: false };
+  private readonly labelLimit = {
+    capWarned: false,
+    longWarned: false,
+    typeWarned: false,
+  };
 
   /** How many labels the current window holds. */
   private _windowLabels = 0;
@@ -223,7 +228,7 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
     }
 
     const key = label ?? DEFAULT_LABEL;
-    if (!this.labels && !(key in this._count) && !this.admitsLabel(key)) {
+    if (!this.labels && !this.admitsLabel(key)) {
       return;
     }
     // Before anything is updated, so the count, maximum and sample keep
@@ -263,17 +268,32 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
   }
 
   /**
-   * Whether a summary that declared no labels may open `label` in this
-   * window: one within the cap and short enough for the collector, as a
-   * counter's series is.
+   * Whether a summary that declared no labels may record under `label`: one
+   * this window already holds, or a new one within the cap and short enough
+   * for the collector, as a counter's series is.
    *
    * Without it the labels were bounded by nothing but the next flush written,
    * which an agent that sends nothing - switched off, or without credentials -
    * never does: a label taken from a request, a search term say, stayed for
-   * the life of the process, at whatever length the request allowed. Refuses
-   * rather than throws, for the reason `admitsSeries` gives.
+   * the life of the process, at whatever length the request allowed. Nor is
+   * a label from a request certain to be a string, and an object or an array
+   * that cannot be made one - `{"toString": 1}`, an array nested a few
+   * thousand levels deep - threw where it was used as a key. Refuses rather
+   * than throws, for the reason `admitsSeries` gives.
    */
   private admitsLabel(label: string): boolean {
+    if (typeof label !== "string") {
+      if (!this.labelLimit.typeWarned) {
+        this.labelLimit.typeWarned = true;
+        console.warn(
+          `[observe] Metric "${this.name}" ignored a label of type ${typeof label}; a summary's labels are strings.`,
+        );
+      }
+      return false;
+    }
+    if (label in this._count) {
+      return true;
+    }
     if (label.length > MAX_SERIES_KEY_LENGTH) {
       if (!this.labelLimit.longWarned) {
         this.labelLimit.longWarned = true;
