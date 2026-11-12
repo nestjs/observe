@@ -86,6 +86,31 @@ describe("LogRedactor", () => {
       ).toBe('password=[REDACTED] user="bob attempt=3');
     });
 
+    it("masks a quoted value through a closing quote on a later line", () => {
+      for (const [message, expected] of [
+        ['secret="aGVsbG8gd29y\nd29ybGQ=" sent', "secret=[REDACTED] sent"],
+        ["password='line one\nline two' kept", "password=[REDACTED] kept"],
+        [
+          'config {"apiKey": "abc\ndef", "user": "bob"}',
+          'config {"apiKey": [REDACTED], "user": "bob"}',
+        ],
+      ]) {
+        expect(redactor.redactMessage(message), message).toBe(expected);
+      }
+    });
+
+    it("ends a quoted value that is never closed at its own line", () => {
+      expect(redactor.redactMessage("password='hunter2\nnext entry ok")).toBe(
+        "password=[REDACTED]\nnext entry ok",
+      );
+    });
+
+    it("keeps a quoted string in source to its line", () => {
+      expect(
+        redactor.redactSource(['const password = "hunter2', 'user = "bob";']),
+      ).toEqual(["const password = [REDACTED]", 'user = "bob";']);
+    });
+
     it("masks every cookie of a Cookie header", () => {
       expect(
         redactor.redactMessage(
@@ -189,6 +214,11 @@ describe("LogRedactor", () => {
     it.each([
       ["unclosed brackets", "password=[".repeat(30_000)],
       ["unclosed quotes", 'password="'.repeat(30_000)],
+      ["quotes open across lines", 'password="x\n'.repeat(30_000)],
+      [
+        "quotes of every kind left open",
+        "password='a\ntoken=\"b\nsecret=`c\n" + "password: d\n".repeat(30_000),
+      ],
       ["escaped quotes", String.raw`\"password\":\"`.repeat(20_000)],
       ["empty values", "password: ".repeat(30_000)],
       ["keys only", "password".repeat(30_000)],

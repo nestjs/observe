@@ -363,25 +363,40 @@ function skipBlanks(text: string, at: number): number {
 }
 
 /**
- * A quoted value through its closing quote, past the quotes it escapes. One
- * that is not closed on its line - a message cut short - runs to the end of
- * the line (a template literal in source, to the end of the text): what it
- * held is masked rather than the head of it kept.
+ * A quoted value through its closing quote, past the quotes it escapes.
+ *
+ * In a message the value runs on through line breaks to its closing quote:
+ * a multi-line secret, or a key the forwarder joined with its continuation
+ * lines, is masked whole rather than its first line only. One never closed -
+ * a message cut short - runs to the end of the line it started on, so what it
+ * held is masked rather than the head of it kept, and the rest of the text is
+ * not. In source only a template literal spans lines, and one never closed
+ * runs to the end of the text.
+ *
+ * Linear over a whole text: a scan that finds no closing quote proves there is
+ * no later quote of its kind, so no later value opening with one can scan
+ * again - at most one fruitless scan per kind of quote.
  */
 function readQuoted(text: string, at: number, inSource = false): number {
   const quote = text[at];
-  const spansLines = inSource && quote === "`";
+  const spansLines = !inSource || quote === "`";
+  let lineEnd = -1;
   for (let i = at + 1; i < text.length; i++) {
     const char = text[i];
     if (char === "\\") {
       i++;
     } else if (char === quote) {
       return i + 1;
-    } else if (char === "\n" && !spansLines) {
-      return i;
+    } else if (char === "\n") {
+      if (!spansLines) {
+        return i;
+      }
+      if (lineEnd === -1) {
+        lineEnd = i;
+      }
     }
   }
-  return text.length;
+  return inSource || lineEnd === -1 ? text.length : lineEnd;
 }
 
 /**
