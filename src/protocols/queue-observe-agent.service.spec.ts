@@ -126,6 +126,90 @@ describe("QueueObserveAgentService", () => {
     expect(decorate(instance.process.bind(instance)).length).toBe(3);
     expect(decorate((_job: unknown) => undefined).length).toBe(1);
   });
+
+  /**
+   * `decorate` is documented as the method to override, and an application
+   * reaches it as the agent does, on the prototype. The agent used to put its
+   * own in place of whatever was there.
+   */
+  describe("an override of decorate the application installed", () => {
+    type Processor = (...args: unknown[]) => unknown;
+    type Override = (this: unknown, processor: Processor) => unknown;
+    const job = { queueName: "emails", name: "welcome", id: "1" };
+    /** Decorates as the explorer does: on its own instance of the service. */
+    const decorateOn = (instance: object, processor: Processor) =>
+      (prototype.decorate as Override).call(instance, processor) as (
+        ...args: unknown[]
+      ) => Promise<unknown>;
+    const decorateWith = (processor: Processor) =>
+      decorateOn(new ProcessorDecoratorService(), processor);
+
+    it("is still called, on the explorer's instance, and the job traced around what it returns", async () => {
+      const receivers: unknown[] = [];
+      prototype.decorate = function (this: unknown, processor: Processor) {
+        receivers.push(this);
+        return (...args: unknown[]) => processor(...args);
+      } satisfies Override;
+      createTracingAgent();
+      const instance = new ProcessorDecoratorService();
+      const processor = vi.fn(async () => "done");
+
+      await expect(
+        decorateOn(instance, processor)(job, "lock-token"),
+      ).resolves.toBe("done");
+
+      expect(receivers).toEqual([instance]);
+      expect(processor).toHaveBeenCalledWith(job, "lock-token");
+    });
+
+    it("still refuses a job it refuses", async () => {
+      prototype.decorate = (() => async () => {
+        throw new Error("job refused");
+      }) satisfies Override;
+      createTracingAgent();
+      const processor = vi.fn();
+
+      await expect(decorateWith(processor)(job)).rejects.toThrow("job refused");
+      expect(processor).not.toHaveBeenCalled();
+    });
+
+    it("declares the parameters of the function the override returns", () => {
+      prototype.decorate = (() =>
+        (_job: unknown, _token?: string, _signal?: AbortSignal) =>
+          undefined) satisfies Override;
+      createAgent();
+
+      expect(decorateWith(() => undefined).length).toBe(3);
+    });
+
+    it("is wrapped once by a second agent, which sees through the first one's wrapper", async () => {
+      const override = vi.fn((processor: Processor) => processor);
+      prototype.decorate = override;
+      createTracingAgent();
+      createTracingAgent();
+
+      await decorateWith(vi.fn(async () => "done"))(job);
+
+      expect(override).toHaveBeenCalledOnce();
+    });
+
+    it("is kept when installed after an agent, by the next agent", async () => {
+      createTracingAgent();
+      const previous = prototype.decorate as Override;
+      const calls: string[] = [];
+      prototype.decorate = function (this: unknown, processor: Processor) {
+        calls.push("override");
+        return previous.call(this, processor);
+      } satisfies Override;
+      createTracingAgent();
+
+      await expect(decorateWith(vi.fn(async () => "done"))(job)).resolves.toBe(
+        "done",
+      );
+
+      expect(calls).toEqual(["override"]);
+    });
+  });
 });
 
 /**

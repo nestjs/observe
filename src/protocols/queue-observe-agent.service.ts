@@ -22,12 +22,23 @@ import {
 /** A processor as a worker calls it - `(job, token, signal)` on current BullMQ. */
 type JobProcessor = (job: Job, ...rest: unknown[]) => unknown;
 
+/** `ProcessorDecoratorService#decorate`, or an override of it. */
+type Decorate = (this: unknown, processor: JobProcessor) => unknown;
+
 /** The `ProcessorDecoratorService` surface this service patches, structurally typed. */
 interface ProcessorDecoratorServiceLike {
   prototype?: {
-    decorate?: (processor: JobProcessor) => JobProcessor;
+    decorate?: Decorate;
   };
 }
+
+/**
+ * On the agent's `decorate`: the one it stands in front of, so a second
+ * agent wraps that rather than the first agent's. Kept on the wrapper, not
+ * the prototype, so an override the application installs after an agent is
+ * never mistaken for what that agent found.
+ */
+const DECORATE_IT_WRAPS = Symbol.for("nestjs.observe.bullmq.decorateItWraps");
 
 interface WorkerProPrototypeLike {
   callProcessJob?: JobProcessor;
@@ -148,26 +159,52 @@ export class QueueObserveAgentService<Store extends Record<string, unknown>> {
       return;
     }
 
+    // `decorate` is documented as the place to override, and the application
+    // may have: a check that refuses a job, a wrapper of its own. What is
+    // there is called, as the explorer would call it, and the job is traced
+    // around what it returns. An earlier agent's wrapper is seen through, to
+    // what that agent found.
+    const prototype = ProcessorDecoratorService.prototype;
+    const found = prototype.decorate;
+    const original =
+      typeof found === "function" &&
+      Object.prototype.hasOwnProperty.call(found, DECORATE_IT_WRAPS)
+        ? (found as Decorate & { [DECORATE_IT_WRAPS]?: Decorate })[
+            DECORATE_IT_WRAPS
+          ]
+        : found;
+    const runner = this.runner;
+    const describeJob = (job: Job) => this.describeJob(job);
+
     // The worker calls the processor with `(job, token, signal)`, and all of it
     // is passed on: a processor that moves its own job (`moveToDelayed`,
     // `extendLock`) needs the token to prove it holds the lock.
     //
-    // And the wrapper declares as many parameters as the processor does: the
-    // worker builds a job's abort signal only for a processor that declares
-    // three, so a rest parameter, whose `length` is 1, left every
-    // `process(job, token, signal)` without one and `cancelJob()` with
-    // nothing to abort.
-    ProcessorDecoratorService.prototype["decorate"] = (
-      processor: JobProcessor,
-    ) => {
-      const decorated = (job: Job, ...rest: unknown[]) =>
-        this.runner.run(this.describeJob(job), () => processor(job, ...rest));
-      Object.defineProperty(decorated, "length", {
-        value: processor.length,
+    // And the wrapper declares as many parameters as the processor it stands
+    // in for does: the worker builds a job's abort signal only for a
+    // processor that declares three, so a rest parameter, whose `length` is
+    // 1, left every `process(job, token, signal)` without one and
+    // `cancelJob()` with nothing to abort.
+    const decorate: Decorate = function (this: unknown, processor) {
+      const decorated =
+        typeof original === "function"
+          ? original.call(this, processor)
+          : processor;
+      if (typeof decorated !== "function") {
+        return decorated;
+      }
+      const traced = (job: Job, ...rest: unknown[]) =>
+        runner.run(describeJob(job), () =>
+          (decorated as JobProcessor)(job, ...rest),
+        );
+      Object.defineProperty(traced, "length", {
+        value: decorated.length,
         configurable: true,
       });
-      return decorated;
+      return traced;
     };
+    Object.defineProperty(decorate, DECORATE_IT_WRAPS, { value: original });
+    prototype.decorate = decorate;
 
     this.patchQueue();
   }
