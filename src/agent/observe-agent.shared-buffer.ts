@@ -888,14 +888,8 @@ export class ObserveAgentSharedBuffer {
       }
     }
 
-    const json = JSON.stringify(this._mainThreadBuffer);
-    const jsonBytes = this.encoder.encode(json);
+    const jsonBytes = this.encodeToFit();
     const jsonLength = jsonBytes.length;
-
-    if (jsonLength > SHARED_BUFFER_SIZE - 8) {
-      // 8 bytes reserved for the lock and length
-      throw new Error("Payload too large for shared buffer");
-    }
 
     // Offset 4 for the lock value
     const view = new DataView(this._sharedBuffer, 4, 4);
@@ -915,6 +909,123 @@ export class ObserveAgentSharedBuffer {
       metric.markFlushed();
     }
     this._awaitingFlushAck.clear();
+  }
+
+  /**
+   * The batch as the bytes written to the shared slot, which they have to fit.
+   *
+   * `maxTracesPerBatch` bounds how many operations a batch holds, not how
+   * large each is, and parts of one are as long as a client made them - a
+   * URL, the text of an error. One entry can also hold what `JSON.stringify`
+   * refuses: a tag of a type nothing checked at run time. Either way the whole
+   * batch was thrown away, with every other request, job, log line and metric
+   * of the window. Such a batch is now sent without the entries that keep it
+   * from being written, so they cost only themselves.
+   *
+   * A batch that fits is serialised once, as before; only one that does not
+   * has its entries measured.
+   */
+  private encodeToFit(): Uint8Array {
+    // 8 bytes reserved for the lock and length
+    const capacity = SHARED_BUFFER_SIZE - 8;
+    const whole = this.encodeWithin(capacity);
+    if (whole instanceof Uint8Array) {
+      return whole;
+    }
+
+    const dropped = this.dropEntriesToFit(capacity);
+    const fitted = this.encodeWithin(capacity);
+    if (!(fitted instanceof Uint8Array)) {
+      // What is left is in a section no entry can be taken out of.
+      throw fitted ?? new Error("Payload too large for shared buffer");
+    }
+    this.logger.warn(
+      `A telemetry batch could not be written whole - it came to more than the ${capacity} bytes one flush carries, or held a value that cannot be serialised - and was sent without ${dropped} of its entries: any that cannot be serialised, then the largest.`,
+    );
+    return fitted;
+  }
+
+  /**
+   * The batch as bytes; nothing when it comes to more than `capacity`, and
+   * what `JSON.stringify` threw when it cannot be serialised at all.
+   */
+  private encodeWithin(capacity: number): Uint8Array | Error | undefined {
+    let json: string;
+    try {
+      json = JSON.stringify(this._mainThreadBuffer);
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+    // Each character is a byte at least, so a longer one is known not to fit.
+    if (json.length > capacity) {
+      return undefined;
+    }
+    const bytes = this.encoder.encode(json);
+    return bytes.length > capacity ? undefined : bytes;
+  }
+
+  /**
+   * Takes request snapshots, job snapshots and log entries out of the batch -
+   * any that cannot be serialised, then the largest - until what is left
+   * comes to at most `capacity` bytes, and returns how many went. Metrics are
+   * left in: a metric's window closes once the batch is written, so one taken
+   * out here would be lost rather than carried to the next.
+   */
+  private dropEntriesToFit(capacity: number): number {
+    const batch = this._mainThreadBuffer;
+    if (!batch) {
+      return 0;
+    }
+
+    const dropped = new Set<unknown>();
+    const sized: Array<{ entry: unknown; bytes: number }> = [];
+    for (const entry of [
+      ...batch.snapshots,
+      ...(batch.jobs ?? []),
+      ...(batch.logs ?? []),
+    ]) {
+      try {
+        // One more for the comma that follows it.
+        sized.push({
+          entry,
+          bytes: Buffer.byteLength(JSON.stringify(entry)) + 1,
+        });
+      } catch {
+        dropped.add(entry);
+      }
+    }
+    sized.sort((a, b) => b.bytes - a.bytes);
+
+    let total = 0;
+    try {
+      total = Buffer.byteLength(
+        JSON.stringify({ ...batch, snapshots: [], jobs: [], logs: [] }),
+      );
+    } catch {
+      // Left to the encode that follows, which reports it.
+    }
+    for (const { bytes } of sized) {
+      total += bytes;
+    }
+    for (const { entry, bytes } of sized) {
+      if (total <= capacity) {
+        break;
+      }
+      dropped.add(entry);
+      total -= bytes;
+    }
+
+    if (dropped.size > 0) {
+      const kept = (entry: unknown) => !dropped.has(entry);
+      batch.snapshots = batch.snapshots.filter(kept);
+      if (batch.jobs) {
+        batch.jobs = batch.jobs.filter(kept);
+      }
+      if (batch.logs) {
+        batch.logs = batch.logs.filter(kept);
+      }
+    }
+    return dropped.size;
   }
 
   resetMainThreadBuffer() {

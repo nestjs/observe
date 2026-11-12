@@ -767,6 +767,43 @@ describe("OperationTraceRegistry", () => {
       expect(root.tags).toMatchObject({ orderId: "o-1" });
     });
 
+    it("records at most 4 kB of an error's message and 8 kB of its stack, frames included", async () => {
+      startRequest("e-long");
+      const spanId = registry.internalStartTraceStep(
+        "e-long",
+        "OrdersService",
+        "place",
+        undefined,
+      );
+      // A message quoting a field of the request body.
+      const error = new Error(`No product with sku ${"x".repeat(100_000)}`);
+      registry.internalEndTraceStep(
+        "e-long",
+        spanId,
+        "OrdersService",
+        "place",
+        spanId,
+        error,
+      );
+      registry.endTrace("e-long", { statusCode: 404 });
+
+      const snapshot = await registry.pluckSnapshot("e-long");
+      const recorded = snapshot!.error as { message: string; stack: string };
+      expect(recorded.message.length).toBeLessThanOrEqual(4 * 1024);
+      expect(recorded.message.startsWith("No product with sku xxx")).toBe(true);
+      expect(recorded.message.endsWith("... [truncated by observe]")).toBe(
+        true,
+      );
+      expect(recorded.stack.length).toBeLessThanOrEqual(8 * 1024);
+      expect(recorded.stack.startsWith("Error: No product with sku xxx")).toBe(
+        true,
+      );
+      // The frames follow the message, and are what the stack is kept for.
+      expect(recorded.stack).toContain(
+        error.stack!.slice(error.stack!.indexOf("\n    at ")),
+      );
+    });
+
     describe("captured errors past the per-trace limit", () => {
       /** A redactor that counts what it is handed - the payload's cost. */
       const countRedactions = () => {

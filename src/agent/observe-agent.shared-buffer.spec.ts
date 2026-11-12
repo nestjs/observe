@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { Counter } from "../custom-metrics/counter.js";
 import { Gauge } from "../custom-metrics/gauge.js";
 import { Summary } from "../custom-metrics/summary.js";
@@ -1098,6 +1099,85 @@ describe("ObserveAgentSharedBuffer", () => {
       // in the same shared memory, then release the lock.
       new DataView(buffer.sharedBuffer, 4, 4).setUint32(0, 0);
       expect(buffer.hasBatchAwaitingWorker()).toBe(false);
+    });
+  });
+
+  describe("a batch that cannot be written whole", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    const request = (
+      traceId: string,
+      overrides: Partial<RequestSnapshot> = {},
+    ) =>
+      ({
+        traceId,
+        protocol: "http",
+        operationId: "/orders",
+        attributes: { method: "GET", statusCode: 200, originalUrl: "/orders" },
+        duration: 1,
+        traces: [],
+        ...overrides,
+      }) as RequestSnapshot;
+
+    const written = (buffer: ObserveAgentSharedBuffer) => {
+      const length = new DataView(buffer.sharedBuffer, 4, 4).getUint32(0);
+      return JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(buffer.sharedBuffer, 8, length),
+        ),
+      ) as { snapshots: Array<{ ti: string }>; logs?: unknown[] };
+    };
+
+    it("is sent without its largest entries rather than not at all", () => {
+      const warn = vi
+        .spyOn(Logger.prototype, "warn")
+        .mockImplementation(() => undefined);
+      const buffer = createBuffer();
+      buffer.insertRequestSnapshot(request("bystander"));
+      // Past the 16 MB slot on its own: a URL, an error's text - anything a
+      // client sets the length of.
+      buffer.insertRequestSnapshot(
+        request("oversized", {
+          attributes: {
+            method: "GET",
+            statusCode: 200,
+            originalUrl: `/orders?q=${"x".repeat(17 * 1024 * 1024)}`,
+          },
+        }),
+      );
+      buffer.insertRequestSnapshot(request("later"));
+      buffer.pushLogs(logs(3));
+
+      expect(() => buffer.encodeAndWrite()).not.toThrow();
+
+      const batch = written(buffer);
+      expect(batch.snapshots.map((snapshot) => snapshot.ti)).toEqual([
+        "bystander",
+        "later",
+      ]);
+      expect(batch.logs).toHaveLength(3);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("was sent without 1 of its entries"),
+      );
+    });
+
+    it("is sent without an entry that cannot be serialised", () => {
+      vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      const buffer = createBuffer();
+      buffer.insertRequestSnapshot(request("bystander"));
+      // A tag nothing checked the type of at run time.
+      buffer.insertRequestSnapshot(
+        request("unserialisable", {
+          tags: { total: 1n } as unknown as RequestSnapshot["tags"],
+        }),
+      );
+
+      expect(() => buffer.encodeAndWrite()).not.toThrow();
+      expect(written(buffer).snapshots.map((snapshot) => snapshot.ti)).toEqual([
+        "bystander",
+      ]);
     });
   });
 

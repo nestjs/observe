@@ -121,6 +121,82 @@ const UNHANDLED_ERROR_STATUS_CODE = 500;
  */
 const HANDLED_ERROR_STATUS_CODE = 400;
 
+/**
+ * The most of an error's message, and of its stack, that is recorded.
+ *
+ * Both are as long as whoever threw made them, and a message that quotes the
+ * request - `No product with sku ${sku}` - is as long as a client made it. V8
+ * repeats the message at the head of the stack, and a failed operation carries
+ * the error on its root span and on itself, so uncut, each such request held
+ * its text four times over until the flush - and the flush, which writes the
+ * batch to a 16 MB slot, threw the whole batch away over a few of them.
+ */
+const MAX_ERROR_MESSAGE_LENGTH = 4 * 1024;
+const MAX_ERROR_STACK_LENGTH = 8 * 1024;
+/**
+ * How much of a cut stack's head is kept - the error's name and the start of
+ * its message. The rest of the limit goes to its tail, the frames.
+ */
+const ERROR_STACK_HEAD_LENGTH = 2 * 1024;
+const ERROR_TEXT_CUT = "... [truncated by observe]";
+
+/** The first `length` characters, not ending in half a surrogate pair. */
+function headOf(text: string, length: number): string {
+  const last = text.charCodeAt(length - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? length - 1 : length);
+}
+
+/**
+ * Its own copy of a cut: a slice keeps the whole of the text it was taken
+ * from alive for as long as the slice itself is.
+ */
+function copyOf(text: string): string {
+  return Buffer.from(text, "utf8").toString("utf8");
+}
+
+/** An error's message, cut to the most of it that is recorded. */
+function fitErrorMessage(message: string): string {
+  if (
+    typeof message !== "string" ||
+    message.length <= MAX_ERROR_MESSAGE_LENGTH
+  ) {
+    return message;
+  }
+  return copyOf(
+    headOf(message, MAX_ERROR_MESSAGE_LENGTH - ERROR_TEXT_CUT.length) +
+      ERROR_TEXT_CUT,
+  );
+}
+
+/**
+ * An error's stack, cut to the most of it that is recorded: its head and its
+ * tail, since a stack opens with the message and closes with the frames,
+ * which a cut message would otherwise push out of it altogether. The tail
+ * starts on a line of its own where it can.
+ */
+function fitErrorStack(stack: string | undefined): string | undefined {
+  if (typeof stack !== "string" || stack.length <= MAX_ERROR_STACK_LENGTH) {
+    return stack;
+  }
+  const tailLength =
+    MAX_ERROR_STACK_LENGTH - ERROR_STACK_HEAD_LENGTH - ERROR_TEXT_CUT.length;
+  let tailStart = stack.length - tailLength;
+  const line = stack.indexOf("\n", tailStart);
+  if (line !== -1) {
+    tailStart = line;
+  } else {
+    const first = stack.charCodeAt(tailStart);
+    if (first >= 0xdc00 && first <= 0xdfff) {
+      tailStart += 1;
+    }
+  }
+  return copyOf(
+    headOf(stack, ERROR_STACK_HEAD_LENGTH) +
+      ERROR_TEXT_CUT +
+      stack.slice(tailStart),
+  );
+}
+
 /** A node and everything below it. */
 function countNodes(node: {
   children?: Array<CompleteTraceEventNode | OngoingTraceEventNode>;
@@ -296,7 +372,7 @@ export class OperationTraceRegistry {
         ? { message: error.message, stack: error.stack }
         : { message: String(error), stack: undefined };
     // Redacted here, at the one point every error payload passes through.
-    const payload = this.redactor
+    const redacted = this.redactor
       ? {
           message: this.redactor.redactMessage(raw.message),
           stack:
@@ -305,6 +381,11 @@ export class OperationTraceRegistry {
               : this.redactor.redactMessage(raw.stack),
         }
       : raw;
+    // Cut once redacted, so no rule is handed half of what it matches.
+    const payload = {
+      message: fitErrorMessage(redacted.message),
+      stack: fitErrorStack(redacted.stack),
+    };
 
     const result: {
       cls?: string;
