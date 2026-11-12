@@ -490,6 +490,92 @@ describe("OtlpTraceExporter", () => {
     }
   }, 15_000);
 
+  describe("against a receiver that keeps sending interim replies", () => {
+    let chatty: Server;
+    let sockets: Socket[];
+    let chattyUrl: string;
+    let timers: NodeJS.Timeout[];
+
+    /** Answers every export with `102 Processing`, every `everyMs`, forever. */
+    const start = async (everyMs: number) => {
+      sockets = [];
+      timers = [];
+      chatty = createServer((socket) => {
+        sockets.push(socket);
+        socket.on("error", () => undefined);
+        socket.once("data", () => {
+          timers.push(
+            setInterval(() => {
+              if (!socket.destroyed) {
+                socket.write("HTTP/1.1 102 Processing\r\n\r\n");
+              }
+            }, everyMs),
+          );
+        });
+      });
+      const port = await freePort();
+      await new Promise<void>((resolve) =>
+        chatty.listen(port, "127.0.0.1", resolve),
+      );
+      chattyUrl = `http://127.0.0.1:${port}`;
+    };
+
+    afterEach(async () => {
+      timers.forEach(clearInterval);
+      sockets.forEach((socket) => socket.destroy());
+      await new Promise((resolve) => chatty.close(resolve));
+    });
+
+    const failure = () =>
+      warn.mock.calls
+        .map((call: unknown[]) => String(call[0]))
+        .find((line: string) => line.includes("could not be reached"));
+
+    // `timeoutMillis` is how long one export may take, not how long the
+    // socket may stay silent: each interim reply would start that over.
+    it("gives up on an export at its timeout, however the receiver keeps writing", async () => {
+      await start(150);
+      const exporter = exporterFor(chattyUrl, {
+        otlp: {
+          endpoint: chattyUrl,
+          protocol: "http/json",
+          timeoutMillis: 600,
+        },
+      });
+      try {
+        exporter.exportRequestSnapshot(snapshot());
+        exporter.flush();
+
+        await waitFor(() => failure() !== undefined, 3_000, "the timeout");
+        expect(failure()).toContain("ETIMEDOUT");
+      } finally {
+        await exporter.onApplicationShutdown();
+      }
+    });
+
+    // Nothing the exporter sends asks for one, and each is parsed on the
+    // application's thread.
+    it("gives up on an export after eight interim replies", async () => {
+      await start(5);
+      const exporter = exporterFor(chattyUrl, {
+        otlp: {
+          endpoint: chattyUrl,
+          protocol: "http/json",
+          timeoutMillis: 60_000,
+        },
+      });
+      try {
+        exporter.exportRequestSnapshot(snapshot());
+        exporter.flush();
+
+        await waitFor(() => failure() !== undefined, 3_000, "the refusal");
+        expect(failure()).toContain("interim");
+      } finally {
+        await exporter.onApplicationShutdown();
+      }
+    });
+  });
+
   describe("against a receiver that never answers", () => {
     let silent: Server;
     let sockets: Socket[];

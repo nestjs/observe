@@ -82,6 +82,17 @@ const KEEP_ALIVE_IDLE_MS = 30_000;
  */
 const MAX_REPLY_BYTES = 64 * 1024;
 
+/**
+ * The most interim (1xx) replies one export sits through. Nothing it sends
+ * asks for one, and each is parsed on the application's thread: how many of
+ * them that thread works through is not the receiver's to choose. A proxy's
+ * few ahead of the answer still pass.
+ */
+const MAX_INTERIM_REPLIES = 8;
+
+/** The longest a timer runs; a longer delay would fire at once instead. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 interface ReceiverReply {
   status: number;
   retryAfter: string | undefined;
@@ -516,14 +527,32 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
         },
       );
       request.on("error", reject);
-      request.setTimeout(settings.timeoutMs, () =>
-        request.destroy(
-          Object.assign(
-            new Error(`no answer within ${settings.timeoutMs} ms`),
-            { code: "ETIMEDOUT" },
+      // A limit on the export as a whole, which is what `timeoutMillis` is.
+      // `request.setTimeout` measures silence on the socket instead and
+      // starts over with every byte: a receiver that went on writing -
+      // interim replies, a body a byte at a time - would hold this export,
+      // and every one queued behind it, open for as long as it liked.
+      const deadline = setTimeout(
+        () =>
+          request.destroy(
+            Object.assign(
+              new Error(`no answer within ${settings.timeoutMs} ms`),
+              { code: "ETIMEDOUT" },
+            ),
           ),
-        ),
+        Math.min(settings.timeoutMs, MAX_TIMER_MS),
       );
+      request.on("close", () => clearTimeout(deadline));
+      let interimReplies = 0;
+      request.on("information", () => {
+        if (++interimReplies > MAX_INTERIM_REPLIES) {
+          request.destroy(
+            new Error(
+              `it sent more than ${MAX_INTERIM_REPLIES} interim (1xx) replies`,
+            ),
+          );
+        }
+      });
       request.end(body);
     });
   }
