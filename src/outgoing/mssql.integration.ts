@@ -272,9 +272,15 @@ export function patchMssql(
         sql = prepared;
         procedure = false;
       }
+      // Names in double quotes only where the driver turns the setting on:
+      // its default and `true`. `null` sends no SET, and the session keeps
+      // the server's own setting, which is OFF as installed - there a double
+      // quote opens a string.
+      const quotedIdentifier =
+        this.parent?.config?.options?.enableQuotedIdentifier;
       const { operation, statement } = describeMssqlStatement(
         procedure ? `EXEC ${sql}` : sql,
-        this.parent?.config?.options?.enableQuotedIdentifier !== false,
+        quotedIdentifier === undefined || quotedIdentifier === true,
         !procedure,
       );
       const span = recorder.open(

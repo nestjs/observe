@@ -694,13 +694,17 @@ describe("MSSQL statement sanitization", () => {
     },
   );
 
-  it.each([undefined, true, false])(
+  // `null` sends no SET at all, so the session keeps the server's setting -
+  // OFF on a server as installed - and a double quote may open a string.
+  it.each([undefined, true, false, null])(
     "respects enableQuotedIdentifier=%s for pool, transaction and prepared-statement requests",
     async (enableQuotedIdentifier) => {
       const h = harness();
       const pool = new mssql.ConnectionPool({
         server: "localhost",
-        options: { enableQuotedIdentifier },
+        options: {
+          enableQuotedIdentifier: enableQuotedIdentifier as boolean | undefined,
+        },
       });
       const transaction = new mssql.Transaction(pool);
       const requests = [
@@ -709,7 +713,8 @@ describe("MSSQL statement sanitization", () => {
         new h.Request(new mssql.PreparedStatement(pool)),
         new h.Request(new mssql.PreparedStatement(transaction)),
       ];
-      const quoted = enableQuotedIdentifier !== false;
+      const quoted =
+        enableQuotedIdentifier === undefined || enableQuotedIdentifier === true;
       const sql = quoted
         ? `SELECT "o"."id" FROM "dbo"."orders" "o" WHERE "o"."note" = N'private-value'`
         : `SELECT "private""value", "/*private-comment*/" FROM [dbo].[orders] WHERE note = N'private-value'`;
