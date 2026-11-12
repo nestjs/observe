@@ -54,16 +54,27 @@ export function patchPg(pg: PgModule, recorder: OutgoingSpanRecorder): boolean {
           span.end(error);
           return callback.call(this, error, ...rest);
         };
-      } else if (typeof config?.callback === "function") {
+      } else if (!covers && typeof config?.callback === "function") {
+        // Only a client calls a config's `callback`. A pool answers through
+        // its promise and hands the client a callback of its own, which pg
+        // stores on the config: one a pool has run before carries a
+        // `callback` that is not the caller's, and that nothing calls again.
         const callback = AsyncResource.bind(config.callback);
         hasCallback = true;
-        args[0] = {
-          ...config,
-          callback(this: unknown, error: unknown, ...rest: any[]) {
-            span.end(error);
-            return callback.call(this, error, ...rest);
+        // Derived from the caller's config rather than copied from it: a
+        // statement object (sql-template-tag, sql-template-strings) keeps
+        // `text` on its prototype, where a spread does not reach.
+        args[0] = Object.create(config, {
+          callback: {
+            value(this: unknown, error: unknown, ...rest: any[]) {
+              span.end(error);
+              return callback.call(this, error, ...rest);
+            },
+            writable: true,
+            enumerable: true,
+            configurable: true,
           },
-        };
+        });
       }
 
       try {

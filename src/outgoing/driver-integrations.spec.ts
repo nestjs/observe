@@ -282,6 +282,72 @@ describe("patchPg", () => {
   });
 });
 
+describe("patchPg with a config object", () => {
+  /** A tagged-template statement: `text` is a getter on its class. */
+  class Statement {
+    values = [1];
+    get text() {
+      return "SELECT * FROM plans WHERE id = $1";
+    }
+  }
+
+  const fakePg = () => {
+    const texts: unknown[] = [];
+    class Client {
+      query(config: any, _values?: unknown, callback?: any) {
+        texts.push(config.text);
+        const answer = callback ?? config.callback;
+        if (answer) {
+          queueMicrotask(() => answer(null, { rows: [] }));
+          return undefined;
+        }
+        return Promise.resolve({ rows: [] });
+      }
+    }
+    class Pool {
+      // pg-pool answers through its promise, and hands the client a callback
+      // of its own - which pg then stores on the config object.
+      query(config: any) {
+        texts.push(config.text);
+        config.callback = () => undefined;
+        return Promise.resolve({ rows: [] });
+      }
+    }
+    return { module: { Client, Pool }, texts };
+  };
+
+  it("runs a statement object through a pool twice, its text and span intact", async () => {
+    const { module, texts } = fakePg();
+    const { recorder, spans } = fakeRecorder();
+    patchPg(module, recorder);
+    const pool = new module.Pool();
+    const statement = new Statement();
+
+    await pool.query(statement);
+    // Now carrying the pool's own callback, which nothing calls again.
+    await pool.query(statement);
+
+    expect(texts).toEqual([statement.text, statement.text]);
+    expect(spans.map((span) => span.ended)).toEqual([1, 1]);
+  });
+
+  it("keeps a statement object's text when the client is given its callback on it", async () => {
+    const { module, texts } = fakePg();
+    const { recorder, spans } = fakeRecorder();
+    patchPg(module, recorder);
+    const answered = vi.fn();
+    const statement = Object.assign(new Statement(), { callback: answered });
+
+    new module.Client().query(statement);
+    await Promise.resolve();
+
+    expect(texts).toEqual([statement.text]);
+    expect(answered).toHaveBeenCalledTimes(1);
+    expect(spans[0].ended).toBe(1);
+    expect(statement.callback).toBe(answered);
+  });
+});
+
 describe("patchMysql2 async context", () => {
   /** mysql2's shape, with the pool's checkout queue. */
   const fakeMysql2 = () => {
