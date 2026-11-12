@@ -638,18 +638,28 @@ function named<T extends AnyFunction>(name: string, fn: T): T {
  * Only the topmost match is rewritten. Every wrapper on the way out relabels
  * its own frame, and inner calls unwind before outer ones, so two classes that
  * happen to share a method name each end up with the right label.
+ *
+ * An error with a long `name` and `message` is left as it is - see
+ * `MAX_RELABELLED_HEADER_LENGTH`.
  */
 function relabelProxyFrame(
   err: unknown,
   className: string,
   methodName: string,
 ): void {
-  if (!(err instanceof Error) || typeof err.stack !== "string") {
+  // Measured first: reading `stack` is what writes it out.
+  if (
+    !(err instanceof Error) ||
+    stackHeaderLength(err) > MAX_RELABELLED_HEADER_LENGTH ||
+    typeof err.stack !== "string"
+  ) {
     return;
   }
-  // `async` prefixes the type name on frames resumed from an await.
+  // `async` prefixes the type name on frames resumed from an await. Spaces
+  // and tabs only after the newline, not `\s`: a newline matched there too,
+  // and a message of newlines then rescanned the run after each one.
   const frame = new RegExp(
-    `(\\n\\s*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
+    `(\\n[ \\t]*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
   );
   if (!frame.test(err.stack)) {
     return;
@@ -659,6 +669,32 @@ function relabelProxyFrame(
   } catch {
     // Some errors ship a read-only `stack`; the label is cosmetic, so leaving
     // it as-is beats masking the original failure.
+  }
+}
+
+/**
+ * The longest `name` plus `message` of an error whose stack is relabelled.
+ *
+ * V8 writes an error's stack out when it is first read, opening it with the
+ * two. Until then a message that quotes the request - `Unknown id ${id}` - is
+ * a reference to the text it quotes, however long, and the frames are held in
+ * a compact form. Searching the stack writes all of it out, and the copy stays
+ * on the error as long as anything holds it: one call per element of a
+ * client's array, each failing with a long quote, then held by
+ * `Promise.allSettled`, held a copy each. The label is cosmetic, so an error
+ * past this keeps `Proxy.` rather than cost that.
+ */
+const MAX_RELABELLED_HEADER_LENGTH = 1024;
+
+function stackHeaderLength(err: Error): number {
+  try {
+    return (
+      (typeof err.name === "string" ? err.name.length : 0) +
+      (typeof err.message === "string" ? err.message.length : 0)
+    );
+  } catch {
+    // A getter that throws; leave such an error alone.
+    return Infinity;
   }
 }
 

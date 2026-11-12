@@ -204,6 +204,70 @@ describe("createInstanceDecorator", () => {
       expect(rootStep.stackAtRecord).toContain("UserService.fail");
     });
 
+    it("relabels frames in linear time when the message is mostly newlines", () => {
+      // `\s*` after the newline that opens a frame also matched newlines, so
+      // every newline of a message rescanned the run after it - quadratic,
+      // per traced frame, on text a client chose. ~1.3 s for this input.
+      class InnerService {
+        fail(input: string) {
+          throw new Error(`invalid: ${input}`);
+        }
+      }
+      class OuterService {
+        constructor(private readonly inner: InnerService) {}
+        fail(input: string) {
+          this.inner.fail(input);
+        }
+      }
+      const outer = decorate(
+        new OuterService(decorate(new InnerService()) as InnerService),
+      ) as OuterService;
+      const input = "\n".repeat(20_000);
+      const startedAt = performance.now();
+
+      expect(() => withTrace(() => outer.fail(input))).toThrow("invalid");
+
+      expect(performance.now() - startedAt).toBeLessThan(100);
+    });
+
+    it("does not write out the stack of an error with a long message", () => {
+      // V8 writes a stack out when it is first read, with the message the
+      // error has by then - so a stack that opens with a changed message was
+      // not read before the change. Read, each error held in a loop keeps a
+      // copy of the text its message quotes.
+      class LookupService {
+        find(name: string) {
+          throw new Error(`No user named "${name}"`);
+        }
+      }
+      const service = createInstanceDecorator(
+        als,
+        {
+          internalStartTraceStep: () => "step-1",
+          internalEndTraceStep: () => undefined,
+        } as unknown as OperationTraceRegistry,
+        { traceIdKey: TRACE_ID_KEY, skipInstrumentation: () => false },
+      )(new LookupService()) as LookupService;
+      const lookUp = (name: string) =>
+        withTrace(() => {
+          try {
+            service.find(name);
+          } catch (err) {
+            return err as Error;
+          }
+          throw new Error("find() did not throw");
+        });
+
+      const long = lookUp("a".repeat(2_000));
+      long.message = "changed";
+      expect(long.stack).toMatch(/^Error: changed\n/);
+
+      const short = lookUp("a");
+      short.message = "changed";
+      expect(short.stack).toMatch(/^Error: No user named "a"\n/);
+      expect(short.stack).not.toContain("Proxy.find");
+    });
+
     it("keeps the original method name on the returned wrapper", () => {
       const service = decorate(new UserService()) as UserService;
 
