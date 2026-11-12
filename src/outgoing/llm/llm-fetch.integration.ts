@@ -302,6 +302,21 @@ async function observeCall(
     },
     { highWaterMark: 0 },
   );
+  let wrapped: Response;
+  try {
+    wrapped = rewrap(response, body);
+  } catch {
+    // The `Response` constructor refuses what `fetch` takes off the wire: a
+    // status past 599, a reason phrase with a control character or past
+    // Latin-1. The caller gets the reply as it came, tagged without its
+    // usage. Nothing has been read from it - `pull` runs on demand - so its
+    // body is whole once the lock is given back. Tagged first: giving the
+    // lock back rejects `closed`, which `start` above would act on.
+    tagged = true;
+    source.releaseLock();
+    tag({}, stream);
+    return response;
+  }
   // Watching `body`, not the response: a caller that keeps only the body,
   // or a clone, can still read it. Nothing registered may reach `body`, or
   // it would never be collected.
@@ -318,7 +333,7 @@ async function observeCall(
     },
     holder,
   );
-  return rewrap(response, body);
+  return wrapped;
 }
 
 /** The same response, reading through `body`. */

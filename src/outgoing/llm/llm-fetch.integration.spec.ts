@@ -97,6 +97,53 @@ describe("a model reply read through the agent", () => {
   });
 });
 
+describe("a model reply the Response constructor refuses", () => {
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  // What `fetch` takes off the wire and `new Response()` will not: a status
+  // past 599, a reason phrase with a control character or past Latin-1.
+  it.each([
+    ["a status past 599", { status: 999 }],
+    ["a reason phrase past Latin-1", { statusText: "Acc\ufffds refus\ufffd" }],
+    ["a control character", { statusText: "OK\u0001" }],
+  ])("hands back the reply as it came, for %s", async (_name, line) => {
+    const tags: unknown[] = [];
+    const released = vi.fn();
+    globalThis.fetch = async () => {
+      attachLlmSpan({
+        spanId: "1",
+        end: () => undefined,
+        tag: (extra) => void tags.push(extra),
+        hold: () => released,
+      });
+      const reply = new Response('{"usage":{"prompt_tokens":1}}', {
+        headers: { "content-type": "application/json" },
+      });
+      for (const [key, value] of Object.entries(line)) {
+        Object.defineProperty(reply, key, { value });
+      }
+      return reply;
+    };
+    installLlmFetchObserver();
+    const stop = activateLlmFetchObserver({
+      isRecording: () => true,
+    } as never);
+    try {
+      const response = await globalThis.fetch(url, { body: "{}" });
+
+      expect({
+        status: response.status,
+        statusText: response.statusText,
+      }).toMatchObject(line);
+      expect(await response.text()).toBe('{"usage":{"prompt_tokens":1}}');
+      expect(released).toHaveBeenCalledTimes(1);
+      expect(tags).toEqual([{ "llm.provider": "openai" }]);
+    } finally {
+      stop();
+    }
+  });
+});
+
 describe("a model reply the application drops", () => {
   setFlagsFromString("--expose-gc");
   const gc = runInNewContext("gc") as () => void;
