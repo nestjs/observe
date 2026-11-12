@@ -406,6 +406,13 @@ export const detachedObserveWorker = (
               text: async () => text,
               json: async () => JSON.parse(text),
             });
+            // A reply can end while the batch is still being written - a
+            // collector or proxy answering off the head and reading no
+            // further. The send is decided; the socket would never be
+            // pooled, timed out or closed again, one more for every flush.
+            if (!req.writableFinished) {
+              req.destroy();
+            }
           };
           res.on("data", (chunk: Buffer) => {
             if (received >= MAX_REPLY_BYTES) {

@@ -5,7 +5,8 @@ import {
   Server,
   ServerResponse,
 } from "node:http";
-import { Socket } from "node:net";
+import { randomBytes } from "node:crypto";
+import { createServer as createNetServer, Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   detachedWorkerData,
@@ -39,8 +40,8 @@ const writeBatch = (sharedBuffer: SharedArrayBuffer, json: string) => {
  * `sends(n)` once it has reported n successful sends. Any error the worker
  * reports fails the wait - a retried batch must not surface as one.
  */
-const startWorker = (endpoint: string) => {
-  const sharedBuffer = new SharedArrayBuffer(64 * 1024);
+const startWorker = (endpoint: string, bufferSize = 64 * 1024) => {
+  const sharedBuffer = new SharedArrayBuffer(bufferSize);
   const worker = new Worker(detachedWorkerSource(), {
     eval: true,
     workerData: detachedWorkerData({
@@ -206,5 +207,48 @@ describe("the detached worker's connection to the collector", () => {
     await worker.sends(1);
 
     expect(written).toBeLessThan(8 * 1024 * 1024);
+  }, 20_000);
+
+  // A collector that answers off the head of a batch and stops reading: the
+  // send is over, but the upload never finishes, and a socket nobody pools
+  // or times out any more would stay open, one more per flush.
+  it("lets go of the connection when the reply ends before the batch is written", async () => {
+    let closed = false;
+    let socket: Socket | undefined;
+    const early = createNetServer((connection) => {
+      socket = connection;
+      connection.once("data", () => {
+        connection.pause();
+        connection.write(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
+            "Connection: keep-alive\r\nContent-Length: 2\r\n\r\n{}",
+        );
+      });
+      connection.on("error", () => undefined);
+      connection.on("close", () => (closed = true));
+      connection.on("end", () => (closed = true));
+    });
+    await new Promise<void>((resolve) => early.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = early.address() as { port: number };
+      worker = startWorker(`http://127.0.0.1:${port}`, 8 * 1024 * 1024);
+      // Too much for the kernel to take unread, gzipped or not.
+      worker.send({
+        traces: [randomBytes(4 * 1024 * 1024).toString("base64")],
+      });
+      await worker.sends(1);
+
+      // Read now: a released request comes to its end, a held one waits.
+      await sleep(200);
+      socket!.resume();
+      const isClosed = () => closed;
+      for (let waited = 0; !isClosed() && waited < 3_000; waited += 50) {
+        await sleep(50);
+      }
+      expect(closed).toBe(true);
+    } finally {
+      socket?.destroy();
+      await new Promise((resolve) => early.close(resolve));
+    }
   }, 20_000);
 });

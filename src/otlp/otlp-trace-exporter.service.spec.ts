@@ -421,6 +421,75 @@ describe("OtlpTraceExporter", () => {
     }, 10_000);
   });
 
+  // A receiver that answers off the head of an export and stops reading: the
+  // export is over, but its upload never finishes, and a socket nobody pools
+  // or times out any more would stay open, one more per export.
+  it("lets go of the connection when the reply ends before the export is written", async () => {
+    let closed = false;
+    let socket: Socket | undefined;
+    const early = createServer((connection) => {
+      socket = connection;
+      connection.once("data", () => {
+        connection.pause();
+        connection.write(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
+            "Connection: keep-alive\r\nContent-Length: 2\r\n\r\n{}",
+        );
+      });
+      connection.on("error", () => undefined);
+      connection.on("close", () => (closed = true));
+      connection.on("end", () => (closed = true));
+    });
+    const port = await freePort();
+    await new Promise<void>((resolve) =>
+      early.listen(port, "127.0.0.1", resolve),
+    );
+    const exporter = exporterFor(`http://127.0.0.1:${port}`, {
+      otlp: {
+        endpoint: `http://127.0.0.1:${port}`,
+        protocol: "http/json",
+        compression: "none",
+      },
+    });
+    try {
+      // One full batch, too much for the kernel to take unread.
+      const [handler] = snapshot().traces as unknown as Array<
+        Record<string, unknown>
+      >;
+      exporter.exportRequestSnapshot(
+        snapshot(0, {
+          traces: [
+            {
+              ...handler,
+              children: Array.from({ length: 999 }, () => ({
+                origin: "auto",
+                className: "OrdersService",
+                methodKey: "m".repeat(4_000),
+                duration: 1,
+                startOffset: 1,
+              })),
+            },
+          ] as RequestSnapshot["traces"],
+        }),
+      );
+      const state = exporter as unknown as { sending: Promise<void> | null };
+      await waitFor(() => socket !== undefined, 3_000, "the export");
+      await waitFor(() => state.sending === null, 3_000, "its reply");
+
+      // Read now: a released request comes to its end, a held one waits.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      socket!.resume();
+      await waitFor(() => closed, 3_000, "the connection to close").catch(
+        () => undefined,
+      );
+      expect(closed).toBe(true);
+    } finally {
+      socket?.destroy();
+      await exporter.onApplicationShutdown();
+      await new Promise((resolve) => early.close(resolve));
+    }
+  }, 15_000);
+
   describe("against a receiver that never answers", () => {
     let silent: Server;
     let sockets: Socket[];

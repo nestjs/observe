@@ -494,6 +494,11 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
                 Math.min(received, MAX_REPLY_BYTES),
               ).toString("utf8"),
             });
+            // A reply that ends before the batch has been written leaves a
+            // socket that is never pooled, timed out or closed again.
+            if (!request.writableFinished) {
+              request.destroy();
+            }
           };
           response.on("data", (chunk: Buffer) => {
             if (received >= MAX_REPLY_BYTES) {
