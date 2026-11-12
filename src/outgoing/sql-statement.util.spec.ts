@@ -141,10 +141,6 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
       "SELECT * FROM users WHERE pw = ? AND id = ?",
     ],
     [
-      "SELECT `it's` FROM t WHERE name = 'secret-value'",
-      "SELECT `it's` FROM t WHERE name = ?",
-    ],
-    [
       "SELECT * FROM t WHERE name = 'secret-value",
       "SELECT * FROM t WHERE name = ?",
     ],
@@ -188,6 +184,15 @@ describe("describeSqlStatement for Postgres", () => {
     [
       `SELECT "a--b" FROM t WHERE name = 'secret-value'`,
       `SELECT "a--b" FROM t WHERE name = ?`,
+    ],
+    // A backtick quotes nothing in Postgres: it is an operator character.
+    [
+      "SELECT * FROM docs WHERE content &` 'secret term' AND share_token = 'tok-123'",
+      "SELECT * FROM docs WHERE content &` ? AND share_token = ?",
+    ],
+    [
+      "SELECT * FROM d WHERE a &` 'x' /* user:42 */ AND b &` 'secret-value'",
+      "SELECT * FROM d WHERE a &` ? AND b &` ?",
     ],
     // A plain string takes a backslash as it is. Whether `\'` ends one turns
     // on a session setting, so what follows such a string is not shipped.
@@ -235,6 +240,10 @@ describe("describeSqlStatement for Postgres", () => {
 
 describe("describeSqlStatement for MySQL", () => {
   it.each([
+    [
+      "SELECT `it's` FROM t WHERE name = 'secret-value'",
+      "SELECT `it's` FROM t WHERE name = ?",
+    ],
     [
       `SELECT * FROM users WHERE email = "secret@example.com"`,
       "SELECT * FROM users WHERE email = ?",
