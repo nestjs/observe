@@ -155,6 +155,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
           transportId,
           ctx as BaseRpcContext,
           done,
+          target,
         );
       },
     );
@@ -186,6 +187,8 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     transportId: Transport | symbol,
     ctx: BaseRpcContext,
     done: () => Promise<any>,
+    /** The server the message arrived at. */
+    target?: Server,
   ): Promise<unknown> {
     // The same map `run` is given, rather than `getStore()` inside the callback:
     // identical object, one lookup fewer, and it is known to exist.
@@ -256,7 +259,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         registryKey,
         {
           protocol: this.toProtocolName(transportId),
-          operationId: this.getOperationIdFromContext(ctx),
+          operationId: this.getOperationIdFromContext(ctx, target),
           tags: this.options.rpc?.tags,
         },
         traceId,
@@ -430,7 +433,56 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     }
   }
 
-  private getOperationIdFromContext(ctx: BaseRpcContext): string {
+  /**
+   * The route a message's handler is registered under, for the pattern or
+   * topic as its sender wrote it. Nest parses a pattern that is JSON and finds
+   * the handler by the normalised outcome, so one handler answers to any
+   * number of texts - other whitespace, an escape, a key given twice. Named by
+   * the text, each was an operation of the sender's choosing, and a route an
+   * `@Objective` on the handler was declared for anew.
+   *
+   * The route is taken only where the server finds that route's handler for
+   * the text: a handler reached through a wildcard keeps the text it was
+   * reached on, and so does anything the server cannot be asked about.
+   */
+  private toRoute(text: string, target: Server | undefined): string {
+    if (!target) {
+      return text;
+    }
+    try {
+      const handlers = target.getHandlers();
+      // What a Nest client sends: the route itself. One lookup, no parse.
+      if (handlers.has(text)) {
+        return text;
+      }
+      // Protected in Nest's typings, so read by shape.
+      const route = (
+        target as unknown as {
+          getRouteFromPattern?: (pattern: string) => unknown;
+        }
+      ).getRouteFromPattern?.(text);
+      if (typeof route !== "string" || route === text) {
+        return text;
+      }
+      const handler = handlers.get(route);
+      return handler !== undefined &&
+        handler === target.getHandlerByPattern(text)
+        ? route
+        : text;
+    } catch {
+      return text;
+    }
+  }
+
+  /**
+   * Kafka, MQTT, RabbitMQ and TCP find a message's handler by the text its
+   * context carries - see `toRoute`. NATS and Redis find it by the
+   * subscription the message came in on.
+   */
+  private getOperationIdFromContext(
+    ctx: BaseRpcContext,
+    target?: Server,
+  ): string {
     const {
       KafkaContext,
       MqttContext,
@@ -442,10 +494,10 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     switch (true) {
       case ctx instanceof KafkaContext:
       case ctx instanceof MqttContext:
-        return ctx.getTopic();
+        return this.toRoute(ctx.getTopic(), target);
       case ctx instanceof RmqContext:
       case ctx instanceof TcpContext:
-        return ctx.getPattern();
+        return this.toRoute(ctx.getPattern(), target);
       case ctx instanceof RedisContext:
         return ctx.getChannel();
       case ctx instanceof NatsContext:
@@ -456,7 +508,9 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         // routing key. Throwing here would fail the message before `done()`
         // ever ran, so fall back to a conventional accessor when one exists.
         const pattern = (ctx as { getPattern?: () => unknown })?.getPattern?.();
-        return typeof pattern === "string" ? pattern : "unknown";
+        return typeof pattern === "string"
+          ? this.toRoute(pattern, target)
+          : "unknown";
       }
     }
   }

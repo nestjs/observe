@@ -1,4 +1,10 @@
-import { ServerKafka, Transport } from "@nestjs/microservices";
+import {
+  Server,
+  ServerKafka,
+  ServerTCP,
+  TcpContext,
+  Transport,
+} from "@nestjs/microservices";
 import { context as otelContext, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
@@ -63,15 +69,50 @@ describe("RpcObserveAgentService", () => {
   });
 
   describe("getOperationIdFromContext", () => {
-    const getOperationId = (ctx: unknown): string => {
+    const getOperationId = (ctx: unknown, target?: unknown): string => {
       const agent = createAgent(() => ({ unsubscribe: vi.fn() }));
       agent.onModuleInit();
       return (
         agent as unknown as {
-          getOperationIdFromContext: (ctx: unknown) => string;
+          getOperationIdFromContext: (ctx: unknown, target?: unknown) => string;
         }
-      ).getOperationIdFromContext(ctx);
+      ).getOperationIdFromContext(ctx, target);
     };
+
+    /** A TCP message as Nest delivers it, its pattern as the sender wrote it. */
+    const tcpMessage = (pattern: string) =>
+      new TcpContext([{} as never, pattern]);
+
+    it("names a TCP message by the route its handler is registered under", () => {
+      const server = new ServerTCP({});
+      server.addHandler({ cmd: "sum" }, async () => 1);
+
+      for (const spelling of [
+        '{"cmd":"sum"}',
+        '{ "cmd" : "sum" }',
+        '{"cmd":"refund","cmd":"sum"}',
+        '{"cmd":"s\\u0075m"}',
+      ]) {
+        expect(getOperationId(tcpMessage(spelling), server)).toBe(
+          '{"cmd":"sum"}',
+        );
+      }
+    });
+
+    it("keeps the text of a message the server cannot be asked about", () => {
+      const spelling = '{ "cmd" : "sum" }';
+      const throwing = {
+        getHandlers: () => {
+          throw new Error("not a server");
+        },
+      } as unknown as Server;
+
+      expect(getOperationId(tcpMessage(spelling))).toBe(spelling);
+      expect(getOperationId(tcpMessage(spelling), throwing)).toBe(spelling);
+      expect(getOperationId(tcpMessage(spelling), new ServerTCP({}))).toBe(
+        spelling,
+      );
+    });
 
     it("falls back to getPattern for a custom transport's own context class", () => {
       expect(getOperationId({ getPattern: () => "custom.pattern" })).toBe(
