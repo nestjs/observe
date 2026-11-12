@@ -122,6 +122,37 @@ describe("StdoutForwarderService", () => {
       expect(buffer.entries).toHaveLength(0);
     });
 
+    it("forwards at most a bounded number of entries from one write", () => {
+      const service = build();
+
+      // One logged value full of line breaks - a client's username, say -
+      // is one write. Every line of it used to become an entry, and the log
+      // buffer's caps are shared by the whole process: one request could
+      // push every other request's lines out of the batch.
+      write(
+        service,
+        Array.from({ length: 3000 }, (_, i) => `line ${i}`).join("\n") + "\n",
+      );
+
+      expect(buffer.entries).toHaveLength(50);
+      expect(buffer.entries[0].text).toBe("line 0");
+      expect(buffer.entries[48].text).toBe("line 48");
+      expect(buffer.entries[49].text).toContain("2951 more lines");
+    });
+
+    it("files the note on lines left out under the trace that wrote them", () => {
+      const service = build();
+
+      als.run(new Map([[TRACE_ID_KEY, "trace-flood"]]), () =>
+        write(service, "x\n".repeat(100)),
+      );
+
+      expect(buffer.entries).toHaveLength(50);
+      expect(
+        buffer.entries.every((entry) => entry.traceId === "trace-flood"),
+      ).toBe(true);
+    });
+
     it("forwards an over-long fragment rather than growing without bound", () => {
       const service = build();
 

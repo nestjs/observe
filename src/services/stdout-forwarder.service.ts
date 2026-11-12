@@ -49,6 +49,19 @@ const MAX_PARSED_LINE_LENGTH = 16 * 1024;
  */
 const MAX_CONTEXT_LENGTH = 255;
 
+/**
+ * Most entries one write may add to the log buffer.
+ *
+ * The buffer's caps are shared by the whole process and keep what came first,
+ * so a single logged value full of line breaks - a client's username, a
+ * posted object `util.inspect` prints a property per line - would otherwise
+ * become thousands of entries, push every other request's lines out of the
+ * batch, and hold the event loop while each one was parsed and redacted.
+ * Past this many, the opening lines are kept and one more entry says how many
+ * followed.
+ */
+const MAX_ENTRIES_PER_WRITE = 50;
+
 const FORWARDED_STREAMS = ["stdout", "stderr"] as const;
 type ForwardedStream = (typeof FORWARDED_STREAMS)[number];
 
@@ -191,9 +204,15 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     // or the empty string left by a chunk that ended cleanly.
     this.partialLines[name] = segments.pop() ?? "";
 
-    const entries = segments
-      .filter((line) => line.trim().length > 0)
-      .map((line) => this.toLogEntry(line));
+    const lines = segments.filter((line) => line.trim().length > 0);
+    if (lines.length > MAX_ENTRIES_PER_WRITE) {
+      // Cut before anything is parsed or redacted, which is where the time
+      // goes.
+      const omitted = lines.length - (MAX_ENTRIES_PER_WRITE - 1);
+      lines.length = MAX_ENTRIES_PER_WRITE - 1;
+      lines.push(`[observe] ${omitted} more lines of this write not forwarded`);
+    }
+    const entries = lines.map((line) => this.toLogEntry(line));
 
     if (entries.length > 0) {
       this.observeAgentSharedBuffer.pushLogs(entries);
