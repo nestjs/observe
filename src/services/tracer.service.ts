@@ -47,6 +47,7 @@ export class TracerService<
   private hasReportedUnusableOperationId = false;
   private hasReportedMetricLimit = false;
   private hasReportedUncapturedError = false;
+  private hasReportedErrorOutsideContext = false;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -141,6 +142,8 @@ export class TracerService<
    * The details of at most 20 errors are recorded per trace; the span an
    * error is captured on after that is marked as failed, and its tags are
    * still recorded.
+   *
+   * Called outside any async context, it records nothing and says so once.
    */
   async captureError(
     error: Error,
@@ -148,9 +151,12 @@ export class TracerService<
   ) {
     const store = this.als.getStore();
     if (!store) {
-      throw new Error(
-        'AsyncLocalStorage is not initialized. Ensure that you are using the "captureError" method within an async context.',
-      );
+      // Reporting an error must not raise one. A handler that reports a
+      // failure from a `catch` and answers with a fallback failed over the
+      // report instead, and one that did not await it ended the process -
+      // wherever the context was lost, by the agent or by the application.
+      this.reportErrorOutsideContext();
+      return;
     }
 
     const traceId =
@@ -180,6 +186,17 @@ export class TracerService<
       // does not await this call - take the process down with it.
       this.reportUncapturedError(failure);
     }
+  }
+
+  /** Said once: a call site outside any context is outside it every time. */
+  private reportErrorOutsideContext(): void {
+    if (this.hasReportedErrorOutsideContext) {
+      return;
+    }
+    this.hasReportedErrorOutsideContext = true;
+    this.logger.warn(
+      'captureError was called outside an async context, so the error is not recorded. Ensure that you are using the "captureError" method within an async context. Later calls outside one are not reported.',
+    );
   }
 
   /**

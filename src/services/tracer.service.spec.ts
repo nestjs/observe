@@ -18,8 +18,8 @@ import { TracerService } from "./tracer.service.js";
  * `counter("orders")` twice must hand back the *same* counter, or every call
  * site accumulates its own total and the reported figure is whichever one
  * flushed last. Trace methods also depend on the async store: methods that
- * require a context fail clearly, while optional accessors and naming are safe
- * outside a recorded operation.
+ * require a context fail clearly, while optional accessors, naming and error
+ * reporting are safe outside a recorded operation.
  */
 describe("TracerService", () => {
   const TRACE_ID_KEY = "traceId";
@@ -504,9 +504,27 @@ describe("TracerService", () => {
       );
     });
 
-    it("fails clearly outside any async context", async () => {
-      await expect(tracer.captureError(new Error("x"))).rejects.toThrow(
-        /AsyncLocalStorage is not initialized/,
+    it("records nothing outside any async context, without failing the caller, and says so once", async () => {
+      // A gateway handler behind an interceptor ran without the message's
+      // store: one that reported a handled error answered with Nest's
+      // exception instead of its fallback, and one that did not await the
+      // call ended the process.
+      const captureError = vi.spyOn(registry, "captureError");
+      const warn = vi
+        .spyOn((tracer as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      await expect(
+        tracer.captureError(new Error("x")),
+      ).resolves.toBeUndefined();
+      await expect(
+        tracer.captureError(new Error("y")),
+      ).resolves.toBeUndefined();
+
+      expect(captureError).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("outside an async context"),
       );
     });
 
