@@ -25,7 +25,7 @@ import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "../observe.constants.js";
 const MAX_PARTIAL_LINE_LENGTH = 8 * 1024;
 
 /**
- * Most of a line the parser and redactor are ever given.
+ * Most text the redactor is ever given in one go.
  *
  * Everything in `toLogEntry` runs synchronously inside the patched
  * `process.stdout.write`, on the application's own hot path, and the redactor
@@ -34,14 +34,28 @@ const MAX_PARTIAL_LINE_LENGTH = 8 * 1024;
  * outside caller chose - must not be able to hold the event loop while every
  * rule walks it. A bound only helps while that cost stays linear: a pattern
  * that backtracks super-linearly holds the loop for minutes inside 16 KB, which
- * is why the parser's patterns are written to be linear.
+ * is why the redactor's patterns are written to be linear.
  *
- * The bound is safe because it is four times what can ship: the shared buffer
- * truncates entries to 4 KB, so bytes beyond this window were never going to
- * leave the process - and a secret straddling the 4 KB cut still sits whole
- * inside this window, so it is redacted before the cut can split it.
+ * The parser is not held to it. It is linear, and a line cut before it reads
+ * it is a different line: a JSON record no longer parses, and goes out as raw
+ * text that nothing masks by key.
  */
-const MAX_PARSED_LINE_LENGTH = 16 * 1024;
+const MAX_REDACTED_LENGTH = 16 * 1024;
+
+/**
+ * How much of what the redactor is shown is there only to be seen, past the
+ * text that is sent.
+ *
+ * A cut through a secret leaves two pieces no rule recognises, and the piece
+ * in front of the cut ships: masking shortens the text before it - a long
+ * `token=AAAA…` becomes `token=[REDACTED]` - so the edge of a 16 KB window can
+ * land inside the 4 KB the shared buffer keeps of an entry. So text that has
+ * to be cut is redacted twice, cut and with this much more of it, and only
+ * what the two agree on is sent: a secret the cut splits is whole, and
+ * masked, in the longer text, and the two part where it starts. A secret
+ * longer than this that a cut splits can still leave its start behind.
+ */
+const REDACTION_LOOKAHEAD = 4 * 1024;
 
 /**
  * Longest `context` the collector accepts. It does not cut a longer one down:
@@ -232,11 +246,8 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     this.observeAgentSharedBuffer.pushLogs([this.toLogEntry(partialLine)]);
   }
 
-  private toLogEntry(rawLine: string) {
-    const line =
-      rawLine.length > MAX_PARSED_LINE_LENGTH
-        ? rawLine.slice(0, MAX_PARSED_LINE_LENGTH)
-        : rawLine;
+  private toLogEntry(line: string) {
+    // Parsed whole: see `MAX_REDACTED_LENGTH`.
     const parsed = parseLogLine(line);
 
     const store = this.als.getStore();
@@ -274,13 +285,51 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       // which is also before the buffer truncates oversized lines. That order is
       // deliberate: truncating first would cut a long secret in half and ship
       // the surviving half.
-      attributes: this.redactor
-        ? this.redactor.redactAttributes(parsed.attributes)
-        : parsed.attributes,
-      text: this.redactor
-        ? this.redactor.redactMessage(parsed.message)
-        : parsed.message,
+      //
+      // A line too long for the redactor's window goes without its attributes:
+      // its length is the only bound on theirs, and every string in them would
+      // need the window too.
+      attributes:
+        line.length > MAX_REDACTED_LENGTH
+          ? undefined
+          : this.redactor
+            ? this.redactor.redactAttributes(parsed.attributes)
+            : parsed.attributes,
+      text: this.redact(parsed.message),
     };
+  }
+
+  /**
+   * `text` redacted, and cut where it has to be: to its first `keep`
+   * characters, and to what the redactor's window leaves room to send.
+   *
+   * Text that fits whole is redacted whole - the common case, one pass. Text
+   * that has to be cut is redacted cut and with `REDACTION_LOOKAHEAD` more of
+   * it, within the window, and only the prefix the two results share is sent:
+   * a secret the cut splits is masked in the longer one, so the two part
+   * before any of it.
+   */
+  private redact(text: string, keep: number = text.length): string {
+    const shown =
+      text.length > MAX_REDACTED_LENGTH
+        ? text.slice(0, MAX_REDACTED_LENGTH)
+        : text;
+    const sent = Math.min(
+      keep,
+      shown.length < text.length
+        ? MAX_REDACTED_LENGTH - REDACTION_LOOKAHEAD
+        : text.length,
+    );
+    if (!this.redactor) {
+      return sent < text.length ? text.slice(0, sent) : text;
+    }
+    if (sent >= text.length) {
+      return this.redactor.redactMessage(text);
+    }
+    return sharedPrefix(
+      this.redactor.redactMessage(text.slice(0, sent)),
+      this.redactor.redactMessage(shown),
+    );
   }
 
   /**
@@ -291,9 +340,25 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
    * cut to what the collector accepts.
    */
   private toContext(context: string): string {
-    const redacted = this.redactor
-      ? this.redactor.redactMessage(context)
-      : context;
-    return fitToLength(redacted, MAX_CONTEXT_LENGTH);
+    return fitToLength(this.redact(context), MAX_CONTEXT_LENGTH);
   }
+}
+
+/**
+ * The start `cut` and `whole` share, as a slice of `cut`. Never ends between
+ * the two halves of a surrogate pair, which would send half a character.
+ */
+function sharedPrefix(cut: string, whole: string): string {
+  const max = Math.min(cut.length, whole.length);
+  let at = 0;
+  while (at < max && cut.charCodeAt(at) === whole.charCodeAt(at)) {
+    at += 1;
+  }
+  if (at > 0 && at < cut.length) {
+    const last = cut.charCodeAt(at - 1);
+    if (last >= 0xd800 && last <= 0xdbff) {
+      at -= 1;
+    }
+  }
+  return at === cut.length ? cut : cut.slice(0, at);
 }

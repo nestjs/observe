@@ -436,6 +436,92 @@ describe("StdoutForwarderService", () => {
 
       expect(buffer.entries[0].text).toContain("***");
     });
+
+    describe("an over-long line", () => {
+      const password = "Pw-0123456789abcdef0123456789abcdef";
+
+      it("is still read as the structured line it is", () => {
+        const service = build();
+
+        // Cut before it was parsed, a long JSON line was no longer JSON: it
+        // went out as raw text, where nothing masks by key, and
+        // `passwordConfirmation` with it.
+        als.run(new Map([[TRACE_ID_KEY, "trace-signup"]]), () =>
+          write(
+            service,
+            `${JSON.stringify({
+              level: "warn",
+              message: "signup rejected",
+              context: "SignupController",
+              form: {
+                password,
+                passwordConfirmation: password,
+                bio: "x".repeat(17_000),
+              },
+            })}\n`,
+          ),
+        );
+
+        expect(buffer.entries).toHaveLength(1);
+        expect(JSON.stringify(buffer.entries[0])).not.toContain("Pw-0123");
+        expect(buffer.entries[0]).toMatchObject({
+          text: "signup rejected",
+          level: "warn",
+          context: "SignupController",
+          traceId: "trace-signup",
+        });
+        // Sent without them: every string in them would need the window too.
+        expect(buffer.entries[0].attributes).toBeUndefined();
+      });
+
+      it("never sends a secret the redactor's window cut in two", () => {
+        const service = build();
+
+        // `token=AAAA…` shrinks to `token=[REDACTED]`, which pulls whatever
+        // sat at the window's edge into what ships - here the first 17
+        // characters of a quoted key whose closing quote lay past the edge.
+        const key = "c0ffee".repeat(10);
+        const padding = 16 * 1024 - "token=".length - ' apiKey="'.length - 17;
+        write(service, `token=${"A".repeat(padding)} apiKey="${key}" done\n`);
+
+        expect(buffer.entries).toHaveLength(1);
+        expect(buffer.entries[0].text).toMatch(/^token=\[REDACTED\]/);
+        expect(buffer.entries[0].text).not.toContain("c0ffee");
+      });
+
+      it("keeps a secret that lies whole inside the window masked", () => {
+        const service = build();
+
+        write(service, `password=hunter2secret ${"word ".repeat(5_000)}\n`);
+
+        expect(buffer.entries[0].text).toMatch(/^password=\[REDACTED\] word/);
+        expect(buffer.entries[0].text).not.toContain("hunter2");
+      });
+
+      it("bounds the context as it bounds the message", () => {
+        const service = build();
+
+        write(
+          service,
+          `${JSON.stringify({
+            level: "info",
+            message: "ready",
+            context: `token=${"B".repeat(20_000)}`,
+          })}\n`,
+        );
+
+        expect(buffer.entries[0].context).toBe("token=[REDACTED]");
+      });
+
+      it("is cut, unredacted, when redaction is off", () => {
+        const service = build({ redaction: { enabled: false } });
+
+        write(service, `password=hunter2 ${"y".repeat(20_000)}\n`);
+
+        expect(buffer.entries[0].text).toMatch(/^password=hunter2 y/);
+        expect(buffer.entries[0].text.length).toBeLessThanOrEqual(16 * 1024);
+      });
+    });
   });
 
   describe("patching stdout", () => {
