@@ -77,7 +77,7 @@ class OrdersController {
 /**
  * Both handlers must be open before either finishes: sequential calls cannot
  * reveal a snapshot overwritten by a second operation with the same public id.
- * Each transport also needs its own proof, since gRPC starts from a timer.
+ * Each transport also needs its own proof: gRPC has a start hook of its own.
  */
 describe.each([
   ["TCP", Transport.TCP],

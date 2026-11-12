@@ -498,9 +498,29 @@ describe("RpcObserveAgentService", () => {
           await expect(
             Promise.resolve(startHook(transportId, {}, done)),
           ).rejects.toBe(error);
-          // gRPC calls done from a timer; let it fire so an extra call counts.
+          // Let any timer fire, so an extra call would count.
           await new Promise((resolve) => setTimeout(resolve, 0));
           expect(done).toHaveBeenCalledTimes(2);
+        },
+      );
+
+      it.each([
+        ["traced", {}],
+        ["ignored", { ignore: true }],
+        ["sampled out", { capture: false }],
+      ])(
+        "has run done by the time it returns when the operation is %s",
+        (_operation, overrides) => {
+          // Nest listens for a gRPC call's `cancelled` and `end` inside done,
+          // and grpc-js emits `cancelled` once: a call whose deadline expired
+          // on arrival, run a tick later, left a client-streaming handler
+          // waiting on a request stream that never ended.
+          const startHook = captureStartHook(createHookedAgent(overrides));
+          const done = vi.fn(async () => "handled");
+
+          void startHook(transportId, {}, done);
+
+          expect(done).toHaveBeenCalledOnce();
         },
       );
     });

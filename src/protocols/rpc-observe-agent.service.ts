@@ -282,7 +282,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       );
       store.set(this.options.traceIdKey, traceId);
 
-      // The key must precede callbacks here too, before the deferred startup.
+      // The key must precede callbacks here too.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
 
@@ -307,41 +307,41 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         "grpc",
       );
 
-      return new Promise<unknown>((resolve) => {
-        // A throw in this timer escapes the promise: `done()` never runs, and
-        // the exception is uncaught. Both decisions below are guarded.
-        setTimeout(() => {
-          if (
-            shouldIgnoreSafely(
-              this.options.grpc?.ignore,
-              [call],
-              this.options.grpc,
-              this.logger,
-              "grpc",
-            )
-          ) {
-            return resolve(done());
-          }
+      // `done` runs before the hook returns, as for any other transport. Nest
+      // listens for the call's `cancelled` and `end` events inside it, and
+      // grpc-js emits `cancelled` once: run from a timer, a call cancelled or
+      // past its deadline on arrival had nothing listening, and a
+      // client-streaming handler waited for good on a request stream that
+      // never ended, its trace held in the registry.
+      if (
+        shouldIgnoreSafely(
+          this.options.grpc?.ignore,
+          [call],
+          this.options.grpc,
+          this.logger,
+          "grpc",
+        )
+      ) {
+        return done();
+      }
 
-          const shouldCapture = this.traceSamplerService.shouldCapture("grpc", {
-            call,
-          });
-          if (!shouldCapture) {
-            return resolve(done());
-          }
-          this.operationTraceRegistry.startTrace(
-            registryKey,
-            {
-              protocol: this.toProtocolName(transportId),
-              operationId: call.operationId,
-              tags: this.options.grpc?.tags,
-            },
-            traceId,
-            traceContext,
-          );
-          resolve(done());
-        }, 0);
+      const shouldCapture = this.traceSamplerService.shouldCapture("grpc", {
+        call,
       });
+      if (!shouldCapture) {
+        return done();
+      }
+      this.operationTraceRegistry.startTrace(
+        registryKey,
+        {
+          protocol: this.toProtocolName(transportId),
+          operationId: call.operationId,
+          tags: this.options.grpc?.tags,
+        },
+        traceId,
+        traceContext,
+      );
+      return done();
     });
   }
 
@@ -425,9 +425,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         // `toProtocolName` - and there is no universal accessor for its
         // routing key. Throwing here would fail the message before `done()`
         // ever ran, so fall back to a conventional accessor when one exists.
-        const pattern = (
-          ctx as { getPattern?: () => unknown }
-        )?.getPattern?.();
+        const pattern = (ctx as { getPattern?: () => unknown })?.getPattern?.();
         return typeof pattern === "string" ? pattern : "unknown";
       }
     }
