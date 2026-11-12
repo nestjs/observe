@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 
 /** The variables `ObserveModule` falls back to for its key pair. */
 export const KEY_VARIABLE = "OBSERVE_APP_KEY";
@@ -74,6 +75,52 @@ export function writeEnvFile(cwd: string, appKey: string, appSecret: string) {
   ];
   writeFileSync(path, lines.join("\n"), existing ? undefined : { mode: 0o600 });
   return path;
+}
+
+/**
+ * `.env` as a path relative to `cwd` when git already tracks the file it is -
+ * itself, or what it links to - or undefined: not tracked, not in a
+ * repository, or no git to ask.
+ *
+ * An ignore rule does not apply to a file in the index, so the secret written
+ * into a tracked `.env` would be in the next `git commit -a` whatever
+ * `.gitignore` says. Git is asked with its arguments fixed, from Node's own
+ * directory and pointed at the project with `-C`, and with the two settings
+ * a project's own `.git/config` could use to run a program turned off:
+ * `core.fsmonitor`, which `ls-files` would start, and the discovery of a bare
+ * repository that only sits in the checkout.
+ */
+export function trackedEnvFile(cwd: string): string | undefined {
+  let root: string;
+  try {
+    root = realpathSync(cwd);
+  } catch {
+    return undefined;
+  }
+  let path = join(root, ".env");
+  try {
+    path = realpathSync(path);
+  } catch {
+    // Not there yet, though it may still be in the index.
+  }
+  const { status } = spawnSync(
+    "git",
+    [
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "safe.bareRepository=explicit",
+      "--literal-pathspecs",
+      "-C",
+      dirname(path),
+      "ls-files",
+      "--error-unmatch",
+      "--",
+      basename(path),
+    ],
+    { cwd: dirname(process.execPath), stdio: "ignore", timeout: 10_000 },
+  );
+  return status === 0 ? relative(root, path) || ".env" : undefined;
 }
 
 /**

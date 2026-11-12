@@ -10,6 +10,7 @@ import {
   ensureEnvIgnored,
   isEnvFileValue,
   readPackageName,
+  trackedEnvFile,
   writeEnvFile,
 } from "./project-files.js";
 import {
@@ -101,6 +102,15 @@ export async function link(
   );
   if (setup.unsupported) {
     deps.log(`${setup.unsupported}. Nothing was written.`);
+    return 1;
+  }
+  // Before a code is asked for: no pair is issued for a project it cannot
+  // be kept out of git in.
+  const tracked = trackedEnvFile(options.cwd);
+  if (tracked) {
+    deps.log(
+      `${tracked} is tracked by git, so the secret link writes into it would be in your next commit, whatever .gitignore says. Run git rm --cached ${tracked}, which keeps the file, and link again. Nothing was written.`,
+    );
     return 1;
   }
   const manager = detectPackageManager(options.cwd);

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -320,6 +321,64 @@ describe("npx @nestjs/observe link", () => {
       TypeError,
     );
     expect(existsSync(join(cwd, ".env"))).toBe(false);
+  });
+
+  describe("in a git repository", () => {
+    // Git as installed, but none of this machine's own configuration.
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@example.com",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@example.com",
+        },
+        stdio: "ignore",
+      });
+
+    beforeEach(() => git("init", "-q"));
+
+    // An ignore rule does not apply to a file git already tracks: the
+    // secret would be in the next commit, whatever .gitignore says.
+    it.each([
+      [
+        "committed",
+        () => {
+          writeFileSync(join(cwd, ".gitignore"), "node_modules\n");
+          writeFileSync(join(cwd, ".env"), "PORT=3000\n");
+        },
+      ],
+      [
+        "force-added under an ignore rule",
+        () => writeFileSync(join(cwd, ".env"), "PORT=3000\n"),
+      ],
+    ])(
+      "turns the project away, before asking for a code, when .env is %s",
+      async (_name, prepare) => {
+        prepare();
+        git("add", "-f", ".env");
+        git("commit", "-q", "-m", "init");
+        const h = harness([{ status: 200, body: LINKED }]);
+
+        expect(await run(h)).toBe(1);
+
+        expect(h.requests).toEqual([]);
+        expect(h.lines.join("\n")).toContain(".env is tracked by git");
+        expect(read(".env")).toBe("PORT=3000\n");
+      },
+    );
+
+    it("links as usual when .env is not tracked", async () => {
+      writeFileSync(join(cwd, ".env"), "PORT=3000\n");
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(0);
+      expect(read(".env")).toContain("OBSERVE_APP_SECRET=");
+    });
   });
 
   it("replaces an earlier pair and keeps the rest of .env", async () => {
