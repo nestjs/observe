@@ -248,6 +248,30 @@ describe("parseLogLine", () => {
     });
   });
 
+  describe("a bracket read as the context", () => {
+    it("is kept in one piece with the message as well", () => {
+      // Only a guess at a context: `Logger.log("[1, 2] done")` prints the
+      // same line. Whoever redacts the halves needs the whole.
+      expect(
+        parseLogLine(
+          "[Nest] 1234  - 07/29/2026, 10:42:18 AM     LOG [1, 2]  done Trace ID: abc-123",
+        ),
+      ).toMatchObject({
+        context: "1, 2",
+        message: "done",
+        unsplit: "[1, 2]  done",
+        traceId: "abc-123",
+      });
+    });
+
+    it("is not there for a line without one", () => {
+      expect(
+        parseLogLine("[Nest] 1234  - 07/29/2026, 10:42:18 AM     LOG done")
+          .unsplit,
+      ).toBeUndefined();
+    });
+  });
+
   describe("format", () => {
     it("says what a line was read as", () => {
       expect(parseLogLine('{"level":"info","message":"ready"}').format).toBe(

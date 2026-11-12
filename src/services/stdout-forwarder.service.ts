@@ -373,7 +373,9 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       } else {
         messages.push({
           head: parsed,
-          lines: [parsed.message],
+          // A bracket read as the context is redacted with the message - see
+          // `splitContext`.
+          lines: [parsed.unsplit ?? parsed.message],
           longest: line.length,
         });
       }
@@ -393,13 +395,19 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       }
       const redacted = this.redact(text, keep);
       const texts = head.format === "json" ? [redacted] : redacted.split("\n");
-      for (const [at, part] of texts.entries()) {
-        entries.push(
-          // The lines under the first had no prefix of their own.
-          at === 0
-            ? this.toLogEntry(part, store, head, message.longest)
-            : this.toLogEntry(part, store),
-        );
+      const first = this.splitContext(head, texts[0]);
+      entries.push(
+        this.toLogEntry(
+          first.text,
+          store,
+          head,
+          first.context,
+          message.longest,
+        ),
+      );
+      // The lines under the first had no prefix of their own.
+      for (let at = 1; at < texts.length; at += 1) {
+        entries.push(this.toLogEntry(texts[at], store));
       }
     }
     if (read < lines.length) {
@@ -431,16 +439,54 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * The context and the text of a message's first line, `line` redacted.
+   *
+   * On a text line the context is a guess: the first `[...]` after the level.
+   * A line logged without a context reads the same when its message opens
+   * with `[` - `Logger.log(JSON.stringify(users))` - and the bracket then
+   * closes at the message's first `]`, wherever that falls. Inside a
+   * password, neither half matched a rule redacted apart, and both went out.
+   * So the bracket was redacted together with the message, as written, and
+   * the guess is kept only when the context, redacted by itself, is how the
+   * line still opens. When a mask runs across the bracket the line is sent
+   * whole, without a context. Either way both fields are cut from the line
+   * redacted whole.
+   */
+  private splitContext(
+    head: ParsedLogLine,
+    line: string,
+  ): { context?: string; text: string } {
+    if (head.unsplit === undefined) {
+      return {
+        context:
+          head.context === undefined ? undefined : this.toContext(head.context),
+        text: line,
+      };
+    }
+    const context = this.redact(head.context ?? "");
+    if (!line.startsWith(`[${context}`)) {
+      return { text: line };
+    }
+    return {
+      context: fitToLength(context, MAX_CONTEXT_LENGTH),
+      // A value without quotes runs on to the next space and takes the
+      // bracket's own `]` with it: `[token=abc] login`.
+      text: line.slice(context.length + 1).replace(/^\]?\s*/, ""),
+    };
+  }
+
+  /**
    * `text` is redacted by now; `parsed` is the line it opens, when that line
-   * said more than its text. `longest` is the longest line `text` was read
-   * from: a line too long for the redactor's window goes without its
-   * attributes, whose length only it bounds - every string in them would need
-   * the window too.
+   * said more than its text, and `context` that line's, redacted. `longest`
+   * is the longest line `text` was read from: a line too long for the
+   * redactor's window goes without its attributes, whose length only it
+   * bounds - every string in them would need the window too.
    */
   private toLogEntry(
     text: string,
     store: Store | undefined,
     parsed?: ParsedLogLine,
+    context?: string,
     longest = 0,
   ): LogEntry {
     const contextTraceId = store?.get(this.options.traceIdKey);
@@ -469,10 +515,7 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
           ? store?.get(CALLER_METADATA_KEY)
           : undefined,
       level: parsed?.level,
-      context:
-        parsed?.context === undefined
-          ? undefined
-          : this.toContext(parsed.context),
+      context,
       // Redaction happens before the entry reaches the shared buffer - which
       // is also before the buffer truncates oversized lines. That order is
       // deliberate: truncating first would cut a long secret in half and ship

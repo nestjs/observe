@@ -566,6 +566,63 @@ describe("StdoutForwarderService", () => {
       );
 
       expect(buffer.entries[0].context).toBe("token=[REDACTED]");
+      expect(buffer.entries[0].text).toBe("login");
+    });
+
+    describe("a bracket read as the context", () => {
+      const NEST_LOG = "[Nest] 1  - 07/29/2026, 10:42:18 AM     LOG";
+
+      it("does not cut a secret in two at its first ]", () => {
+        const service = build();
+
+        // Logged without a context, a message that opens with `[` reads as
+        // one, closed at the message's first `]` - here inside the password.
+        // Redacted apart, neither half matched a rule.
+        write(
+          service,
+          `${NEST_LOG} [{"email":"alice@example.com","password":"s3cr]etV4lue"}]\n`,
+        );
+
+        const sent = JSON.stringify(buffer.entries);
+        expect(sent).not.toContain("s3cr");
+        expect(sent).not.toContain("etV4lue");
+        // Where the context ends then depends on where the redactor's mask
+        // falls; either way both fields are cut from the line redacted whole.
+        expect(buffer.entries).toHaveLength(1);
+        expect(buffer.entries[0].level).toBe("log");
+        expect(sent).toContain('\\"password\\":[REDACTED]');
+      });
+
+      it("does not send the rest of a credential that runs on past it", () => {
+        const service = build();
+
+        write(
+          service,
+          `${NEST_LOG} [Authorization: Bearer abc]defghijklmnop sent\n`,
+        );
+
+        expect(JSON.stringify(buffer.entries)).not.toContain("defghijk");
+      });
+
+      it("keeps a bracket that is only a guess when nothing in it is masked", () => {
+        const service = build();
+
+        write(service, `${NEST_LOG} [1, 2] done\n`);
+
+        expect(buffer.entries).toMatchObject([
+          { context: "1, 2", text: "done" },
+        ]);
+      });
+
+      it("keeps it apart when redaction is off", () => {
+        const service = build({ redaction: { enabled: false } });
+
+        write(service, `${NEST_LOG} [AppService]   started\n`);
+
+        expect(buffer.entries).toMatchObject([
+          { context: "AppService", text: "started" },
+        ]);
+      });
     });
 
     it("is on by default, because forwarding moves logs onto another machine", () => {

@@ -19,6 +19,13 @@ export interface ParsedLogLine {
   level?: LogLevel;
   context?: string;
   message: string;
+  /**
+   * On a text line whose context was read off a bracket: the bracket and the
+   * message as they were written, in one piece. The bracket is only a guess
+   * at a context - a line logged without one reads the same when its message
+   * opens with `[` - so whoever redacts the two needs them whole.
+   */
+  unsplit?: string;
   traceId?: string;
   attributes?: Record<string, unknown>;
   /**
@@ -54,7 +61,7 @@ const ANSI_PATTERN = /\x1B\[[0-9;]*[A-Za-z]/g;
  * precedes the level, and nothing after the level can fail.
  */
 const NEST_TEXT_PATTERN =
-  /^\[Nest\]\s+\d+\s+-\s+\S.*?\s(FATAL|ERROR|WARN|LOG|DEBUG|VERBOSE)\s+(?:\[([^\]]+)\]\s*)?([\s\S]*)$/;
+  /^\[Nest\]\s+\d+\s+-\s+\S.*?\s(FATAL|ERROR|WARN|LOG|DEBUG|VERBOSE)\s+(\[([^\]]+)\]\s*)?([\s\S]*)$/;
 
 /**
  * Marker LoggerPatcherService puts before the trace id it appends when a trace
@@ -163,7 +170,7 @@ function parseNestText(line: string): ParsedLogLine | null {
     return null;
   }
 
-  const [, level, context, rest] = match;
+  const [, level, bracket, context, rest] = match;
   const { message, traceId } = splitTraceIdSuffix(rest);
 
   return {
@@ -171,6 +178,7 @@ function parseNestText(line: string): ParsedLogLine | null {
     context: context || undefined,
     traceId,
     message,
+    unsplit: bracket === undefined ? undefined : bracket + message,
     format: "nest",
   };
 }
