@@ -1,5 +1,6 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
 import { admitsFinite, admitsReading } from "./finite-value.util.js";
+import { isLabelSet } from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -317,13 +318,13 @@ export class Counter<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot increment a counter with labels without specifying a label. For example, use `counter.increment({ route: '/login' })`.",
       );
     }
 
-    if (typeof labelOrValue === "object") {
+    if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
 
       const stringifiedLabel = stringifyLabel(labelOrValue);

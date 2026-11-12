@@ -1,6 +1,7 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
 import { admitsSeries, stringifyLabel } from "./counter.js";
 import { admitsFinite, admitsReading } from "./finite-value.util.js";
+import { isLabelSet } from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -205,13 +206,13 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot increment a gauge with labels without specifying a label. For example, use `gauge.increment({ route: '/login' })`.",
       );
     }
 
-    if (typeof labelOrValue === "object") {
+    if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
@@ -273,11 +274,11 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot decrement a gauge with labels without specifying a label. For example, use `gauge.decrement({ route: '/login' })`.",
       );
-    } else if (typeof labelOrValue === "object") {
+    } else if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
 
       const stringifiedLabel = stringifyLabel(labelOrValue);
@@ -332,11 +333,11 @@ export class Gauge<TLabel extends string = typeof DEFAULT_LABEL>
     labelOrValue?: Record<TLabel, string | number> | number,
     value?: number,
   ): void {
-    if (this.labels && typeof labelOrValue !== "object") {
+    if (this.labels && !isLabelSet(labelOrValue)) {
       throw new Error(
         "Cannot set value of a gauge with labels without specifying a label. For example, use `gauge.setValue({ route: '/login' }, 42)`.",
       );
-    } else if (typeof labelOrValue === "object") {
+    } else if (isLabelSet(labelOrValue)) {
       this.validateLabels(labelOrValue);
 
       const stringifiedLabel = stringifyLabel(labelOrValue);

@@ -619,3 +619,42 @@ describe("non-finite values", () => {
     expect(() => summary.observe(Number.NaN)).toThrow(/without specifying one/);
   });
 });
+
+/**
+ * What a number field of a JSON body holds when the client sent `null`, or
+ * when the sender serialised a NaN. Not a label object, though `typeof` says
+ * "object": taken for one, it reached `Object.keys(null)` and failed the
+ * request being measured.
+ */
+describe("a null in place of the value", () => {
+  const NULL = null as unknown as number;
+
+  it("is taken for a missing one by a counter", () => {
+    const counter = new Counter("orders");
+
+    expect(() => counter.increment(NULL)).not.toThrow();
+
+    expect(counter.getValue()).toBe(1);
+  });
+
+  it("is taken for a missing one by a gauge", () => {
+    const gauge = new Gauge("level", { initialValue: 5 });
+
+    expect(() => gauge.increment(NULL)).not.toThrow();
+    expect(() => gauge.decrement(NULL)).not.toThrow();
+    expect(gauge.getValue()).toBe(5);
+    gauge.setValue(9);
+    expect(() => gauge.setValue(NULL)).not.toThrow();
+    expect(gauge.getValue()).toBe(5);
+  });
+
+  it("is a missing label on a labelled metric", () => {
+    const counter = new Counter<"route">("hits", "d", ["route"]);
+    const gauge = new Gauge<"pool">("connections", { labels: ["pool"] });
+
+    expect(() => counter.increment(NULL)).toThrow(/without specifying a label/);
+    expect(() => gauge.increment(NULL)).toThrow(/without specifying a label/);
+    expect(() => gauge.decrement(NULL)).toThrow(/without specifying a label/);
+    expect(() => gauge.setValue(NULL)).toThrow(/without specifying a label/);
+  });
+});
