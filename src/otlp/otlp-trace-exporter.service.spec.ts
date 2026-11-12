@@ -490,6 +490,49 @@ describe("OtlpTraceExporter", () => {
     }
   }, 15_000);
 
+  // Node emits no response for a 101 with `Connection: Upgrade`: an export
+  // waiting on one would never settle, and every export after it would wait
+  // behind it for the life of the process.
+  it("drops an export answered with an upgrade nobody asked for, and sends the next", async () => {
+    let connections = 0;
+    const upgrading = createServer((connection) => {
+      connections += 1;
+      const first = connections === 1;
+      connection.on("error", () => undefined);
+      connection.once("data", () =>
+        connection.write(
+          first
+            ? "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            : "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        ),
+      );
+    });
+    const port = await freePort();
+    await new Promise<void>((resolve) =>
+      upgrading.listen(port, "127.0.0.1", resolve),
+    );
+    const exporter = exporterFor(`http://127.0.0.1:${port}`);
+    try {
+      exporter.exportRequestSnapshot(snapshot());
+      exporter.flush();
+      await waitFor(
+        () =>
+          warn.mock.calls.some((call: unknown[]) =>
+            String(call[0]).includes("101"),
+          ),
+        3_000,
+        "the refusal",
+      );
+
+      exporter.exportRequestSnapshot(snapshot());
+      exporter.flush();
+      await waitFor(() => connections === 2, 3_000, "the next export");
+    } finally {
+      await exporter.onApplicationShutdown();
+      await new Promise((resolve) => upgrading.close(resolve));
+    }
+  });
+
   describe("against a receiver that keeps sending interim replies", () => {
     let chatty: Server;
     let sockets: Socket[];

@@ -55,15 +55,19 @@ const startWorker = (endpoint: string, bufferSize = 64 * 1024) => {
 
   let sent = 0;
   let failure: string | undefined;
+  let exited: number | undefined;
+  const errors: string[] = [];
   const waiters: Array<() => void> = [];
   worker.on("message", (msg: string) => {
     if (msg === SENT) {
       sent += 1;
     } else if (msg.startsWith("Error:")) {
       failure = msg;
+      errors.push(msg);
     }
     waiters.splice(0).forEach((wake) => wake());
   });
+  worker.on("exit", (code) => (exited = code));
 
   const sends = (count: number) =>
     new Promise<void>((resolve, reject) => {
@@ -88,6 +92,11 @@ const startWorker = (endpoint: string, bufferSize = 64 * 1024) => {
   return {
     send: (batch: unknown) => writeBatch(sharedBuffer, JSON.stringify(batch)),
     sends,
+    /** Every error the worker reported, which `sends` would fail on. */
+    errors,
+    /** Forgets a reported error, for a case that expects one. */
+    forgive: () => (failure = undefined),
+    exitCode: () => exited,
     stop: () => worker.terminate(),
   };
 };
@@ -207,6 +216,48 @@ describe("the detached worker's connection to the collector", () => {
     await worker.sends(1);
 
     expect(written).toBeLessThan(8 * 1024 * 1024);
+  }, 20_000);
+
+  // Node emits no response for a 101 with `Connection: Upgrade`, only an
+  // `upgrade` event, and destroys the socket without an error: a send that
+  // waits on neither would never settle, and the worker would end holding
+  // the shared buffer's lock - no telemetry again until a restart.
+  it("fails a send answered with an upgrade nobody asked for, and sends the next", async () => {
+    let connections = 0;
+    const upgrading = createNetServer((connection) => {
+      connections += 1;
+      const first = connections === 1;
+      connection.on("error", () => undefined);
+      connection.once("data", () =>
+        connection.write(
+          first
+            ? "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            : "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        ),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      upgrading.listen(0, "127.0.0.1", resolve),
+    );
+    try {
+      const { port } = upgrading.address() as { port: number };
+      worker = startWorker(`http://127.0.0.1:${port}`);
+      worker.send({ traces: [] });
+      for (let waited = 0; waited < 3_000; waited += 50) {
+        if (worker.errors.length > 0 || worker.exitCode() !== undefined) {
+          break;
+        }
+        await sleep(50);
+      }
+      expect(worker.exitCode()).toBeUndefined();
+      expect(worker.errors.join("\n")).toContain("101");
+
+      worker.forgive();
+      worker.send({ traces: [] });
+      await worker.sends(1);
+    } finally {
+      upgrading.close();
+    }
   }, 20_000);
 
   // A collector that answers off the head of a batch and stops reading: the

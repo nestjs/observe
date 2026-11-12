@@ -527,6 +527,19 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
         },
       );
       request.on("error", reject);
+      // A 101 with `Connection: Upgrade` is no response to Node: it emits
+      // only this, and destroys the socket without an error. Unheard, the
+      // export would never settle and every later one would wait behind it.
+      // No upgrade was asked for: it is a status like any other refusal.
+      request.on("upgrade", (response, socket) => {
+        socket.destroy();
+        resolve({
+          status: response.statusCode ?? 101,
+          retryAfter: undefined,
+          contentType: undefined,
+          body: "",
+        });
+      });
       // A limit on the export as a whole, which is what `timeoutMillis` is.
       // `request.setTimeout` measures silence on the socket instead and
       // starts over with every byte: a receiver that went on writing -

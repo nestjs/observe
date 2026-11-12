@@ -441,6 +441,21 @@ export const detachedObserveWorker = (
           ),
         ),
       );
+      // A 101 with `Connection: Upgrade` is no response to Node: it emits
+      // only this, and destroys the socket without an error. Unheard, the
+      // send would never settle, and the worker would end with the lock
+      // still held. No upgrade was asked for, so it fails like any other
+      // transport failure.
+      req.on("upgrade", (res: IncomingMessage, socket: { destroy(): void }) => {
+        socket.destroy();
+        reject(
+          new Error("request to the collector failed", {
+            cause: new Error(
+              `it answered ${res.statusCode} to a request that asked for no upgrade`,
+            ),
+          }),
+        );
+      });
       req.setTimeout(REQUEST_TIMEOUT_MS, () =>
         req.destroy(
           Object.assign(
