@@ -280,4 +280,52 @@ describe("encodeOtlpJson", () => {
       expect.objectContaining({ name: "OrdersService.find", kind: 1 }),
     );
   });
+
+  // Half a surrogate pair names no character. `JSON.stringify` writes it as
+  // a `\ud83d` escape, which a receiver reading strings strictly refuses -
+  // with the whole batch. It becomes U+FFFD, as the protobuf encoding has it.
+  it("writes half a surrogate pair as the protobuf encoding does, and a whole one as it is", () => {
+    const lone = "\ud83d";
+    const span: OtlpSpan = {
+      ...server,
+      name: `GET /search?q=${lone}`,
+      attributes: [
+        { key: `tag.${lone}`, value: `x${lone}y` },
+        { key: "tag.whole", value: "🙂" },
+      ],
+      // The second half alone, this time.
+      events: [{ ...server.events[0], name: "event \ude00" }],
+      status: { code: STATUS_CODE_ERROR, message: `${lone}boom` },
+    };
+    const json = encodeOtlpJson(
+      [{ key: "service.name", value: `orders${lone}` }],
+      scope,
+      [span],
+    );
+
+    expect(json).not.toMatch(/\\ud[89a-f][0-9a-f]{2}/i);
+    const fromProtobuf = decode(
+      encodeOtlpProtobuf(
+        [{ key: "service.name", value: `orders${lone}` }],
+        scope,
+        [span],
+      ),
+    );
+    const fromJson = JSON.parse(json) as typeof fromProtobuf;
+    const [encoded] = fromJson.resourceSpans[0].scopeSpans[0].spans;
+    const [decoded] = fromProtobuf.resourceSpans[0].scopeSpans[0].spans;
+    expect(encoded.name).toBe(decoded.name);
+    expect(encoded.name).toBe("GET /search?q=\ufffd");
+    expect(encoded.attributes).toEqual([
+      { key: "tag.\ufffd", value: { stringValue: "x\ufffdy" } },
+      { key: "tag.whole", value: { stringValue: "🙂" } },
+    ]);
+    expect(encoded.events).toEqual([
+      expect.objectContaining({ name: "event \ufffd" }),
+    ]);
+    expect(encoded.status).toEqual({ code: 2, message: "\ufffdboom" });
+    expect(fromJson.resourceSpans[0].resource.attributes).toEqual([
+      { key: "service.name", value: { stringValue: "orders\ufffd" } },
+    ]);
+  });
 });

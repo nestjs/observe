@@ -36,13 +36,26 @@ export function encodeOtlpJson(
   });
 }
 
+/**
+ * A string as a protobuf `string` field holds it, which is what the JSON
+ * encoding stands for. Half a surrogate pair names no character:
+ * `JSON.stringify` writes it as a `\ud83d` escape, and a receiver that reads
+ * JSON strings strictly refuses the whole request for it - every span of the
+ * batch, whoever's request put it there. It becomes U+FFFD, which is what
+ * the protobuf encoding's UTF-8 makes of it. With the `u` flag a whole pair
+ * is one character, outside the class.
+ */
+function jsonText(value: string): string {
+  return value.replace(/[\ud800-\udfff]/gu, "\ufffd");
+}
+
 function jsonSpan(span: OtlpSpan) {
   return {
     traceId: span.traceId,
     spanId: span.spanId,
     ...(span.parentSpanId ? { parentSpanId: span.parentSpanId } : {}),
     ...(span.traceState ? { traceState: span.traceState } : {}),
-    name: span.name,
+    name: jsonText(span.name),
     kind: span.kind,
     startTimeUnixNano: span.startTimeUnixNano.toString(),
     endTimeUnixNano: span.endTimeUnixNano.toString(),
@@ -51,26 +64,32 @@ function jsonSpan(span: OtlpSpan) {
       ? { droppedAttributesCount: span.droppedAttributesCount }
       : {}),
     ...(span.events.length > 0 ? { events: span.events.map(jsonEvent) } : {}),
-    ...(span.status ? { status: span.status } : {}),
+    ...(span.status ? { status: jsonStatus(span.status) } : {}),
     flags: span.flags,
   };
+}
+
+function jsonStatus({ code, message }: NonNullable<OtlpSpan["status"]>) {
+  return message === undefined
+    ? { code }
+    : { code, message: jsonText(message) };
 }
 
 function jsonEvent(event: OtlpEvent) {
   return {
     timeUnixNano: event.timeUnixNano.toString(),
-    name: event.name,
+    name: jsonText(event.name),
     attributes: event.attributes.map(jsonKeyValue),
   };
 }
 
 function jsonKeyValue({ key, value }: OtlpAttribute) {
-  return { key, value: jsonAnyValue(value) };
+  return { key: jsonText(key), value: jsonAnyValue(value) };
 }
 
 function jsonAnyValue(value: OtlpAttributeValue) {
   if (typeof value === "string") {
-    return { stringValue: value };
+    return { stringValue: jsonText(value) };
   }
   if (typeof value === "boolean") {
     return { boolValue: value };
