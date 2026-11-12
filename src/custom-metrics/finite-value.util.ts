@@ -26,8 +26,19 @@ export function admitsFinite(
 
   if (!state.warned) {
     state.warned = true;
+    // Only what the warning is about - a NaN, an Infinity, a missing value -
+    // is printed. Anything else got past the type at run time, a field of a
+    // request body say, and need not convert to a string at all: `{"toString":
+    // 1}` throws a TypeError and a deeply nested array a RangeError, out of
+    // the call this function exists not to fail. Nor is a string any
+    // particular length, or free of line breaks.
+    const refused: unknown = value;
+    const given =
+      typeof refused === "number" || refused === undefined || refused === null
+        ? String(refused)
+        : `a value of type ${typeof refused}`;
     console.warn(
-      `[observe] Metric "${metricName}" ignored ${value}, which is not a finite number. ` +
+      `[observe] Metric "${metricName}" ignored ${given}, which is not a finite number. ` +
         `Further ones are ignored without another warning. This usually means the value is ` +
         `computed from something that can be zero or missing (a division by a zero total, a failed parse).`,
     );

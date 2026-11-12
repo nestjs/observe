@@ -463,6 +463,68 @@ describe("non-finite values", () => {
     expect(warn.mock.calls[1][0]).toContain('"latency"');
   });
 
+  describe("a value that is not a number at run time", () => {
+    // What a field of a request body can hold: JSON parses `{"toString": 1}`
+    // into an object no string conversion survives, and a deeply nested array
+    // overflows the stack of one.
+    const deeplyNested = () => {
+      let nested: unknown = [];
+      for (let i = 0; i < 20_000; i++) {
+        nested = [nested];
+      }
+      return nested;
+    };
+    const unprintable = (): unknown[] => [
+      { toString: 1 },
+      deeplyNested(),
+      Symbol("amount"),
+    ];
+
+    it("ignores it rather than throwing from the warning", () => {
+      for (const value of unprintable()) {
+        const summary = new Summary("amount");
+        const counter = new Counter<"route">("hits", "d", ["route"]);
+        const gauge = new Gauge<"pool">("level", { labels: ["pool"] });
+
+        // Thrown from the warning, it failed the request being measured.
+        expect(() => summary.observe(value as number)).not.toThrow();
+        expect(() =>
+          counter.increment({ route: "/a" }, value as number),
+        ).not.toThrow();
+        expect(() =>
+          gauge.setValue({ pool: "main" }, value as number),
+        ).not.toThrow();
+
+        expect(summary.observations).toEqual({});
+        expect(counter.value).toEqual({});
+        expect(gauge.value).toEqual({ default: 0 });
+      }
+      expect(warn).toHaveBeenCalledTimes(9);
+      expect(warn.mock.calls[0][0]).toContain("a value of type object");
+      expect(warn.mock.calls[6][0]).toContain("a value of type symbol");
+    });
+
+    it("names a string by its type rather than echoing it", () => {
+      const summary = new Summary("amount");
+
+      summary.observe("12\u001b[2J" as unknown as number);
+
+      // Written to stderr as given, line breaks and escapes included.
+      expect(warn.mock.calls[0][0]).toContain("a value of type string");
+      expect(warn.mock.calls[0][0]).not.toContain("\u001b");
+    });
+
+    it("still prints the numbers the warning is about", () => {
+      new Summary("a").observe(Number.NaN);
+      new Summary("b").observe(Number.NEGATIVE_INFINITY);
+      new Summary("c").observe(undefined as unknown as number);
+
+      expect(warn.mock.calls[0][0]).toContain("ignored NaN");
+      expect(warn.mock.calls[1][0]).toContain("ignored -Infinity");
+      expect(warn.mock.calls[2][0]).toContain("ignored undefined");
+    });
+  });
+
   it("still throws for a mistake in the call, whatever the value", () => {
     // A missing label fails on every run rather than on unlucky data, so
     // refusing it quietly would only hide the bug.
