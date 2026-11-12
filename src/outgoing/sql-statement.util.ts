@@ -119,14 +119,17 @@ export type SqlDialect = "postgresql" | "mysql";
  *
  * MySQL quotes strings in `"` as well as `'`, as its default sql_mode does
  * (under ANSI_QUOTES a `"` name goes too), with backslash escapes in both -
- * NO_BACKSLASH_ESCAPES is not assumed - and `#` starts a comment. Its block
- * comments do not nest.
+ * NO_BACKSLASH_ESCAPES is not assumed - and `#` starts a comment. `--` does
+ * only before whitespace or a control character, as MySQL reads it:
+ * `credit--5` is `credit - -5`, and the rest of its line is still SQL, quotes
+ * and all. Its block comments do not nest.
  */
 const TOKEN: Record<SqlDialect, RegExp> = {
   postgresql:
     /(?<nested>\/\*)|(?<comment>--[^\n]*)|(?<name>"(?:[^"]|"")*(?:"|$)|`(?:[^`]|``)*(?:`|$))|(?<![\w$])(?<escape>[eE])'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|(?<plain>'(?:[^']|'')*(?:'|$))|(?<!\w)\$(?<tag>[A-Za-z_]*)\$[\s\S]*?(?:\$\k<tag>\$|$)/g,
   mysql:
-    /(?<comment>\/\*[\s\S]*?(?:\*\/|$)|--[^\n]*|#[^\n]*)|(?<name>`(?:[^`]|``)*(?:`|$))|'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|"(?:[^"\\]|\\[\s\S]?|"")*(?:"|$)/g,
+    // eslint-disable-next-line no-control-regex -- MySQL's rule for `--`.
+    /(?<comment>\/\*[\s\S]*?(?:\*\/|$)|--(?=[\u0000-\u0020\u007f]|$)[^\n]*|#[^\n]*)|(?<name>`(?:[^`]|``)*(?:`|$))|'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|"(?:[^"\\]|\\[\s\S]?|"")*(?:"|$)/g,
 };
 
 function stripLiteralsAndComments(sql: string, dialect: SqlDialect): string {

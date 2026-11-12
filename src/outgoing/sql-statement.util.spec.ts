@@ -237,6 +237,24 @@ describe("describeSqlStatement for MySQL", () => {
     ],
     ["SELECT /* outer /* inner */ 1", "SELECT ?"],
     ["SELECT a$$b$$, $$c FROM t", "SELECT a$$b$$, $$c FROM t"],
+    // `--` opens a comment only before whitespace or a control character:
+    // `credit--5` is `credit - -5`, and what follows it is still SQL.
+    [
+      "UPDATE accounts SET credit=credit--5, memo='see ticket\nsecret line' WHERE account_key='secret-key'",
+      "UPDATE accounts SET credit=credit-?, memo=? WHERE account_key=?",
+    ],
+    [
+      "SELECT credit--5 /* user:42\nsession:abc */ FROM t",
+      "SELECT credit-? FROM t",
+    ],
+    ["SELECT 1 --\tuser=secret@example.com\nFROM t", "SELECT ? FROM t"],
+    ["SELECT 1 --\r\nFROM t", "SELECT ? FROM t"],
+    ["SELECT 1 --", "SELECT ?"],
+    // The comment ends at the line feed that makes it one.
+    [
+      "SELECT * --\nFROM t WHERE a = 'x\ny' AND k = 'secret-value'",
+      "SELECT * FROM t WHERE a = ? AND k = ?",
+    ],
   ])("%s", (sql, statement) => {
     expect(describeSqlStatement(sql, "mysql").statement).toBe(statement);
   });
