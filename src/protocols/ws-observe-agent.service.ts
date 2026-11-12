@@ -41,6 +41,27 @@ const ORIGINAL_CREATE = Symbol.for("nestjs.observe.ws.create");
 /** `@nestjs/websockets`' MESSAGE_METADATA - what `@SubscribeMessage()` writes. */
 const MESSAGE_METADATA = "message";
 
+/** The traces a client's messages still hold open. */
+interface ClientTraces {
+  /** One abandon per open trace, removed as the trace ends. */
+  readonly open: Set<() => void>;
+  /** Set once the client's disconnect has been seen. */
+  gone: boolean;
+}
+
+/** The surface of a socket.io or `ws` socket read here, structurally typed. */
+interface ClientLike {
+  once?: (event: string, listener: () => void) => unknown;
+  disconnect?: unknown;
+  disconnected?: unknown;
+  readyState?: unknown;
+}
+
+/** `ws`' `WebSocket.CLOSED`. */
+const WS_CLOSED = 3;
+
+const noop = () => undefined;
+
 /**
  * Gateway message tracing for `@nestjs/websockets`.
  *
@@ -54,6 +75,7 @@ const MESSAGE_METADATA = "message";
 @Injectable()
 export class WsObserveAgentService<Store extends Record<string, unknown>> {
   private readonly logger = new Logger(WsObserveAgentService.name);
+  private readonly tracesByClient = new WeakMap<object, ClientTraces>();
 
   constructor(
     private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
@@ -165,6 +187,67 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
     return routed;
   }
 
+  /**
+   * Drops a message's trace when its client goes away before the handler
+   * settles, and returns what stops watching for that once the trace ends.
+   *
+   * A handler waiting on its client - an acknowledgement without a timeout,
+   * the client's next frame - never settles once the client has gone, and
+   * nothing else would end its trace: every client that hung up on one left
+   * its snapshot registered for the life of the process, and a client that
+   * reconnects can leave as many as it likes.
+   *
+   * One listener per client, however many messages it has in flight, on the
+   * events Nest's adapters stop a client's messages at: socket.io's
+   * `disconnect`, `ws`' `close`. Dropped at once, as the HTTP agent drops an
+   * aborted request: an abandoned trace is never reported, and the registry
+   * lets a handler that outlives its client end its spans on a trace that is
+   * gone. A client that is no event emitter - a custom adapter's - is not
+   * watched.
+   */
+  private abandonWhenClientLeaves(
+    client: unknown,
+    abandon: () => void,
+  ): () => void {
+    const socket = client as ClientLike | null | undefined;
+    if (typeof socket?.once !== "function") {
+      return noop;
+    }
+    let traces = this.tracesByClient.get(socket);
+    if (!traces) {
+      const watched: ClientTraces = { open: new Set(), gone: false };
+      try {
+        socket.once(
+          typeof socket.disconnect === "function" ? "disconnect" : "close",
+          () => {
+            watched.gone = true;
+            for (const abandonTrace of watched.open) {
+              abandonTrace();
+            }
+            watched.open.clear();
+          },
+        );
+      } catch {
+        return noop;
+      }
+      this.tracesByClient.set(socket, watched);
+      traces = watched;
+    }
+    // Gone before the message was traced: a request-scoped gateway resolves
+    // its instance before the chain runs, and the client can leave meanwhile.
+    if (
+      traces.gone ||
+      socket.disconnected === true ||
+      socket.readyState === WS_CLOSED
+    ) {
+      abandon();
+      return noop;
+    }
+    const open = traces.open;
+    open.add(abandon);
+    return () => void open.delete(abandon);
+  }
+
   private traceMessage(message: WsMessageContext, invoke: () => unknown) {
     // Always a store of its own: whatever context the socket's events happen
     // to fire in - the upgrade request, a polling request - is not this
@@ -205,7 +288,26 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
         tags: this.options.ws?.tags,
       });
 
+      // Ended or dropped once, whichever comes first: the handler settling,
+      // or its client leaving.
+      let open = true;
+      let unwatch: () => void = noop;
+      const abandon = () => {
+        if (!open) {
+          return;
+        }
+        open = false;
+        unwatch();
+        this.operationTraceRegistry.abandonTrace(traceId);
+      };
+      unwatch = this.abandonWhenClientLeaves(message.client, abandon);
+
       const endTrace = () => {
+        if (!open) {
+          return;
+        }
+        open = false;
+        unwatch();
         deferTraceCompletion(
           async () => {
             this.operationTraceRegistry.endTrace(traceId, {

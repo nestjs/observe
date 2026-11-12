@@ -12,11 +12,13 @@ import { NestFactory } from "@nestjs/core";
 import { IoAdapter } from "@nestjs/platform-socket.io";
 import { WsAdapter } from "@nestjs/platform-ws";
 import {
+  ConnectedSocket,
   MessageBody,
   SubscribeMessage,
   WebSocketGateway,
   WsException,
 } from "@nestjs/websockets";
+import { EventEmitter } from "events";
 import { createServer, Server } from "http";
 import { connect } from "net";
 import pg from "pg";
@@ -26,6 +28,7 @@ import { WebSocket } from "ws";
 import { ObserveOptions } from "../interfaces/observe-options.interface.js";
 import { CompleteTraceEventNode } from "../interfaces/trace-events.interfaces.js";
 import { createObserveModule } from "../observe.module.js";
+import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
 import { nestMajor } from "../testing/nest-version.js";
 import {
@@ -58,6 +61,13 @@ const postgresReachable = await new Promise<boolean>((resolve) => {
 
 let downstreamUrl = "";
 let pool: pg.Pool | undefined;
+
+/** `hold` handlers still waiting: their trace, their socket, and their answer. */
+const holding: Array<{
+  traceId: string | null;
+  socket: EventEmitter;
+  answer: () => void;
+}> = [];
 
 @Injectable()
 class MembersOnlyGuard implements CanActivate {
@@ -144,6 +154,19 @@ class DeskGateway {
   @SubscribeMessage("sampled-out")
   sampledOut() {
     return { event: "sampled-out-done", data: null };
+  }
+
+  // Waits for what only its client could supply - an acknowledgement, the
+  // next frame - until the test answers for it.
+  @SubscribeMessage("hold")
+  hold(@ConnectedSocket() socket: EventEmitter) {
+    return new Promise((resolve) => {
+      holding.push({
+        traceId: this.tracer.currentTraceId(),
+        socket,
+        answer: () => resolve({ event: "held", data: true }),
+      });
+    });
   }
 }
 
@@ -247,7 +270,7 @@ async function bootApp(platform: Platform, ws: ObserveOptions["ws"]) {
   const port = await freePort();
   await app.listen(port);
   const client = await connectClient(platform, port);
-  return { app, collected, client, sampled };
+  return { app, collected, client, sampled, port };
 }
 
 const spansOf = (
@@ -303,11 +326,14 @@ describe.each<Platform>(["ws", "socket.io"])(
       let collected: CollectedSnapshots;
       let client: TestClient;
       let sampled: Array<{ protocol: string; attributes: unknown }>;
+      let port: number;
+      let registry: OperationTraceRegistry;
 
       beforeAll(async () => {
-        ({ app, collected, client, sampled } = await bootApp(platform, {
+        ({ app, collected, client, sampled, port } = await bootApp(platform, {
           setAttributes: (message) => ({ pattern: message.pattern }),
         }));
+        registry = app.get(OperationTraceRegistry, { strict: false });
         // After the app: the agent patches the driver from its constructor.
         if (postgresReachable) {
           pool = new pg.Pool({ ...PG, max: 2 });
@@ -519,6 +545,41 @@ describe.each<Platform>(["ws", "socket.io"])(
           protocol: "ws",
           attributes: { gateway: "DeskGateway", pattern: "sampled-out" },
         });
+      });
+
+      it("drops the traces of a client's waiting handlers when it leaves, watching it with one listener however many it sends", async () => {
+        holding.length = 0;
+        const leaving = await connectClient(platform, port);
+        const leftAt = platform === "ws" ? "close" : "disconnect";
+
+        leaving.send("hold");
+        await waitFor(() => holding.length === 1, 3_000, "a handler to wait");
+        const { socket } = holding[0];
+        const listeners = socket.listenerCount(leftAt);
+        leaving.send("hold");
+        leaving.send("hold");
+        await waitFor(() => holding.length === 3, 3_000, "three handlers");
+
+        expect(socket.listenerCount(leftAt)).toBe(listeners);
+        const traceIds = holding.map(({ traceId }) => traceId as string);
+        expect(traceIds.every((traceId) => registry.hasTrace(traceId))).toBe(
+          true,
+        );
+
+        leaving.close();
+        await waitFor(
+          () => traceIds.every((traceId) => !registry.hasTrace(traceId)),
+          3_000,
+          "the traces to be dropped",
+        );
+
+        // Not reported either when the handlers settle after all: an
+        // abandoned trace stays abandoned.
+        for (const { answer } of holding) {
+          answer();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(collected.operationIds).not.toContain("DeskGateway:hold");
       });
     });
 
