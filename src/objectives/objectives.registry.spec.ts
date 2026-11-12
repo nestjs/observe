@@ -1,5 +1,7 @@
 import { All, Controller, Get, Logger, Version } from "@nestjs/common";
 import { DiscoveryService, MetadataScanner } from "@nestjs/core";
+import { METHODS } from "http";
+import { validateTelemetryPayload } from "../agent/telemetry-wire-contract.js";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { Objective } from "./objective.decorator.js";
 import { ObjectivesRegistry } from "./objectives.registry.js";
@@ -294,6 +296,58 @@ describe("ObjectivesRegistry", () => {
           String(call[0]).includes("longer than 255 characters"),
         ),
       ).toHaveLength(1);
+    });
+
+    describe("a handler routed for every method", () => {
+      class ProxyController {
+        @All("proxy")
+        @Objective({ availability: 99 })
+        proxy() {}
+      }
+      const request = (method: string) =>
+        snapshot([node("ProxyController", "proxy")], {
+          operationId: "/proxy",
+          attributes: { method },
+        });
+
+      it("declares nothing under a method longer than the collector takes, and says so once", () => {
+        const built = registry(ProxyController);
+
+        // Node parses it, Express routes it to `@All()`, and the collector
+        // takes a method of at most 10 characters - refusing the whole batch,
+        // every client's snapshots with it, over a longer one.
+        expect(built.declarationFor(request("UNSUBSCRIBE"), 0)).toBeUndefined();
+        expect(built.declarationFor(request("UNSUBSCRIBE"), 1)).toBeUndefined();
+        expect(
+          warn.mock.calls.filter((call: unknown[]) =>
+            String(call[0]).includes("UNSUBSCRIBE"),
+          ),
+        ).toHaveLength(1);
+
+        // Nothing was stated, so an ordinary request still declares it.
+        expect(built.declarationFor(request("GET"), 2)).toMatchObject({
+          handler: "ProxyController.proxy",
+          method: "GET",
+        });
+      });
+
+      it("makes no declaration the collector would refuse, whatever method Node parses", () => {
+        for (const method of METHODS) {
+          const declaration = registry(ProxyController).declarationFor(
+            request(method),
+          );
+
+          expect(
+            validateTelemetryPayload(
+              {
+                serviceId: "svc",
+                objectives: declaration ? [declaration] : [],
+              },
+              { forbidUnknown: true },
+            ),
+          ).toEqual([]);
+        }
+      });
     });
 
     it("ignores a handler that serves several routes, however it comes to", () => {
