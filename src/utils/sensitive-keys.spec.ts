@@ -54,4 +54,16 @@ describe("createSensitiveKeyMatcher", () => {
     expect(configured("TENANT-REF")).toBe(true);
     expect(configured("tenantRefs")).toBe(false);
   });
+
+  it("strips a numbered suffix in linear time", () => {
+    // Query-string keys come from the client, and `\d+$` restarted at every
+    // digit of a run that is not at the end: ~350 ms for this key.
+    const key = "1".repeat(15_000) + "x";
+    const startedAt = performance.now();
+
+    expect(isSensitive(key)).toBe(false);
+    expect(isSensitive("1".repeat(15_000) + "token")).toBe(true);
+
+    expect(performance.now() - startedAt).toBeLessThan(25);
+  });
 });

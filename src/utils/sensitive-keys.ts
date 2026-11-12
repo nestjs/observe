@@ -64,6 +64,23 @@ function wordsOf(key: string): string[] {
     .split(/[^a-z0-9]+/);
 }
 
+/**
+ * Walked by hand rather than with `/\d+$/`, which restarts at every digit of a
+ * run that does not reach the end - quadratic, on a query-string key the
+ * client chose.
+ */
+function withoutTrailingDigits(key: string): string {
+  let end = key.length;
+  while (end > 0) {
+    const code = key.charCodeAt(end - 1);
+    if (code < 48 || code > 57) {
+      break;
+    }
+    end -= 1;
+  }
+  return key.slice(0, end);
+}
+
 export type SensitiveKeyMatcher = (key: string) => boolean;
 
 /**
@@ -78,7 +95,7 @@ export function createSensitiveKeyMatcher(
   return (key) => {
     const normalised = normaliseKey(key);
     // `password2`, `token_1`: a numbered credential is still one.
-    const stem = normalised.replace(/\d+$/, "");
+    const stem = withoutTrailingDigits(normalised);
     return (
       exact.has(normalised) ||
       SENSITIVE_SUFFIXES.some((suffix) => stem.endsWith(suffix)) ||
