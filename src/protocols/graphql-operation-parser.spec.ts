@@ -184,6 +184,35 @@ describe("parseGraphQLOperation", () => {
       ).toBe("query($v1: Int = _) { orders(first: $v1) { id } }");
     });
 
+    it("blanks a number written straight after another literal", () => {
+      // Commas are optional, and the `_` a string leaves is a name character
+      // itself: the number after it is not a name's tail.
+      expect(
+        parseGraphQLOperation('{ notes(ids: ["draft"489213"""x"""7]) { id } }')
+          ?.sanitizedDocument,
+      ).toBe("{ notes(ids: [____]) { id } }");
+      expect(
+        parseGraphQLOperation('{ notes(ids: ["draft"1.5e3]) { field2 } }')
+          ?.sanitizedDocument,
+      ).toBe("{ notes(ids: [__]) { field2 } }");
+    });
+
+    it.each([
+      ["a run of literals", "1 ".repeat(100_000)],
+      ["a sign before each literal", "-1".repeat(100_000)],
+      ["digits that continue a name", `a${"1".repeat(200_000)}`],
+    ])("scans a document of digits in linear time: %s", (_, digits) => {
+      // The euro sign is not GraphQL, but it is copied through like any other
+      // character and makes the output a two-byte string.
+      const document = `{ health(ids: [€ ${digits}]) }`;
+      const startedAt = performance.now();
+
+      const parsed = parseGraphQLOperation(document);
+
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+      expect(parsed?.fieldName).toBe("health");
+    });
+
     it('reads an escaped \\""" as part of its block string', () => {
       // graphql-js reads `\"""` inside a block string as three quotes of
       // content; ended there, the rest of the literal was recorded as syntax.

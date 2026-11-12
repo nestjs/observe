@@ -305,13 +305,29 @@ function stripIgnoredTokens(document: string): string {
       continue;
     }
 
+    // A name is copied whole, so a digit that continues one (`field2`,
+    // `$var1`) never reaches the number rule below. Whether a digit belongs
+    // to a name is read from the document, never from `out`: the `_` a
+    // literal leaves there is a name character itself, so the number straight
+    // after one - `["draft"489213]`, commas being optional - read as its
+    // tail, and indexing a string built with `+=` copied all of it, once per
+    // digit.
+    if (isNameStart(char)) {
+      const start = index;
+      index += 1;
+      while (index < document.length && isNameChar(document[index])) {
+        index += 1;
+      }
+      out += document.slice(start, index);
+      continue;
+    }
+
     // Numbers go the same way as strings. An inline `verifyOtp(code: 489213)`
     // or `charge(amount: 1999)` is user data exactly as a string literal is,
-    // and blanking it also keeps `first: 10` and `first: 20` one shape. A
-    // digit that continues a name (`field2`, `$var1`) is not a literal.
+    // and blanking it also keeps `first: 10` and `first: 20` one shape.
     const startsNumber =
       isDigit(char) || (char === "-" && isDigit(document[index + 1] ?? ""));
-    if (startsNumber && !isNameChar(out[out.length - 1] ?? "")) {
+    if (startsNumber) {
       index += 1;
       while (index < document.length && isNumberChar(document, index)) {
         index += 1;
