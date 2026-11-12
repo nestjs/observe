@@ -16,6 +16,23 @@ import { dirname, join } from "node:path";
 export const nestMajor = Number(readCoreManifest().version.split(".")[0]);
 
 /**
+ * Whether the Nest the suites run on is `version` or newer, for a case that
+ * pins behaviour Nest itself only gained in a later release than the SDK's
+ * floor.
+ */
+export function nestAtLeast(version: string): boolean {
+  const installed = readCoreManifest().version.split(".").map(Number);
+  const wanted = version.split(".").map(Number);
+  for (let i = 0; i < wanted.length; i++) {
+    const part = installed[i] ?? 0;
+    if (part !== wanted[i]) {
+      return part > wanted[i];
+    }
+  }
+  return true;
+}
+
+/**
  * Read beside the entry point rather than required by name: early Nest 12
  * export maps, 12.0.1's among them, have no `./package.json` and turn
  * `@nestjs/core/package.json` into `package.json.js`. Checked for its name, so

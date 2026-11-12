@@ -16,7 +16,11 @@ import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
-import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
+import {
+  createNodeAdapter,
+  nestAtLeast,
+  onPlatforms,
+} from "../testing/nest-version.js";
 import {
   CollectedSnapshots,
   collectSnapshots,
@@ -216,9 +220,15 @@ describe.each(cases)(
       expect(addRouteMetadata).toHaveBeenCalledOnce();
     });
 
-    it.each([
+    it.each<[string, string | undefined]>([
       ["with done(err)", undefined],
-      ["by rejecting", "reject"],
+      // A request hook's rejected promise reaches the request only from Nest
+      // 12.1.3 (nestjs/nest#18110 for Express, #17997 for Fastify). Before
+      // that the adapter drops the promise, and the request hangs with or
+      // without the agent.
+      ...(nestAtLeast("12.1.3")
+        ? [["by rejecting", "reject"] as [string, string]]
+        : []),
     ])(
       "refuses a request the application's hook refuses %s, leaving no trace open",
       async (_, key) => {
