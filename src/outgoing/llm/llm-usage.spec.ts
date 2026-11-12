@@ -62,6 +62,41 @@ describe("model from the request", () => {
     expect(modelFromRequestBody(new FormData())).toBeUndefined();
   });
 
+  // A tool call's input or a tool result is part of the prompt, and may hold
+  // a key of the same name: what it says is not the model, and not the
+  // agent's to report.
+  it("reads only the outermost object's model, never one in the prompt", () => {
+    const converse = JSON.stringify({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { toolResult: { content: [{ json: { model: "secret device" } }] } },
+          ],
+        },
+      ],
+    });
+    expect(modelFromRequestBody(converse)).toBeUndefined();
+    expect(
+      modelFromRequestBody(
+        JSON.stringify({
+          messages: [{ role: "user", content: { model: "secret" } }],
+          system: "a } that closes nothing, a { that opens nothing",
+          model: "claude-sonnet-4-5",
+        }),
+      ),
+    ).toBe("claude-sonnet-4-5");
+    expect(
+      modelFromRequestBody(
+        JSON.stringify({ prompt: '"model":"secret"', model: "gpt-4.1" }),
+      ),
+    ).toBe("gpt-4.1");
+    expect(modelFromRequestBody('say "model": "secret"')).toBeUndefined();
+    expect(
+      modelFromRequestBody(JSON.stringify({ model: 4, input: { model: "x" } })),
+    ).toBeUndefined();
+  });
+
   it("reads the model out of the path for Gemini, Vertex and Bedrock", () => {
     expect(
       modelFromUrlPath("/v1beta/models/gemini-2.5-flash:streamGenerateContent"),
@@ -166,6 +201,22 @@ describe("JsonUsageReader", () => {
       inputTokens: 900,
       outputTokens: 64000,
     });
+  });
+
+  it("takes the model of a body too large to keep from its outermost object only", () => {
+    const reader = new JsonUsageReader();
+    feed(
+      reader,
+      JSON.stringify({
+        output: [
+          { type: "function_call", arguments: { model: "secret text" } },
+          { type: "message", text: "x".repeat(3 * 1024 * 1024) },
+        ],
+        usage: { input_tokens: 5, output_tokens: 6 },
+      }),
+      256 * 1024,
+    );
+    expect(reader.finish()).toEqual({ inputTokens: 5, outputTokens: 6 });
   });
 
   it("gives up quietly on a body that is not JSON", () => {

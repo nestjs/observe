@@ -2,6 +2,7 @@
  * Reading token usage out of a model provider's response - a JSON body, or
  * the events of a server-sent stream - without ever keeping its text.
  */
+import { topLevelModel } from "./llm-providers.js";
 
 /** What one call consumed, as far as the response said. */
 export interface LlmUsage {
@@ -204,7 +205,7 @@ function usageFromEdges(head: string, tail: string): LlmUsage {
   if (cached && usage.cachedInputTokens === undefined) {
     usage.cachedInputTokens = Number(cached[1]);
   }
-  const model = /"model"\s*:\s*"([^"\\]{1,128})"/.exec(head)?.[1];
+  const model = topLevelModel(head);
   return { ...usage, ...(model ? { model } : {}) };
 }
 
