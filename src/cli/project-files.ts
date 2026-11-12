@@ -131,10 +131,19 @@ export function trackedEnvFile(cwd: string): string | undefined {
 export function ensureEnvIgnored(cwd: string): boolean {
   const path = join(cwd, ".gitignore");
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-  const ignored = existing
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .some((line) => line === ".env" || line === "/.env" || line === ".env*");
+  // Read the way git reads it. The last rule that matches decides, so a
+  // `!.env` further down takes `.env` back out. Only trailing spaces are
+  // dropped from a rule: an indented ` .env` names a file that starts with
+  // a space, and `.env` followed by a tab one that ends with a tab.
+  let ignored = false;
+  for (const line of existing.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const rule = line.replace(/ +$/, "");
+    if (rule === ".env" || rule === "/.env" || rule === ".env*") {
+      ignored = true;
+    } else if (rule.startsWith("!") && mayMatchEnv(rule.slice(1))) {
+      ignored = false;
+    }
+  }
   if (ignored) {
     return false;
   }
@@ -144,6 +153,30 @@ export function ensureEnvIgnored(cwd: string): boolean {
     `${existing}${separator}\n# NestJS Observe key pair\n.env\n`,
   );
   return true;
+}
+
+/**
+ * Whether a `.gitignore` pattern can match `<cwd>/.env`. Asked only of rules
+ * that take files back out, where a wrong yes costs one more `.env` line at
+ * the end of the file and a wrong no costs the secret - so whatever is not
+ * read exactly counts as a match: a `[class]`, a `\` escape, and a name in
+ * another case, for a checkout on a case-insensitive file system.
+ */
+function mayMatchEnv(pattern: string): boolean {
+  if (/[[\\]/.test(pattern)) {
+    return true;
+  }
+  // `/` in front anchors it to this directory, where `.env` is anyway; one
+  // at the end means directories only, and `.env` is a file.
+  const name = pattern.replace(/^\//, "").replace(/^(\*\*\/)+/, "");
+  if (!name || name.includes("/")) {
+    return false;
+  }
+  const glob = name
+    .replace(/[.+^${}()|]/g, "\\$&")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]");
+  return new RegExp(`^${glob}$`, "i").test(".env");
 }
 
 export interface ScriptsUpdate {

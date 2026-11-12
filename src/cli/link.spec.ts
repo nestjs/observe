@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import * as ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { link, LinkDependencies } from "./link.js";
-import { writeEnvFile } from "./project-files.js";
+import { ensureEnvIgnored, writeEnvFile } from "./project-files.js";
 
 const STARTED = {
   deviceCode: "device-code",
@@ -379,6 +379,34 @@ describe("npx @nestjs/observe link", () => {
       expect(await run(h)).toBe(0);
       expect(read(".env")).toContain("OBSERVE_APP_SECRET=");
     });
+  });
+
+  // Git's reading of .gitignore: the last rule that matches decides, a `!`
+  // takes a file back out, and only trailing spaces are not part of a rule.
+  it.each([
+    [".env*\n!.env\n"],
+    ["/.env\n!/.env\n"],
+    [".env\n!.e?v\n"],
+    [".env\n![.]env\n"],
+    [" .env\n"],
+    [".env\t\n"],
+  ])("git-ignores .env when %j does not", (gitignore) => {
+    writeFileSync(join(cwd, ".gitignore"), gitignore);
+
+    expect(ensureEnvIgnored(cwd)).toBe(true);
+    expect(read(".gitignore").endsWith("\n.env\n")).toBe(true);
+  });
+
+  it.each([
+    [".env\n"],
+    ["node_modules\n.env*\n!.env.example\n"],
+    ["!.env\n.env  \n"],
+    [".env\n!dist/.env\n"],
+  ])("leaves %j alone: it already ignores .env", (gitignore) => {
+    writeFileSync(join(cwd, ".gitignore"), gitignore);
+
+    expect(ensureEnvIgnored(cwd)).toBe(false);
+    expect(read(".gitignore")).toBe(gitignore);
   });
 
   it("replaces an earlier pair and keeps the rest of .env", async () => {
