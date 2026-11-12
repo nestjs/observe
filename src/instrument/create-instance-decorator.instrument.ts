@@ -234,7 +234,9 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
   },
 ) {
   /**
-   * Builds the tracing wrapper shared by methods and standalone functions.
+   * Builds the tracing wrapper shared by methods and standalone functions:
+   * called with the receiver and the arguments of the call it stands in for,
+   * as the `apply` trap that dispatches to it is handed them.
    *
    * Every function this creates is named `<className>.<methodName>`, so the
    * frames instrumentation contributes to a stack trace read like the call the
@@ -330,19 +332,20 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       },
     );
 
-    // A function expression, not an arrow: the wrapper has to forward whatever
-    // `this` the caller invoked it with.
-    return named(frameName, function (this: unknown, ...args: unknown[]) {
+    // The receiver the call was made with is handed on, not read off `this`:
+    // the wrapper is called as a plain function, so V8 prints its frame as
+    // top-level, under the name above.
+    return named(frameName, (thisArg: unknown, args: unknown[]) => {
       // Already tracing this callable, invoke it as-is
       if (spec.isActive()) {
-        return callUntraced(this, args);
+        return callUntraced(thisArg, args);
       }
 
       const store = als.getStore();
       const requestId =
         store?.get(TRACE_REGISTRY_KEY) ?? store?.get(options.traceIdKey);
       if (!requestId) {
-        return callUntraced(this, args);
+        return callUntraced(thisArg, args);
       }
       spec.setActive(true);
 
@@ -361,7 +364,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       // provider call on an ignored route logged a registry error.
       if (newStepId === undefined) {
         try {
-          return callUntraced(this, args);
+          return callUntraced(thisArg, args);
         } finally {
           spec.setActive(false);
         }
@@ -372,7 +375,14 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       // caller once this call returns.
       const spanStore = new Map(store);
       spanStore.set(CALLER_METADATA_KEY, newStepId);
-      return als.run(spanStore, callTraced, this, args, requestId, newStepId);
+      return als.run(
+        spanStore,
+        callTraced,
+        thisArg,
+        args,
+        requestId,
+        newStepId,
+      );
     });
   };
 
@@ -410,7 +420,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // `apply` is trapped, so `new fn()` still constructs the original.
     return new Proxy(fn, {
       apply: named(frameName, (_target, thisArg, args) =>
-        Reflect.apply(tracedFn, thisArg, args),
+        tracedFn(thisArg, args),
       ),
     });
   };
@@ -471,12 +481,21 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // constructors and callable objects.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     const passedThrough = new WeakSet<Function>();
-    return new Proxy(instance, {
+    const proxy: object = new Proxy(instance, {
       // Runs for every property read through the proxy - each `this.field`
       // and `this.dependency.method` inside a traced call - so the common
-      // answers come first: a value that is no method, then a method already
-      // wrapped.
+      // answers come first: a read by something other than the proxy, a value
+      // that is no method, then a method already wrapped.
       get: (target, prop, receiver) => {
+        // An object that inherits from the proxy - what a traced method
+        // derives from `this` with `Object.create(this)`, as pino's
+        // `logger.child()` does - reads its property as it would without the
+        // proxy, accessors against itself, and calls its methods with itself
+        // as `this`. Wrapped and cached, the first such object to read a
+        // method was the `this` of every later call of it, from any request.
+        if (receiver !== proxy) {
+          return Reflect.get(target, prop, receiver);
+        }
         const attributeValue = Reflect.get(target, prop);
         if (typeof attributeValue !== "function" || prop === "constructor") {
           return attributeValue;
@@ -525,13 +544,13 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         const originalMethod = requiresRawReceiver
           ? attributeValue
           : Reflect.get(target, prop, receiver);
-        const tracedReceiver = requiresRawReceiver ? target : receiver;
+        const tracedReceiver = requiresRawReceiver ? target : proxy;
         // The wrapper is made once per method of this instance and cached
         // below, so a flag of its own guards exactly that callable - checked
         // and flipped on every traced call, where a lookup keyed by instance
         // and name used to be.
         let active = false;
-        const proxyFn = createTracedWrapper({
+        const tracedFn = createTracedWrapper({
           className,
           methodName,
           spanId: generateSpanId(target, methodName),
@@ -549,34 +568,44 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
           ),
         });
 
-        // V8 hard-codes the type name of a stack frame to "Proxy" whenever the
-        // frame's receiver is a proxy, and no trap can override that. The
-        // wrapper never reads `this`, so handing it out with the receiver
-        // detached costs nothing and makes V8 treat its frame as top-level -
-        // printing the "<Class>.<method>" name above on its own.
-        const boundFn = proxyFn.bind(undefined);
+        // A method read off the provider is not always called on it. ioredis
+        // copies a client's custom commands onto every `Pipeline` it makes
+        // (`this[name] = redis[name]`), and each queues on the `this` it is
+        // called with: run against the client regardless, a command written
+        // into `multi()` was sent at once, outside the transaction. Called on
+        // another object, the method runs as it would without the proxy -
+        // against that object, untraced. Called on the provider, or on
+        // nothing, it is traced against the receiver chosen above.
+        //
+        // Bound, so V8 prints the trap's frame as top-level, under its name:
+        // called as the handler's `apply`, it would carry "[as apply]".
+        const apply = named(
+          frameName,
+          (_target: unknown, thisArg: unknown, args: unknown[]) =>
+            thisArg === proxy ||
+            thisArg === target ||
+            thisArg === undefined ||
+            thisArg === null
+              ? tracedFn(thisArg, args)
+              : Reflect.apply(originalMethod, thisArg, args),
+        ).bind(undefined);
 
-        // `bind` renames the function to "bound <name>" and drops metadata;
-        // restore both so the wrapper stays indistinguishable from the original
-        // to anything reflecting over it (DI, decorators, arity checks).
-        Object.defineProperty(boundFn, "name", {
-          value: originalMethod.name,
-          configurable: true,
-        });
-        Object.defineProperty(boundFn, "length", {
-          value: originalMethod.length,
-          configurable: true,
-        });
+        // A proxy of the method itself, so `name`, `length` and everything
+        // else read off it are the original's, to anything reflecting over it
+        // (DI, decorators, arity checks). Metadata is held by identity, so it
+        // is copied onto the proxy.
+        const wrapped = new Proxy(originalMethod, { apply });
         const metadataKeys = Reflect.getMetadataKeys(originalMethod);
         for (const key of metadataKeys) {
           const metadata = Reflect.getMetadata(key, originalMethod);
-          Reflect.defineMetadata(key, metadata, boundFn);
+          Reflect.defineMetadata(key, metadata, wrapped);
         }
 
-        methodRefsCache.set(attributeValue, boundFn);
-        return boundFn;
+        methodRefsCache.set(attributeValue, wrapped);
+        return wrapped;
       },
     });
+    return proxy;
   };
 
   return (instance: unknown) => {

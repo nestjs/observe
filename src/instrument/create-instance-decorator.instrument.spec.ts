@@ -635,6 +635,123 @@ describe("createInstanceDecorator", () => {
     });
   });
 
+  describe("when another object calls a provider's method", () => {
+    /**
+     * ioredis's `Pipeline` borrows a client's custom commands
+     * (`this[name] = redis[name]`), and each queues on the `this` it is
+     * called with. Run against the client regardless, a command written into
+     * `multi()` was sent at once, outside the transaction.
+     */
+    class Client {
+      readonly log: number[] = [];
+      reserve(quantity: number) {
+        this.log.push(quantity);
+        return this;
+      }
+      multi() {
+        return new Pipeline(this);
+      }
+    }
+    class Pipeline {
+      readonly log: number[] = [];
+      reserve: Client["reserve"];
+      constructor(client: Client) {
+        // oxlint-disable-next-line typescript/unbound-method -- borrowed, as ioredis's Pipeline borrows
+        this.reserve = client.reserve;
+      }
+    }
+
+    it.each([
+      ["inside a trace", withTrace],
+      ["outside a trace", <T>(fn: () => T) => fn()],
+    ])(
+      "runs a borrowed method against the object it is called on, %s",
+      (_, run) => {
+        const instance = new Client();
+        const client = decorate(instance) as Client;
+
+        const pipeline = run(() => {
+          const transaction = client.multi();
+          transaction.reserve(50);
+          return transaction;
+        });
+
+        expect(pipeline.log).toEqual([50]);
+        expect(instance.log).toEqual([]);
+      },
+    );
+
+    it("still traces the provider's own call of a method it lent", () => {
+      const client = decorate(new Client()) as Client;
+
+      withTrace(() => client.multi().reserve(1));
+      startedSteps = [];
+      withTrace(() => client.reserve(2));
+
+      expect(startedSteps).toEqual([
+        { className: "Client", methodName: "reserve" },
+      ]);
+    });
+
+    /**
+     * A traced call runs with the proxy as `this`, so what a method derives
+     * from `this` - `Object.create(this)`, as pino's `logger.child()` does -
+     * inherits from the proxy. The first such object to read a method became
+     * the `this` of every later call of it, from any request.
+     */
+    class Repo {
+      tenant = "none";
+      forTenant(tenant: string): Repo {
+        const scoped = Object.create(this) as Repo;
+        scoped.tenant = tenant;
+        return scoped;
+      }
+      list() {
+        return `invoices of ${this.tenant}`;
+      }
+      get label() {
+        return `repo of ${this.tenant}`;
+      }
+    }
+
+    it("runs an inherited method against the object that inherited it", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      expect(withTrace(() => repo.forTenant("acme").list())).toBe(
+        "invoices of acme",
+      );
+      expect(withTrace(() => repo.forTenant("globex").list())).toBe(
+        "invoices of globex",
+      );
+    });
+
+    it("runs it so outside a trace as well", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      const scoped = withTrace(() => repo.forTenant("acme"));
+
+      expect(scoped.list()).toBe("invoices of acme");
+    });
+
+    it("still traces the provider's own call once a derived object read the method", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      withTrace(() => repo.forTenant("acme").list());
+      startedSteps = [];
+      withTrace(() => repo.list());
+
+      expect(startedSteps).toEqual([{ className: "Repo", methodName: "list" }]);
+    });
+
+    it("reads an inherited getter against the object that inherited it", () => {
+      const repo = decorate(new Repo()) as Repo;
+
+      expect(withTrace(() => repo.forTenant("acme").label)).toBe(
+        "repo of acme",
+      );
+    });
+  });
+
   describe("when a field holds a callable object", () => {
     /** Shaped like a compiled Mongoose model: callable, statics, custom proto. */
     const makeModel = () => {
