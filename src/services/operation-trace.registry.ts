@@ -226,6 +226,34 @@ function fitManualSpanName(name: string): string {
   return fitToLength(name, MAX_SPAN_NAME_LENGTH);
 }
 
+/** An absolute-form request target: `http://api.example.com/graphql?query=`. */
+const ABSOLUTE_URL = /^[a-z][a-z\d+.-]*:\/\//i;
+
+/**
+ * The URL of a request that nothing named - no route, no GraphQL resolver -
+ * without its query string.
+ *
+ * Its query string is masked by parameter name only, and nothing says what
+ * it holds: over GET, a GraphQL endpoint's is the operation itself, string
+ * literals and `variables` included, which the GraphQL agent's request hook
+ * blanks - and the hook did not run for a request that is still unnamed: a
+ * middleware refused it, it is a persisted query sent by its hash, or the
+ * endpoint is one the hook is not registered for. Anything that is not a
+ * request target - a GraphQL document - is left as it is.
+ */
+function withoutQueryString(
+  originalUrl: string | undefined,
+): string | undefined {
+  if (
+    typeof originalUrl !== "string" ||
+    !(originalUrl.startsWith("/") || ABSOLUTE_URL.test(originalUrl))
+  ) {
+    return originalUrl;
+  }
+  const queryAt = originalUrl.indexOf("?");
+  return queryAt === -1 ? originalUrl : originalUrl.slice(0, queryAt);
+}
+
 /** A node and everything below it. */
 function countNodes(node: {
   children?: Array<CompleteTraceEventNode | OngoingTraceEventNode>;
@@ -1148,6 +1176,23 @@ export class OperationTraceRegistry {
       delete bookkeeping.customOperationId;
       delete bookkeeping.keptWithoutSpans;
       delete bookkeeping.capturedErrors;
+
+      // Before a custom name is applied: a request is named after its URL
+      // when nothing else named it - by the buffer, or below as the name a
+      // custom one replaces - and that URL is then sent without its query
+      // string. Here, at the one point every request snapshot is handed on,
+      // ahead of the buffer and of the OTLP export that reads it too.
+      if (
+        "protocol" in snapshot &&
+        snapshot.operationId == null &&
+        snapshot.attributes?.originalUrl !== undefined
+      ) {
+        const originalUrl = withoutQueryString(snapshot.attributes.originalUrl);
+        if (originalUrl !== snapshot.attributes.originalUrl) {
+          // A copy: the transport may share the object it was given.
+          snapshot.attributes = { ...snapshot.attributes, originalUrl };
+        }
+      }
 
       // Before `skipSpans`, which judges the operation by the name it is
       // reported under.

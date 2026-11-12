@@ -992,6 +992,99 @@ describe("OperationTraceRegistry", () => {
         registry.addRouteMetadataToTrace("nope", 0, "/x"),
       ).not.toThrow();
     });
+
+    describe("a request nothing named", () => {
+      // A GraphQL query over GET that the GraphQL agent's request hook never
+      // labelled - refused by a middleware, sent as a persisted query's hash,
+      // or on an endpoint the hook is not registered for. Its query string is
+      // the operation itself, which the hook would have blanked.
+      const graphqlGet =
+        '/graphql?query=query($name:String!){patient(name:$name){id}}&variables={"name":"John Doe","diagnosis":"G40.9"}';
+
+      const unnamed = async (
+        traceId: string,
+        originalUrl: string,
+        rename?: string,
+      ) => {
+        registry.startTrace(traceId, {
+          protocol: "http",
+          attributes: { method: "GET", originalUrl },
+          tags: {},
+        });
+        const spanId = registry.internalStartTraceStep(
+          traceId,
+          "SessionMiddleware",
+          "use",
+          undefined,
+        );
+        if (rename) {
+          registry.setOperationId(traceId, rename);
+        }
+        registry.internalEndTraceStep(
+          traceId,
+          spanId,
+          "SessionMiddleware",
+          "use",
+          spanId,
+        );
+        registry.endTrace(traceId, { statusCode: 401 });
+        return (await registry.pluckSnapshot(traceId)) as RequestSnapshot;
+      };
+
+      it("is handed on without its query string", async () => {
+        const snapshot = await unnamed("r-unnamed", graphqlGet);
+
+        expect(snapshot.attributes?.originalUrl).toBe("/graphql");
+        expect(JSON.stringify(snapshot)).not.toContain("John Doe");
+      });
+
+      it("is handed on without it in absolute form too", async () => {
+        const snapshot = await unnamed(
+          "r-absolute",
+          `http://api.example.com${graphqlGet}`,
+        );
+
+        expect(snapshot.attributes?.originalUrl).toBe(
+          "http://api.example.com/graphql",
+        );
+      });
+
+      it("is handed on without it when renamed", async () => {
+        const snapshot = await unnamed("r-renamed", graphqlGet, "patients");
+
+        expect(snapshot.operationId).toBe("patients");
+        expect(snapshot.attributes?.originalUrl).toBe("/graphql");
+        expect(snapshot.attributes?.defaultOperationId).toBe("/graphql");
+      });
+
+      it("keeps the query string of a request a route named", async () => {
+        registry.startTrace("r-named", {
+          operationId: "/orders",
+          protocol: "http",
+          attributes: { method: "GET", originalUrl: "/orders?page=2" },
+          tags: {},
+        });
+        const spanId = registry.internalStartTraceStep(
+          "r-named",
+          "OrdersController",
+          "list",
+          undefined,
+        );
+        registry.internalEndTraceStep(
+          "r-named",
+          spanId,
+          "OrdersController",
+          "list",
+          spanId,
+        );
+        registry.endTrace("r-named", { statusCode: 200 });
+
+        const snapshot = (await registry.pluckSnapshot(
+          "r-named",
+        )) as RequestSnapshot;
+        expect(snapshot.attributes?.originalUrl).toBe("/orders?page=2");
+      });
+    });
   });
 
   describe("setOperationId", () => {

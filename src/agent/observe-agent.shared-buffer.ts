@@ -264,7 +264,9 @@ export class ObserveAgentSharedBuffer {
     // over a single miss, so fall back to the transport's URL, and drop the
     // snapshot when even that is absent rather than poison the batch it would
     // ride in. The URL is folded to a route-like path first, or every query
-    // string and id would be a route of its own; `originalUrl` keeps it whole.
+    // string and id would be a route of its own. `originalUrl` keeps its ids;
+    // its query string the registry has already cut, as nothing that named
+    // the request said what it holds.
     snapshot.operationId ??= fallbackOperationId(
       snapshot.attributes?.originalUrl,
     );
