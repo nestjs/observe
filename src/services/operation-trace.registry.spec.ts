@@ -804,6 +804,92 @@ describe("OperationTraceRegistry", () => {
       );
     });
 
+    describe("an error that cannot be read as text", () => {
+      it("is captured rather than thrown back at the caller", async () => {
+        startRequest("e-reply");
+        const spanId = registry.internalStartTraceStep(
+          "e-reply",
+          "OrdersService",
+          "place",
+          undefined,
+        );
+        // What a microservice client rejects with: the JSON object the remote
+        // service sent as its error, on which `String()` throws.
+        const reply = JSON.parse('{"status":"error","toString":1}') as Error;
+
+        expect(() =>
+          registry.captureError("e-reply", spanId, reply, {}),
+        ).not.toThrow();
+        registry.internalEndTraceStep(
+          "e-reply",
+          spanId,
+          "OrdersService",
+          "place",
+          spanId,
+        );
+        registry.endTrace("e-reply");
+
+        const snapshot = await registry.pluckSnapshot("e-reply");
+        expect(snapshot!.traces[0].error).toMatchObject({
+          message: "[object Object]",
+        });
+      });
+
+      it("is recorded without a stack that is not a string", async () => {
+        startRequest("e-stack");
+        const spanId = registry.internalStartTraceStep(
+          "e-stack",
+          "OrdersRepository",
+          "insert",
+          undefined,
+        );
+        // A driver error that copied a server reply's fields onto itself.
+        const error = Object.assign(new Error("insert failed"), { stack: 1 });
+
+        expect(() =>
+          registry.internalEndTraceStep(
+            "e-stack",
+            spanId,
+            "OrdersRepository",
+            "insert",
+            spanId,
+            error,
+          ),
+        ).not.toThrow();
+        registry.endTrace("e-stack");
+
+        const snapshot = await registry.pluckSnapshot("e-stack");
+        expect(snapshot!.error).toMatchObject({ message: "insert failed" });
+        expect(snapshot!.error?.stack).toBeUndefined();
+      });
+
+      it("is recorded with a message that is not a string as text", async () => {
+        startRequest("e-message");
+        const spanId = registry.internalStartTraceStep(
+          "e-message",
+          "OrdersService",
+          "place",
+          undefined,
+        );
+        const error = Object.assign(new Error(), { message: { code: 7 } });
+
+        registry.captureError("e-message", spanId, error, {});
+        registry.internalEndTraceStep(
+          "e-message",
+          spanId,
+          "OrdersService",
+          "place",
+          spanId,
+        );
+        registry.endTrace("e-message");
+
+        const snapshot = await registry.pluckSnapshot("e-message");
+        expect(snapshot!.traces[0].error).toMatchObject({
+          message: "[object Object]",
+        });
+      });
+    });
+
     describe("captured errors past the per-trace limit", () => {
       /** A redactor that counts what it is handed - the payload's cost. */
       const countRedactions = () => {

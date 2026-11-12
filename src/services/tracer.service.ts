@@ -46,6 +46,7 @@ export class TracerService<
   private readonly logger = new Logger(TracerService.name);
   private hasReportedUnusableOperationId = false;
   private hasReportedMetricLimit = false;
+  private hasReportedUncapturedError = false;
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
@@ -165,12 +166,39 @@ export class TracerService<
       return;
     }
     const callerId = store.get(CALLER_METADATA_KEY) as string | undefined;
-    this.operationTraceRegistry.captureError(
-      traceId,
-      callerId,
-      error,
-      tags ?? {},
-      this.reportedTraceId(store, traceId),
+    try {
+      this.operationTraceRegistry.captureError(
+        traceId,
+        callerId,
+        error,
+        tags ?? {},
+        this.reportedTraceId(store, traceId),
+      );
+    } catch (failure) {
+      // For the same reason: a handler that reports a failure and answers
+      // with a fallback must not answer 500 over the report, nor - when it
+      // does not await this call - take the process down with it.
+      this.reportUncapturedError(failure);
+    }
+  }
+
+  /**
+   * A failure to record an error comes from the same call site on every
+   * request, so it is reported once rather than once per request.
+   */
+  private reportUncapturedError(failure: unknown): void {
+    if (this.hasReportedUncapturedError) {
+      return;
+    }
+    this.hasReportedUncapturedError = true;
+    let reason: string;
+    try {
+      reason = failure instanceof Error ? failure.message : String(failure);
+    } catch {
+      reason = "an unprintable error";
+    }
+    this.logger.warn(
+      `captureError could not record an error, and the operation goes on without it. Later failures are not reported: ${reason}`,
     );
   }
 

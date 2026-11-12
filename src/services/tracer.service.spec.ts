@@ -509,6 +509,32 @@ describe("TracerService", () => {
         /AsyncLocalStorage is not initialized/,
       );
     });
+
+    it("does not fail the caller when recording the error fails, and says so once", async () => {
+      // Reporting an error must not raise one: a handler that captures a
+      // failure and then answers with a fallback answered 500 instead, and
+      // one that did not await the call took the process down.
+      vi.spyOn(registry, "captureError").mockImplementation(() => {
+        throw new TypeError("Cannot convert object to primitive value");
+      });
+      const warn = vi
+        .spyOn((tracer as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => undefined);
+
+      await inTrace("c3", async () => {
+        await expect(
+          tracer.captureError(new Error("x")),
+        ).resolves.toBeUndefined();
+        await expect(
+          tracer.captureError(new Error("y")),
+        ).resolves.toBeUndefined();
+      });
+
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Cannot convert object to primitive value"),
+      );
+    });
   });
 
   describe("metric registry", () => {

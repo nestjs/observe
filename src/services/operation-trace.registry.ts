@@ -226,6 +226,57 @@ function fitManualSpanName(name: string): string {
   return fitToLength(name, MAX_SPAN_NAME_LENGTH);
 }
 
+/**
+ * A thrown value, or an error's message, as text - whatever it is.
+ *
+ * Neither is what its type says for certain. A microservice client rejects
+ * with the JSON object the remote service sent as its error, and a driver
+ * copies a server reply's fields onto the error it throws; `String()` throws
+ * on `{"toString": 1}`, and that was thrown back at the code recording the
+ * failure - a handler that reported it and answered with a fallback
+ * answered 500 instead.
+ */
+function toErrorText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    // oxlint-disable-next-line typescript/no-base-to-string -- recorded as `String()` always recorded it
+    return String(value);
+  } catch {
+    try {
+      return Object.prototype.toString.call(value);
+    } catch {
+      return "[unprintable value]";
+    }
+  }
+}
+
+/** An error's stack, when it has one that is text. */
+function stackOf(error: Error): string | undefined {
+  try {
+    const stack: unknown = error.stack;
+    return typeof stack === "string" ? stack : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The name of a thrown value's class, when it can be read. */
+function classNameOf(error: unknown): string | undefined {
+  try {
+    const constructor = (error as { constructor?: unknown } | null | undefined)
+      ?.constructor;
+    if (typeof constructor !== "function") {
+      return undefined;
+    }
+    const name: unknown = constructor.name;
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** An absolute-form request target: `http://api.example.com/graphql?query=`. */
 const ABSOLUTE_URL = /^[a-z][a-z\d+.-]*:\/\//i;
 
@@ -426,8 +477,8 @@ export class OperationTraceRegistry {
   private toErrorPayload(error: Error | string | object) {
     const raw =
       error instanceof Error
-        ? { message: error.message, stack: error.stack }
-        : { message: String(error), stack: undefined };
+        ? { message: toErrorText(error.message), stack: stackOf(error) }
+        : { message: toErrorText(error), stack: undefined };
     // Redacted here, at the one point every error payload passes through.
     const redacted = this.redactor
       ? {
@@ -452,8 +503,9 @@ export class OperationTraceRegistry {
       tags?: Record<string, string | number | boolean>;
     } = payload;
 
-    if (typeof error?.constructor === "function") {
-      result.cls = error.constructor.name;
+    const cls = classNameOf(error);
+    if (cls !== undefined) {
+      result.cls = cls;
     }
 
     if (this.sourceContext !== false) {
