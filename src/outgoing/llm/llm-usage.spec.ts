@@ -173,6 +173,33 @@ describe("JsonUsageReader", () => {
     feed(reader, "<html>bad gateway</html>");
     expect(reader.finish()).toEqual({});
   });
+
+  // A chunk kept as it was handed over costs a few hundred bytes of heap on
+  // top of its own: a body a byte at a time would be held a hundred times
+  // over. What the reader keeps are copies, bounded by the bytes counted.
+  it.each([
+    ["one byte at a time", 1],
+    ["in pieces", 7],
+  ])("keeps a copy of a body arriving %s, not the chunks", (_name, size) => {
+    const reader = new JsonUsageReader();
+    const encoded = bytes(
+      JSON.stringify({
+        model: "gpt-4o-2024-08-06",
+        choices: [{ message: { content: "hello é ✓" } }],
+        usage: { prompt_tokens: 11, completion_tokens: 2 },
+      }),
+    );
+    for (let offset = 0; offset < encoded.byteLength; offset += size) {
+      const chunk = encoded.slice(offset, offset + size);
+      reader.push(chunk);
+      chunk.fill(0);
+    }
+    expect(reader.finish()).toEqual({
+      model: "gpt-4o-2024-08-06",
+      inputTokens: 11,
+      outputTokens: 2,
+    });
+  });
 });
 
 describe("SseUsageReader", () => {
@@ -285,6 +312,26 @@ describe("SseUsageReader", () => {
       model: "m1",
       inputTokens: 1,
       outputTokens: 2,
+    });
+  });
+
+  it("reads a stream arriving one byte at a time, characters split and all", () => {
+    const reader = new SseUsageReader();
+    feed(
+      reader,
+      [
+        `data: {"model":"modèle-✓","text":"héllo"}`,
+        ``,
+        `data: {"text":"wörld ✓"}\r`,
+        ``,
+        `data: {"usage":{"prompt_tokens":3,"completion_tokens":4}}`,
+      ].join("\n"),
+      1,
+    );
+    expect(reader.finish()).toEqual({
+      model: "modèle-✓",
+      inputTokens: 3,
+      outputTokens: 4,
     });
   });
 });
