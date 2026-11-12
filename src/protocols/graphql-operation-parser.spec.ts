@@ -209,6 +209,23 @@ describe("parseGraphQLOperation", () => {
       ).toBe("{ orders { id } }");
     });
 
+    it("ends a comment at a carriage return, as the server does", () => {
+      // Read on to the next `\n`, the comment swallowed the opening quotes
+      // of the block string after it, whose text was then recorded.
+      expect(
+        parseGraphQLOperation(
+          'mutation { # note\rsaveNote(text: """\npassword=hunter2\n""") { id } }',
+        ),
+      ).toMatchObject({
+        fieldName: "saveNote",
+        sanitizedDocument: "mutation { saveNote(text: _) { id } }",
+      });
+      expect(parseGraphQLOperation("# note\r{ orders { id } }")).toMatchObject({
+        fieldName: "orders",
+        sanitizedDocument: "{ orders { id } }",
+      });
+    });
+
     it("caps what it records of an oversized document", () => {
       // The document is a request body, chosen by the client; the shape it
       // leaves in the trace must not be able to overflow the batch.

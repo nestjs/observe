@@ -275,8 +275,15 @@ function stripIgnoredTokens(document: string): string {
   while (index < document.length) {
     const char = document[index];
 
+    // A comment ends at either line terminator, as graphql-js ends it. Read on
+    // to the next `\n`, it swallowed what the server reads after a bare `\r` -
+    // the opening quotes of a block string included.
     if (char === "#") {
-      while (index < document.length && document[index] !== "\n") {
+      while (
+        index < document.length &&
+        document[index] !== "\n" &&
+        document[index] !== "\r"
+      ) {
         index += 1;
       }
       continue;
