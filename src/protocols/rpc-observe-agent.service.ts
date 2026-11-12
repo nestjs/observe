@@ -1,10 +1,4 @@
-import {
-  Inject,
-  Injectable,
-  Logger,
-  OnModuleDestroy,
-  OnModuleInit,
-} from "@nestjs/common";
+import { Inject, Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { ModulesContainer } from "@nestjs/core";
 import type { BaseRpcContext, Server, Transport } from "@nestjs/microservices";
 import { AsyncLocalStorage } from "async_hooks";
@@ -23,6 +17,7 @@ import {
 import { handedOnTraceContext } from "../utils/trace-context.util.js";
 import { continueHandedOnTrace } from "../utils/trace-handoff.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
+import { setAgentHook } from "../utils/shared-hook-slot.util.js";
 import {
   describePeerLoadError,
   loadOptionalPeer,
@@ -57,14 +52,24 @@ interface GrpcCall<TRequest = any, TMetadata = any> {
   operationId: string;
 }
 
+type ProcessingStartHook = (
+  transportId: Transport | symbol,
+  ctx: unknown,
+  done: () => Promise<any>,
+) => unknown;
+type ProcessingEndHook = (
+  transportId: Transport | symbol,
+  ctx: unknown,
+) => void;
+
 @Injectable()
 export class RpcObserveAgentService<Store extends Record<string, unknown>>
-  implements OnModuleInit, OnModuleDestroy
+  implements OnModuleDestroy
 {
   private readonly logger = new Logger(RpcObserveAgentService.name);
   private rpcTargetAddedSubscription: Subscription | undefined;
   /**
-   * Assigned in `onModuleInit`. Every use below is reached only through the
+   * Assigned in the constructor. Every use below is reached only through the
    * hooks registered there, after a successful load - a service without the
    * package has no RPC target to hook.
    */
@@ -90,16 +95,25 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     private readonly operationTraceRegistry: OperationTraceRegistry,
     private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
     private readonly traceSamplerService: TraceSamplerService,
-  ) {}
-
-  onModuleInit() {
+  ) {
+    // From the constructor, while Nest builds the providers: Nest announces
+    // a server when it constructs the microservice around it, inside
+    // `createMicroservice()` or `connectMicroservice()`, so the hooks are in
+    // place before the application is handed the server and can set hooks
+    // of its own on it (`getTransportServer()`), which then run beside them.
     this.microservices = this.loadMicroservices();
     if (!this.microservices) {
       return;
     }
-    this.rpcTargetAddedSubscription = this.modulesContainer
-      .getRpcTargetRegistry?.<Server>()
-      .subscribe((target) => this.registerRpcHooks(target));
+    try {
+      this.rpcTargetAddedSubscription = this.modulesContainer
+        .getRpcTargetRegistry?.<Server>()
+        .subscribe((target) => this.registerRpcHooks(target));
+    } catch (error) {
+      this.logger.warn(
+        `RPC operations will not be instrumented: the microservice registry could not be subscribed to: ${describePeerLoadError(error)}`,
+      );
+    }
   }
 
   onModuleDestroy() {
@@ -111,9 +125,9 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
   /**
    * Loads `@nestjs/microservices` without a static import, so a service that
    * exposes no microservice need not install the package. Loaded here rather
-   * than lazily because the target registry is subscribed from `onModuleInit`,
-   * and a dynamic `import()` would resolve after a target may already have
-   * been announced.
+   * than lazily because the target registry is subscribed from the
+   * constructor, and a dynamic `import()` would resolve after a target may
+   * already have been announced.
    */
   private loadMicroservices(): Microservices | undefined {
     const result = loadOptionalPeer<Microservices>("@nestjs/microservices");
@@ -133,17 +147,19 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     return result.module;
   }
 
+  /**
+   * Sets the agent's processing hooks on a server, beside any the application
+   * sets on it - see `composeStartHook`.
+   */
   registerRpcHooks(target: Server) {
     // Return `done()`'s promise, as Nest's default hook does. Nest's servers
     // hand it back from their message handlers: kafkajs waits on it to commit
     // the offset or retry the message, and recent Nest versions log its
     // rejection for most other transports.
-    target.setOnProcessingStartHook(
-      (
-        transportId: Transport | symbol,
-        ctx: unknown,
-        done: () => Promise<any>,
-      ) => {
+    setAgentHook<ProcessingStartHook>(
+      target,
+      "setOnProcessingStartHook",
+      (transportId, ctx, done) => {
         if (transportId === this.microservices!.Transport.GRPC) {
           return this.startGrpcRequestTracing(
             transportId,
@@ -158,15 +174,19 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
           target,
         );
       },
+      composeStartHook,
     );
 
-    target.setOnProcessingEndHook(
-      (transportId: Transport | symbol, ctx: unknown) => {
+    setAgentHook<ProcessingEndHook>(
+      target,
+      "setOnProcessingEndHook",
+      (transportId, ctx) => {
         this.endRpcRequestTracing(
           transportId,
           ctx as BaseRpcContext | GrpcCall,
         );
       },
+      composeEndHook,
     );
   }
 
@@ -514,6 +534,52 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       }
     }
   }
+}
+
+/**
+ * The start hook the server is given: the application's outside, and the
+ * agent's inside the `done` it is handed, returning what the application's
+ * returns. The application's hook decides whether a message is handled at
+ * all, and the agent opens a trace only once it is: one the application
+ * refuses by never calling `done` leaves nothing behind, where the other way
+ * round each would leave a trace open in the registry.
+ */
+function composeStartHook(
+  application: ProcessingStartHook | undefined,
+  agent: ProcessingStartHook,
+): ProcessingStartHook {
+  if (!application) {
+    return agent;
+  }
+  return function (this: unknown, transportId, ctx, done) {
+    return application.call(
+      this,
+      transportId,
+      ctx,
+      () => agent.call(this, transportId, ctx, done) as Promise<any>,
+    );
+  };
+}
+
+/**
+ * The end hook the server is given: the agent's first, inside the
+ * application's as its start hook is, then the application's whatever the
+ * agent's did.
+ */
+function composeEndHook(
+  application: ProcessingEndHook | undefined,
+  agent: ProcessingEndHook,
+): ProcessingEndHook {
+  if (!application) {
+    return agent;
+  }
+  return function (this: unknown, transportId, ctx) {
+    try {
+      agent.call(this, transportId, ctx);
+    } finally {
+      application.call(this, transportId, ctx);
+    }
+  };
 }
 
 /**

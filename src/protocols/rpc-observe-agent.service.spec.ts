@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import {
   Server,
   ServerKafka,
@@ -46,9 +47,9 @@ describe("RpcObserveAgentService", () => {
 
   it("subscribes to the RPC target registry when @nestjs/microservices is installed", () => {
     const subscribe = vi.fn(() => ({ unsubscribe: vi.fn() }));
-    const agent = createAgent(subscribe);
-
-    agent.onModuleInit();
+    // From the constructor: Nest announces a server as it builds the
+    // microservice, before the application is handed it.
+    createAgent(subscribe);
 
     expect(subscribe).toHaveBeenCalledTimes(1);
   });
@@ -61,17 +62,28 @@ describe("RpcObserveAgentService", () => {
       "loadMicroservices",
     ).mockReturnValue(undefined);
     const subscribe = vi.fn();
-    const agent = createAgent(subscribe);
+    let agent: ReturnType<typeof createAgent> | undefined;
 
-    expect(() => agent.onModuleInit()).not.toThrow();
+    expect(() => {
+      agent = createAgent(subscribe);
+    }).not.toThrow();
     expect(subscribe).not.toHaveBeenCalled();
-    expect(() => agent.onModuleDestroy()).not.toThrow();
+    expect(() => agent!.onModuleDestroy()).not.toThrow();
+  });
+
+  it("starts even when the target registry cannot be subscribed to", () => {
+    vi.spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+
+    expect(() =>
+      createAgent(() => {
+        throw new Error("no registry");
+      }),
+    ).not.toThrow();
   });
 
   describe("getOperationIdFromContext", () => {
     const getOperationId = (ctx: unknown, target?: unknown): string => {
       const agent = createAgent(() => ({ unsubscribe: vi.fn() }));
-      agent.onModuleInit();
       return (
         agent as unknown as {
           getOperationIdFromContext: (ctx: unknown, target?: unknown) => string;
@@ -160,7 +172,6 @@ describe("RpcObserveAgentService", () => {
         buffer,
         new TraceSamplerService(executionOptions),
       );
-      agent.onModuleInit();
       const tracer = new TracerService(
         registry,
         als as never,
@@ -496,7 +507,6 @@ describe("RpcObserveAgentService", () => {
         {} as never,
         { shouldCapture: () => overrides.capture ?? true } as never,
       );
-      agent.onModuleInit();
       return agent;
     };
 
@@ -621,7 +631,6 @@ describe("RpcObserveAgentService", () => {
           { isReporting: () => reporting } as never,
           { shouldCapture: () => overrides.capture ?? true } as never,
         );
-        agent.onModuleInit();
         return captureStartHook(agent);
       };
 
