@@ -238,6 +238,35 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     expect(performance.now() - startedAt).toBeLessThan(250);
   });
 
+  it("reads the frames of an error whose message spans lines", () => {
+    expect(files(collect(new Error("first line\nsecond line")))).toContain(
+      "source-context.util.spec.ts",
+    );
+  });
+
+  it("reads nothing when the message starts below the stack's first line", () => {
+    const frames = collectCodeFrames(
+      `Error: something else\nboom\n    at run (${secret}:1:1)`,
+      { message: "boom" },
+    );
+
+    expect(frames).toBeUndefined();
+  });
+
+  it("finds where the frames start in linear time when the first line repeats the message", () => {
+    // A driver error can take its message and its stack from two places - a
+    // `MongoServerError` copies both off the server's reply - so neither has
+    // to be what V8 wrote. Visiting every match on the first line, each with a
+    // scan back to its start, was quadratic: ~4s for this input.
+    const stack = `${"a".repeat(75_000)}\n    at run (${secret}:1:1)`;
+    const startedAt = performance.now();
+
+    const frames = collectCodeFrames(stack, { message: "a" });
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(files(frames)).toEqual(["secrets.js"]);
+  });
+
   it("does not follow a symlink out of the working directory", () => {
     const target = join(outside, "target.ts");
     writeFileSync(target, "TOP SECRET\n");

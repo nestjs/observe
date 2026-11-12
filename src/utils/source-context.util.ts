@@ -163,20 +163,21 @@ function frameLines(stack: string, message: string | undefined): string[] {
   if (message === "") {
     headerEnd = stack.indexOf("\n");
   } else {
-    // The last match on the first line that runs to the end of a line: an
-    // earlier one can sit inside the name - `UnauthorizedException:
-    // Unauthorized` - and a later one ends past the real message, so whatever
-    // follows it is still what V8 wrote.
-    headerEnd = -1;
-    for (
-      let at = stack.indexOf(message);
-      at !== -1 && stack.lastIndexOf("\n", at) === -1;
-      at = stack.indexOf(message, at + 1)
-    ) {
-      if (stack[at + message.length] === "\n") {
-        headerEnd = at + message.length;
-      }
-    }
+    // A match that starts on the first line and runs to the end of a line
+    // has one possible place: the message's first line has to end where the
+    // stack's first line does. That steps over a match inside the name -
+    // `UnauthorizedException: Unauthorized` - and it is computed rather than
+    // searched for. Neither string is bounded here, nor certain to be what
+    // V8 wrote - a driver can copy both off a server's reply - and visiting
+    // every match on a first line that repeats the message was quadratic.
+    const stackLineEnd = stack.indexOf("\n");
+    const messageLineEnd = message.indexOf("\n");
+    const at =
+      stackLineEnd - (messageLineEnd === -1 ? message.length : messageLineEnd);
+    headerEnd =
+      at >= 0 && at < stackLineEnd && stack.startsWith(message, at)
+        ? at + message.length
+        : -1;
   }
   if (headerEnd === -1 || stack[headerEnd] !== "\n") {
     return [];
