@@ -1,5 +1,7 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
+import { MAX_SERIES_PER_METRIC } from "./counter.js";
 import { admitsFinite, admitsReading } from "./finite-value.util.js";
+import { MAX_SERIES_KEY_LENGTH } from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -31,6 +33,15 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
    * `admitsFinite` can set it, as with the counter's and gauge's latches.
    */
   private readonly nonFinite = { warned: false };
+
+  /**
+   * Whether a label past the cap, or one too long, has been reported: once
+   * per metric, though the cap is reached again in every window it fills.
+   */
+  private readonly labelLimit = { capWarned: false, longWarned: false };
+
+  /** How many labels the current window holds. */
+  private _windowLabels = 0;
 
   /**
    * The name of the summary.
@@ -212,6 +223,9 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
     }
 
     const key = label ?? DEFAULT_LABEL;
+    if (!this.labels && !(key in this._count) && !this.admitsLabel(key)) {
+      return;
+    }
     // Before anything is updated, so the count, maximum and sample keep
     // describing the observations the total does.
     const sum = (this._sum[key] ?? 0) + value;
@@ -219,6 +233,9 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
       return;
     }
     const count = (this._count[key] ?? 0) + 1;
+    if (count === 1) {
+      this._windowLabels += 1;
+    }
     this._count[key] = count;
     this._sum[key] = sum;
     this._max[key] = Math.max(this._max[key] ?? value, value);
@@ -238,10 +255,47 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
    * rather than being thrown away.
    */
   markFlushed(): void {
+    this._windowLabels = 0;
     this._count = {};
     this._sum = {};
     this._max = {};
     this._samples = {};
+  }
+
+  /**
+   * Whether a summary that declared no labels may open `label` in this
+   * window: one within the cap and short enough for the collector, as a
+   * counter's series is.
+   *
+   * Without it the labels were bounded by nothing but the next flush written,
+   * which an agent that sends nothing - switched off, or without credentials -
+   * never does: a label taken from a request, a search term say, stayed for
+   * the life of the process, at whatever length the request allowed. Refuses
+   * rather than throws, for the reason `admitsSeries` gives.
+   */
+  private admitsLabel(label: string): boolean {
+    if (label.length > MAX_SERIES_KEY_LENGTH) {
+      if (!this.labelLimit.longWarned) {
+        this.labelLimit.longWarned = true;
+        console.warn(
+          `[observe] Metric "${this.name}" ignored a label of ${label.length} characters; ` +
+            `the collector accepts at most ${MAX_SERIES_KEY_LENGTH}. Shorter labels keep recording.`,
+        );
+      }
+      return false;
+    }
+    if (this._windowLabels < MAX_SERIES_PER_METRIC) {
+      return true;
+    }
+    if (!this.labelLimit.capWarned) {
+      this.labelLimit.capWarned = true;
+      console.warn(
+        `[observe] Metric "${this.name}" reached ${MAX_SERIES_PER_METRIC} distinct labels in one window; ` +
+          `further labels are ignored until the next flush. This usually means a label carries something ` +
+          `unbounded (a user id, a search term, a URL). Existing labels keep recording.`,
+      );
+    }
+    return false;
   }
 
   /**

@@ -1,4 +1,12 @@
 /**
+ * The longest series key - the serialised label combination - the collector
+ * accepts. A longer one is not truncated there: the whole batch it rides in is
+ * refused, logs and spans included. The longest label it accepts, too, which
+ * is what a summary keys its series by.
+ */
+export const MAX_SERIES_KEY_LENGTH = 255;
+
+/**
  * Whether the first argument of a counter's or a gauge's call is a label set
  * rather than the value.
  *

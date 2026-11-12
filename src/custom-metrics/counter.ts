@@ -1,6 +1,6 @@
 import { CustomMetric } from "../interfaces/custom-metric.interface.js";
 import { admitsFinite, admitsReading } from "./finite-value.util.js";
-import { isLabelSet } from "./label-values.util.js";
+import { isLabelSet, MAX_SERIES_KEY_LENGTH } from "./label-values.util.js";
 
 const DEFAULT_LABEL = "default" as const;
 
@@ -26,19 +26,14 @@ export function stringifyLabel(label: Record<string, string | number>): string {
  * flushed for the life of the process. That is correct for a counter and fatal
  * for one labelled with something unbounded - a user id, a request id, a raw
  * URL - which grows this object forever inside the *host application's* memory
- * and adds a row per series to every flush. Summaries need no such cap; their
- * windows are cleared on each flush.
+ * and adds a row per series to every flush. A summary's labels go when its
+ * window does, on each flush written - but a flush that is never written, by
+ * an agent switched off or without credentials, never clears one, so a
+ * summary that declared no labels is held to the same number per window.
  *
  * A thousand is far above a sensible label set and far below a leak.
  */
 export const MAX_SERIES_PER_METRIC = 1_000;
-
-/**
- * The longest series key - the serialised label combination - the collector
- * accepts. A longer one is not truncated there: the whole batch it rides in is
- * refused, logs and spans included.
- */
-const MAX_SERIES_KEY_LENGTH = 255;
 
 /**
  * Whether a metric may record under `key`: a series it already has, or a new

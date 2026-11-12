@@ -1,6 +1,7 @@
 import type { MockInstance } from "vitest";
 import { Counter, MAX_SERIES_PER_METRIC } from "./counter.js";
 import { Gauge } from "./gauge.js";
+import { Summary } from "./summary.js";
 
 describe("series cardinality cap", () => {
   let warn: MockInstance;
@@ -86,6 +87,72 @@ describe("series cardinality cap", () => {
       expect(Object.keys(gauge.value).length).toBeLessThanOrEqual(
         MAX_SERIES_PER_METRIC,
       );
+    });
+  });
+
+  /**
+   * A summary that declared no labels takes any. Its window is cleared only
+   * when a flush is written, which an agent sending nothing - switched off,
+   * or without credentials - never does: each new label stayed for the life
+   * of the process.
+   */
+  describe("summary without declared labels", () => {
+    const observeEach = (summary: Summary<string>, n: number, from = 0) => {
+      for (let i = from; i < from + n; i++) {
+        summary.observe(1, `user-${i}`);
+      }
+    };
+
+    it("stops taking labels at the cap, keeping the ones it has", () => {
+      const summary = new Summary<string>("search_ms");
+
+      observeEach(summary, MAX_SERIES_PER_METRIC + 500);
+      summary.observe(7, "user-0");
+
+      const observations = summary.observations;
+      expect(Object.keys(observations)).toHaveLength(MAX_SERIES_PER_METRIC);
+      expect(observations["user-0"]).toBe(2);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('"search_ms"');
+    });
+
+    it("takes them again in the next window, without another warning", () => {
+      const summary = new Summary<string>("search_ms");
+      observeEach(summary, MAX_SERIES_PER_METRIC + 1);
+
+      summary.markFlushed();
+      observeEach(summary, MAX_SERIES_PER_METRIC + 1, 5_000);
+
+      expect(Object.keys(summary.observations)).toHaveLength(
+        MAX_SERIES_PER_METRIC,
+      );
+      expect(summary.observations["user-5000"]).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a label longer than the collector accepts", () => {
+      const summary = new Summary<string>("search_ms");
+
+      summary.observe(1, "a".repeat(256));
+      summary.observe(1, "b".repeat(90_000));
+      summary.observe(1, "c".repeat(255));
+
+      expect(Object.keys(summary.observations)).toEqual(["c".repeat(255)]);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves a summary that declared its labels alone", () => {
+      const labels = Array.from(
+        { length: MAX_SERIES_PER_METRIC + 1 },
+        (_, i) => `l${i}`,
+      );
+      const summary = new Summary<string>("declared", { labels });
+
+      for (const label of labels) {
+        summary.observe(1, label);
+      }
+
+      expect(Object.keys(summary.observations)).toHaveLength(labels.length);
     });
   });
 });
