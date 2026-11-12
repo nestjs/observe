@@ -118,8 +118,8 @@ export type SqlDialect = "postgresql" | "mysql";
  * `/*` is matched alone and its end found by hand.
  *
  * MySQL quotes strings in `"` as well as `'`, as its default sql_mode does
- * (under ANSI_QUOTES a `"` name goes too), with backslash escapes in both -
- * NO_BACKSLASH_ESCAPES is not assumed - and `#` starts a comment. `--` does
+ * (under ANSI_QUOTES a `"` name goes too), with backslash escapes in both,
+ * and `#` starts a comment. `--` does
  * only before whitespace or a control character, as MySQL reads it:
  * `credit--5` is `credit - -5`, and the rest of its line is still SQL, quotes
  * and all. Its block comments do not nest.
@@ -129,7 +129,19 @@ const TOKEN: Record<SqlDialect, RegExp> = {
     /(?<nested>\/\*)|(?<comment>--[^\n]*)|(?<name>"(?:[^"]|"")*(?:"|$)|`(?:[^`]|``)*(?:`|$))|(?<![\w$])(?<escape>[eE])'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|(?<plain>'(?:[^']|'')*(?:'|$))|(?<!\w)\$(?<tag>[A-Za-z_]*)\$[\s\S]*?(?:\$\k<tag>\$|$)/g,
   mysql:
     // eslint-disable-next-line no-control-regex -- MySQL's rule for `--`.
-    /(?<comment>\/\*[\s\S]*?(?:\*\/|$)|--(?=[\u0000-\u0020\u007f]|$)[^\n]*|#[^\n]*)|(?<name>`(?:[^`]|``)*(?:`|$))|'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|"(?:[^"\\]|\\[\s\S]?|"")*(?:"|$)/g,
+    /(?<comment>\/\*[\s\S]*?(?:\*\/|$)|--(?=[\u0000-\u0020\u007f]|$)[^\n]*|#[^\n]*)|(?<name>`(?:[^`]|``)*(?:`|$))|(?<plain>'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|"(?:[^"\\]|\\[\s\S]?|"")*(?:"|$))/g,
+};
+
+/**
+ * An odd run of backslashes before the quote a string opened with. Whether
+ * that quote ends the string is a session setting the statement does not
+ * show: Postgres's standard_conforming_strings, MySQL's NO_BACKSLASH_ESCAPES.
+ * Read the wrong way, everything after it is out of step - the SQL between
+ * literals masked and the literals shipped - so nothing after it is kept.
+ */
+const ESCAPED_QUOTE: Record<string, RegExp> = {
+  "'": /(?<!\\)(?:\\\\)*\\'/,
+  '"': /(?<!\\)(?:\\\\)*\\"/,
 };
 
 function stripLiteralsAndComments(sql: string, dialect: SqlDialect): string {
@@ -147,10 +159,8 @@ function stripLiteralsAndComments(sql: string, dialect: SqlDialect): string {
       text += " ";
     } else if (name !== undefined) {
       text += name;
-    } else if (plain !== undefined && /(?<!\\)(?:\\\\)*\\'/.test(plain)) {
-      // An odd run of backslashes before a quote: with
-      // standard_conforming_strings off, the quote does not end the string
-      // here, so where it does end is unknown - and so is everything after.
+    } else if (plain !== undefined && ESCAPED_QUOTE[plain[0]].test(plain)) {
+      // Where this string ends is unknown, and so is everything after it.
       return `${text}?`;
     } else {
       text += `${escape ?? ""}?`;

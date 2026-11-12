@@ -222,10 +222,30 @@ describe("describeSqlStatement for MySQL", () => {
       `SELECT * FROM users WHERE email = "secret@example.com"`,
       "SELECT * FROM users WHERE email = ?",
     ],
-    [`SELECT "it\\"s", "a""b", "c'd" FROM t`, "SELECT ?, ?, ? FROM t"],
+    [`SELECT "a""b", "c'd", "it\\'s" FROM t`, "SELECT ?, ?, ? FROM t"],
+    [
+      "SELECT 'a\\\\', 'b' FROM t WHERE c = 'secret-value'",
+      "SELECT ?, ? FROM t WHERE c = ?",
+    ],
+    // A backslash escapes a quote, unless the server runs with
+    // NO_BACKSLASH_ESCAPES - then `'C:\'` is a whole string. Where such a
+    // string ends is the server's to say, so nothing after it is shipped.
+    [
+      "UPDATE files SET opened_at = NOW() WHERE path = 'C:\\' AND tenant_key = 'tenant-secret'",
+      "UPDATE files SET opened_at = NOW() WHERE path = ?",
+    ],
+    [
+      `SELECT * FROM t WHERE path = "C:\\" AND k = "tenant-secret"`,
+      "SELECT * FROM t WHERE path = ?",
+    ],
     [
       "SELECT * FROM t WHERE a = 'it\\'s' AND b = 'secret-value'",
-      "SELECT * FROM t WHERE a = ? AND b = ?",
+      "SELECT * FROM t WHERE a = ?",
+    ],
+    [`SELECT "it\\"s", "secret-value" FROM t`, "SELECT ?"],
+    [
+      "SELECT * FROM t WHERE a = 'x\\\\\\' AND b = 'secret-value'",
+      "SELECT * FROM t WHERE a = ?",
     ],
     [
       "SELECT * FROM t WHERE id = 1 # user=secret@example.com",
