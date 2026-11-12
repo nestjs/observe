@@ -58,6 +58,151 @@ describe("LogRedactor", () => {
     });
   });
 
+  describe("key=value edge cases", () => {
+    it("reads a quoted value past the quotes it escapes", () => {
+      const output = redactor.redactMessage(
+        String.raw`Login refused: {"user":"bob","password":"Tr0\"ub4dor-correct-horse"}`,
+      );
+
+      expect(output).not.toMatch(/Tr0|horse/);
+      expect(output).toContain('"user":"bob"');
+    });
+
+    it("masks pairs in JSON that is itself inside a string", () => {
+      const output = redactor.redactMessage(
+        String.raw`POST failed: {"body":"{\"password\":\"hunter2\",\"api_key\":\"k3y-9f3c\",\"user\":\"bob\"}"}`,
+      );
+
+      expect(output).not.toMatch(/hunter2|k3y-9f3c/);
+      expect(output).toContain(String.raw`\"user\":\"bob\"`);
+    });
+
+    it("masks a quoted value cut off before its closing quote", () => {
+      expect(redactor.redactMessage('{"user":"bob","password":"hunter')).toBe(
+        '{"user":"bob","password":[REDACTED]',
+      );
+      expect(
+        redactor.redactMessage('password="hunter2" user="bob attempt=3'),
+      ).toBe('password=[REDACTED] user="bob attempt=3');
+    });
+
+    it("masks every cookie of a Cookie header", () => {
+      expect(
+        redactor.redactMessage(
+          "Cookie: theme=dark; connect.sid=s%3AQb2x.k9f3c1a7e; lang=en",
+        ),
+      ).toBe("Cookie: [REDACTED]");
+    });
+
+    it("masks an Authorization header whatever its scheme", () => {
+      for (const header of [
+        "Authorization: ApiKey sk_live_9f3c1a7e2b4d",
+        "authorization: Negotiate YIIGhgYJKoZIhvcSAQICAQBu",
+        "Proxy-Authorization: Digest username=bob, response=6629fae4",
+        "authorization: 4000 0566 5566 5556",
+      ]) {
+        expect(redactor.redactMessage(header), header).toBe(
+          `${header.split(":")[0]}: [REDACTED]`,
+        );
+      }
+    });
+
+    it("masks a card number in full behind a sensitive key", () => {
+      expect(
+        redactor.redactMessage("token: 4000 0566 5566 5556 retry"),
+      ).not.toMatch(/0566|5556/);
+    });
+
+    it("masks a structure under a sensitive key, and nothing after it", () => {
+      expect(
+        redactor.redactMessage(
+          'failed with {"auth":{"user":"alice","pass":"abc123def"},"retries":25} after 3 tries',
+        ),
+      ).toBe('failed with {"auth":[REDACTED],"retries":25} after 3 tries');
+      expect(redactor.redactMessage("credentials=[abc, def] refused")).toBe(
+        "credentials=[REDACTED] refused",
+      );
+      expect(
+        redactor.redactMessage('token: expired {"attempt":3} for u-1'),
+      ).toBe('token: [REDACTED] {"attempt":3} for u-1');
+    });
+
+    it("does not take the next key for the value of an empty one", () => {
+      for (const message of [
+        "currentPassword:\nnewPassword: correct-horse-battery-staple",
+        "currentPassword: newPassword: correct-horse-battery-staple",
+        "Invalid Basic credentials: dXNlcjpwYXNzd29yZA",
+      ]) {
+        const output = redactor.redactMessage(message);
+        expect(output, message).not.toMatch(/correct-horse|dXNlcjpw/);
+        expect(output, message).not.toMatch(/\[REDACTED\]:/);
+      }
+    });
+
+    it("masks pairs as util.inspect prints a Map or URLSearchParams", () => {
+      expect(
+        redactor.redactMessage("Map(1) { 'password' => '7822abcd' }"),
+      ).toBe("Map(1) { 'password' => [REDACTED] }");
+      expect(
+        redactor.redactMessage("URLSearchParams { 'token' => 'abc123def' }"),
+      ).toBe("URLSearchParams { 'token' => [REDACTED] }");
+    });
+
+    it("holds free text to the same key list as attributes", () => {
+      for (const pair of [
+        "passwordConfirmation=hunter2",
+        "password2=hunter2",
+        "secret_value=hunter2",
+        "X-Amz-Signature=hunter2",
+        "client_jwt=hunter2",
+      ]) {
+        expect(redactor.redactMessage(`sent ${pair} ok`), pair).toBe(
+          `sent ${pair.split("=")[0]}=[REDACTED] ok`,
+        );
+      }
+      expect(
+        new LogRedactor({ keys: ["tenant_ref"] }).redactMessage(
+          "tenant_ref=acme",
+        ),
+      ).toBe("tenant_ref=[REDACTED]");
+    });
+
+    it("still leaves keys that only mention a credential alone", () => {
+      for (const message of [
+        "maxTokens=4096 tokenCount=12",
+        "secretary: Alice",
+        "author=bob sortKey=name",
+        "http://example.com:8080/path",
+      ]) {
+        expect(redactor.redactMessage(message)).toBe(message);
+      }
+    });
+
+    it("masks a value behind colour codes", () => {
+      expect(
+        redactor.redactMessage(
+          "{ password: \x1b[32m'hunter2-9f3c'\x1b[39m, card: \x1b[33m4111111111111111\x1b[39m }",
+        ),
+      ).toBe("{ password: [REDACTED], card: [REDACTED] }");
+    });
+
+    it.each([
+      ["unclosed brackets", "password=[".repeat(30_000)],
+      ["unclosed quotes", 'password="'.repeat(30_000)],
+      ["escaped quotes", String.raw`\"password\":\"`.repeat(20_000)],
+      ["empty values", "password: ".repeat(30_000)],
+      ["keys only", "password".repeat(30_000)],
+      ["nested opening", "token={".repeat(30_000)],
+    ])("scans %s in linear time", (_name, text) => {
+      const startedAt = performance.now();
+
+      redactor.redactMessage(text);
+      redactor.redactSource(text.split("\n"));
+
+      expect(performance.now() - startedAt).toBeLessThan(250);
+    });
+  });
+
   describe("authorization schemes", () => {
     it.each(["Bearer", "Basic", "Token"])(
       "keeps the scheme and masks the credential for a bare %s token",
@@ -288,6 +433,21 @@ describe("LogRedactor", () => {
       }
     });
 
+    it("masks one followed by an expiry date or a CVV", () => {
+      for (const message of [
+        "card 4111111111111111 12/27",
+        "card 4111111111111111 123",
+        "on 2026-11-05 4111 1111 1111 1111 charged",
+      ]) {
+        expect(redactor.redactMessage(message), message).not.toMatch(
+          /4111|1111 1111/,
+        );
+      }
+      expect(redactor.redactMessage("on 2026-11-05 4111 1111 1111 1111")).toBe(
+        "on 2026-11-05 [REDACTED]",
+      );
+    });
+
     it("leaves a long number that is not Luhn-valid alone", () => {
       // Order ids, concatenated timestamps and trace ids are all card-shaped.
       // A rule that masked them would shred ordinary numeric log data and get
@@ -372,6 +532,27 @@ describe("LogRedactor", () => {
 
       expect(JSON.stringify(output)).toContain("[REDACTED]");
       expect(JSON.stringify(output)).not.toContain("bottom");
+    });
+
+    it("matches a key written with colour codes", () => {
+      expect(
+        redactor.redactAttributes({ "\x1b[32mpassword\x1b[39m": "hunter2" }),
+      ).toEqual({ password: "[REDACTED]" });
+    });
+
+    it("masks a card number given as a number", () => {
+      expect(
+        redactor.redactAttributes({ number: 4111111111111111, amount: 1250 }),
+      ).toEqual({ number: "[REDACTED]", amount: 1250 });
+    });
+
+    it("redacts a secret that ended up in a key", () => {
+      // A JSON body parsed as a form: the whole document is one key.
+      const output = redactor.redactAttributes({
+        '{"username":"a","password":"hunter2"}': "",
+      });
+
+      expect(JSON.stringify(output)).not.toContain("hunter2");
     });
 
     it("passes undefined through", () => {

@@ -1,4 +1,5 @@
 import { RedactionOptions } from "../interfaces/observe-options.interface.js";
+import { stripAnsi } from "./log-line.parser.js";
 import {
   createSensitiveKeyMatcher,
   SensitiveKeyMatcher,
@@ -25,33 +26,6 @@ import {
  */
 
 const DEFAULT_REPLACEMENT = "[REDACTED]";
-
-/**
- * Key names recognised inside free text, as `key=value` or `"key": "value"`.
- * Spelled for a regex, where the separators are still present. Unanchored on
- * the left, so a compound name - `resetToken=`, `client_secret=` - matches on
- * its ending, the same way `sensitive-keys.ts` matches a structured key.
- */
-const TEXT_KEY_ALTERNATION = [
-  "password",
-  "passwd",
-  "pwd",
-  "secret",
-  "token",
-  "access[_-]?token",
-  "refresh[_-]?token",
-  "id[_-]?token",
-  "api[_-]?key",
-  "authorization",
-  "auth",
-  "credentials?",
-  "private[_-]?key",
-  "access[_-]?key",
-  "secret[_-]?key",
-  "session[_-]?id",
-  "set-cookie",
-  "cookie",
-].join("|");
 
 interface PatternRule {
   pattern: RegExp;
@@ -205,44 +179,291 @@ function isBase64Char(code: number): boolean {
 }
 
 /**
+ * A name followed by `:`, `=`, `:=` or `=>`, as free text writes a pair:
+ * `password=x`, `"token": "x"`, `\"secret\":\"x\"` (JSON inside a string),
+ * `'password' => 'x'` (util.inspect of a Map), `api.key: x`, `auth[token]=x`.
+ * Not `==`, which compares rather than assigns, and `=>` only after a quoted
+ * name, as util.inspect writes one - otherwise it is an arrow function. Must
+ * not start inside a name,
+ * so each name is tried once, from its first character; a bracket is not part
+ * of the name's own run, so `[token=x]` is a name after a bracket.
+ */
+const KEY_CANDIDATE =
+  /(?<![\w$.-])((?:\\?["'])?)([A-Za-z_$][\w$.-]*(?:\[[\w$.-]*\])*)((?:\\?["'])?)[ \t]*(:=|=>|:|=(?!=))[ \t]*/g;
+
+/**
+ * What every name the shared matcher calls sensitive contains, written
+ * without separators. Tested first so the matcher - which splits a name into
+ * words - runs only for the few names that could be one.
+ */
+const KEY_STEMS = /pass|pwd|secret|token|auth|cred|key|sig|jwt|cookie|session/i;
+
+/**
+ * Names whose value is a whole header: a scheme and a credential
+ * (`Authorization: ApiKey sk_...`), or every cookie of a `Cookie` line.
+ */
+const HEADER_KEY = /(?:authorization|cookie)$/;
+
+/** Where a bare value ends: what the old rule's `[^\s,;&}"']` stopped at. */
+const BARE_VALUE_END = /[\s,;&}"']/;
+/**
+ * Where a header value ends: the line, a quote, or the object it sits in. Not
+ * a comma - a Digest credential is a list of them.
+ */
+const HEADER_VALUE_END = /[\r\n"'\\}]/;
+const SCHEME_WORD = /^(?:bearer|basic|token)$/i;
+
+/**
+ * `key=value` / `"key": "value"`, the value masked and the key kept - a log
+ * reading `password=[REDACTED]` is far more useful than one where the whole
+ * pair vanished.
+ *
+ * A scan rather than a regex, for what a regex could not read: a quoted value
+ * past the quotes it escapes, JSON inside a string (`\"password\":\"x\"`), a
+ * value cut off before its closing quote, an object or array under a
+ * sensitive name, a header that runs past its first space. Every character is
+ * read a bounded number of times: a value is read once, and the scan resumes
+ * after it.
+ *
+ * The name is held to the same matcher as an attribute's key - the
+ * deployment's `redaction.keys` included - so free text and structured data
+ * cannot drift apart.
+ *
  * `literalValuesOnly` is the variant for source code, where the text either
  * side of a `:` or `=` is mostly identifiers: `const token = await sign(user)`
  * assigns no secret, and masking `await` would shred every frame that mentions
  * a credential by name. In source a secret is a literal, so only a quoted
  * value is masked there.
  */
-function buildDefaultRules(literalValuesOnly = false): CompiledRule[] {
-  const value = literalValuesOnly
-    ? "(?:\"[^\"\\n]*\"|'[^'\\n]*'|`[^`]*`)"
-    : "(?:\"[^\"]*\"|'[^']*'|(?:Bearer|Basic|Token)\\s+\\S+|[^\\s,;&}\"']+)";
+function keyValueRule(
+  isSensitiveKey: SensitiveKeyMatcher,
+  checkEveryKey: boolean,
+  literalValuesOnly: boolean,
+): ScanRule {
+  const isSensitive = (key: string) => {
+    const bare = key.replace(/[-_. [\]]/g, "");
+    return (checkEveryKey || KEY_STEMS.test(bare)) && isSensitiveKey(key);
+  };
+  return {
+    scan: (text, mask) => {
+      const candidate = new RegExp(KEY_CANDIDATE.source, "g");
+      let output = "";
+      let copiedTo = 0;
+      let match: RegExpExecArray | null;
+      while ((match = candidate.exec(text))) {
+        const key = match[2];
+        if ((match[4] === "=>" && !match[3]) || !isSensitive(key)) {
+          continue;
+        }
+        const valueStart = match.index + match[0].length;
+        // `"token=" + token`: a quote opened before the name and not closed
+        // after it means the pair is inside a string, and a value starting
+        // with that quote is the string ending, not a value.
+        const enclosing = match[3] ? "" : match[1].replace("\\", "");
+        if (
+          enclosing &&
+          (text[valueStart] === enclosing ||
+            (text[valueStart] === "\\" && text[valueStart + 1] === enclosing))
+        ) {
+          continue;
+        }
+        const header = HEADER_KEY.test(key.toLowerCase().replace(/[-_]/g, ""));
+        const valueEnd = readValue(text, valueStart, literalValuesOnly, header);
+        if (valueEnd === -1) {
+          continue;
+        }
+        output += text.slice(copiedTo, valueStart);
+        output += mask(text.slice(valueStart, valueEnd));
+        copiedTo = valueEnd;
+        candidate.lastIndex = valueEnd;
+      }
+      return copiedTo === 0 ? text : output + text.slice(copiedTo);
+    },
+  };
+}
+
+/** Where the value starting at `at` ends, or -1 when there is none to mask. */
+function readValue(
+  text: string,
+  at: number,
+  literalValuesOnly: boolean,
+  header: boolean,
+): number {
+  const first = text[at];
+  if (first === undefined) {
+    return -1;
+  }
+
+  let end: number;
+  if (first === "\\" && (text[at + 1] === '"' || text[at + 1] === "'")) {
+    end = readEscapedQuoted(text, at);
+  } else if (first === '"' || first === "'" || first === "`") {
+    end = readQuoted(text, at, literalValuesOnly);
+  } else if (literalValuesOnly) {
+    return -1;
+  } else if (header) {
+    end = runUntil(text, at, HEADER_VALUE_END);
+    return end === at ? -1 : end;
+  } else if (first === "{" || first === "[") {
+    end = readBracketed(text, at);
+  } else {
+    end = runUntil(text, at, BARE_VALUE_END);
+    if (end === at || text[end - 1] === ":") {
+      // Nothing, or the next pair's key: `currentPassword: newPassword: x`.
+      return -1;
+    }
+    if (SCHEME_WORD.test(text.slice(at, end)) && /[ \t]/.test(text[end])) {
+      // `token: Bearer eyJ...` - the credential, not just its scheme.
+      const credential = skipBlanks(text, end);
+      const credentialEnd = runUntil(text, credential, /\s/);
+      return credentialEnd > credential ? credentialEnd : end;
+    }
+    return end;
+  }
+
+  if (literalValuesOnly) {
+    return end;
+  }
+  // A quoted name rather than a value: `"currentPassword": "newPassword": x`.
+  const after = skipBlanks(text, end);
+  if (
+    text[after] === ":" &&
+    end < text.length &&
+    first !== "{" &&
+    first !== "["
+  ) {
+    return -1;
+  }
+  // Text run on behind a closing quote or bracket is the value's too:
+  // `token=[abc]def`.
+  while (end < text.length && /\w/.test(text[end])) {
+    end++;
+  }
+  return end;
+}
+
+function runUntil(text: string, at: number, stop: RegExp): number {
+  let end = at;
+  while (end < text.length && !stop.test(text[end])) {
+    end++;
+  }
+  return end;
+}
+
+function skipBlanks(text: string, at: number): number {
+  let end = at;
+  while (text[end] === " " || text[end] === "\t") {
+    end++;
+  }
+  return end;
+}
+
+/**
+ * A quoted value through its closing quote, past the quotes it escapes. One
+ * that is not closed on its line - a message cut short - runs to the end of
+ * the line (a template literal in source, to the end of the text): what it
+ * held is masked rather than the head of it kept.
+ */
+function readQuoted(text: string, at: number, inSource = false): number {
+  const quote = text[at];
+  const spansLines = inSource && quote === "`";
+  for (let i = at + 1; i < text.length; i++) {
+    const char = text[i];
+    if (char === "\\") {
+      i++;
+    } else if (char === quote) {
+      return i + 1;
+    } else if (char === "\n" && !spansLines) {
+      return i;
+    }
+  }
+  return text.length;
+}
+
+/**
+ * A value quoted with escaped quotes - `\"x\"`, JSON inside a JSON string -
+ * through its closing `\"`. Inside it, a quote of its own is `\\\"`; a quote
+ * behind an even run of backslashes is the enclosing string's, and ends the
+ * value before it.
+ */
+function readEscapedQuoted(text: string, at: number): number {
+  const quote = text[at + 1];
+  for (let i = at + 2; i < text.length; i++) {
+    if (text[i] === "\n") {
+      return i;
+    }
+    if (text[i] !== "\\") {
+      continue;
+    }
+    let runEnd = i;
+    while (runEnd < text.length && text[runEnd] === "\\") {
+      runEnd++;
+    }
+    const run = runEnd - i;
+    if (text[runEnd] === quote) {
+      if (run % 2 === 0) {
+        return runEnd;
+      }
+      if (run % 4 === 1) {
+        return runEnd + 1;
+      }
+    }
+    i = runEnd - 1;
+  }
+  return text.length;
+}
+
+/**
+ * An object or array through the bracket that closes it, its strings read as
+ * strings. One never closed runs to the end of the text.
+ */
+function readBracketed(text: string, at: number): number {
+  let depth = 0;
+  for (let i = at; i < text.length; i++) {
+    const char = text[i];
+    if (char === "{" || char === "[") {
+      depth++;
+    } else if (char === "}" || char === "]") {
+      depth--;
+      if (depth === 0) {
+        return i + 1;
+      }
+    } else if (char === '"') {
+      i = readQuoted(text, i) - 1;
+    } else if (char === "\\") {
+      i++;
+    }
+  }
+  return text.length;
+}
+
+function buildDefaultRules(
+  isSensitiveKey: SensitiveKeyMatcher,
+  checkEveryKey: boolean,
+  literalValuesOnly = false,
+): CompiledRule[] {
   return [
     // PEM blocks first: they span lines and would otherwise be partially eaten
     // by the narrower rules below.
     { scan: scanPemBlocks },
+    // Card numbers before any key: a key's bare value stops at a space, so
+    // `token: 4000 0566 5566 5556` would lose only its first group.
+    { scan: scanCardNumbers },
     // Authorization schemes: `Bearer eyJ...`, `Basic dXNlcjpwYXNz`.
     //
     // Must precede the key=value rule. That rule's value stops at whitespace, so
     // on `Authorization: Basic dXNlcjpwYXNz` it would consume only the word
-    // "Basic" and leave the credential itself sitting in the line.
+    // "Basic" and leave the credential itself sitting in the line. Not a word
+    // followed by `:` - `Invalid Basic credentials: dXNl...` names a key, whose
+    // value the key=value rule masks.
     {
       pattern:
-        /\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8}[A-Za-z0-9._~+/=-]*/gi,
+        /\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=%-]{8}[A-Za-z0-9._~+/=%-]*(?![A-Za-z0-9._~+/=%-]|[ \t]*:)/gi,
       replace: (replacement, scheme) => `${scheme} ${replacement}`,
     },
-    // key=value / "key": "value". Keeps the key so the line still says what was
-    // removed - a log reading `password=[REDACTED]` is far more useful than one
-    // where the whole pair vanished.
-    //
-    // The value alternation matches a scheme-prefixed credential before the bare
-    // form, so an already-masked `Authorization: Bearer [REDACTED]` collapses to
-    // a single `[REDACTED]` rather than stacking two.
-    {
-      pattern: new RegExp(
-        `((?:${TEXT_KEY_ALTERNATION})["']?\\s*[:=]\\s*)${value}`,
-        "gi",
-      ),
-      replace: (replacement, prefix) => `${prefix}${replacement}`,
-    },
+    // The scheme-prefixed form already masked above collapses here into one
+    // `[REDACTED]` under an `Authorization` key, rather than two stacked.
+    keyValueRule(isSensitiveKey, checkEveryKey, literalValuesOnly),
     // Bare JWTs - they show up outside any header often enough to matter.
     // A signed one has three parts; an encrypted one (JWE) five, the second
     // of them empty under `alg: dir`.
@@ -277,8 +498,91 @@ function buildDefaultRules(literalValuesOnly = false): CompiledRule[] {
  * ids, timestamps concatenated together - so the digits are Luhn-checked before
  * anything is masked. That turns a rule which would otherwise shred numeric log
  * data into one that only fires on something genuinely card-shaped.
+ *
+ * Read as runs of digit groups, so a card beside other numbers - an expiry
+ * date, a CVV, a timestamp in front - is still found: a card is one group of
+ * 13-19 digits, or groups in a card's own layout (4-4-4-4 and its shorter and
+ * longer forms, 4-6-5, 4-6-4). Only those windows are Luhn-checked, so the
+ * odds of masking an ordinary run of numbers stay what they were.
  */
-const CARD_CANDIDATE = /(?:\b|(?<=\\[nrtbf]))\d(?:[ -]?\d){12,18}\b/g;
+const DIGIT_RUN = /(?:\b|(?<=\\[nrtbf]))\d+(?:[ -]\d+)*/g;
+const CARD_LAYOUTS = [
+  [4, 4, 4, 4, 3],
+  [4, 4, 4, 4, 2],
+  [4, 4, 4, 4, 1],
+  [4, 4, 4, 4],
+  [4, 6, 5],
+  [4, 6, 4],
+  [4, 4, 4, 3],
+  [4, 4, 4, 2],
+  [4, 4, 4, 1],
+];
+
+function scanCardNumbers(text: string, mask: (secret: string) => string) {
+  let output = "";
+  let copiedTo = 0;
+  for (const run of text.matchAll(DIGIT_RUN)) {
+    const runEnd = run.index + run[0].length;
+    // A run that goes on into a word (`4111...abc`) is an identifier.
+    const usable = /\w/.test(text[runEnd] ?? "")
+      ? run[0].slice(0, Math.max(0, run[0].search(/[ -]\d+$/)))
+      : run[0];
+    if (usable.length < 13) {
+      continue;
+    }
+    const groups: Array<[start: number, end: number]> = [];
+    for (const group of usable.matchAll(/\d+/g)) {
+      groups.push([
+        run.index + group.index,
+        run.index + group.index + group[0].length,
+      ]);
+    }
+    for (let i = 0; i < groups.length; ) {
+      const end = cardEndingAt(text, groups, i);
+      if (end === undefined) {
+        i++;
+        continue;
+      }
+      output +=
+        text.slice(copiedTo, groups[i][0]) +
+        mask(text.slice(groups[i][0], groups[end][1]));
+      copiedTo = groups[end][1];
+      i = end + 1;
+    }
+  }
+  return copiedTo === 0 ? text : output + text.slice(copiedTo);
+}
+
+/** The last group of a Luhn-valid card starting at group `first`, if any. */
+function cardEndingAt(
+  text: string,
+  groups: Array<[number, number]>,
+  first: number,
+): number | undefined {
+  const length = (i: number) => groups[i][1] - groups[i][0];
+  const digitsOf = (from: number, to: number) => {
+    let digits = "";
+    for (let i = from; i <= to; i++) {
+      digits += text.slice(groups[i][0], groups[i][1]);
+    }
+    return digits;
+  };
+  if (length(first) >= 13 && length(first) <= 19) {
+    return isLuhnValid(digitsOf(first, first)) ? first : undefined;
+  }
+  for (const layout of CARD_LAYOUTS) {
+    if (first + layout.length > groups.length) {
+      continue;
+    }
+    if (layout.every((size, offset) => length(first + offset) === size)) {
+      const last = first + layout.length - 1;
+      if (isLuhnValid(digitsOf(first, last))) {
+        return last;
+      }
+    }
+  }
+  return undefined;
+}
 
 function isLuhnValid(digits: string): boolean {
   let sum = 0;
@@ -316,9 +620,15 @@ export class LogRedactor {
   constructor(options: RedactionOptions = {}) {
     this.replacement = options.replacement ?? DEFAULT_REPLACEMENT;
     this.redactCards = options.useDefaultPatterns !== false;
+    this.matchesSensitiveKey = createSensitiveKeyMatcher(options.keys);
 
+    // Configured keys are matched exactly and can be anything, so the cheap
+    // stem test in front of the matcher cannot stand in for them.
+    const checkEveryKey = (options.keys ? [...options.keys].length : 0) > 0;
     const defaults =
-      options.useDefaultPatterns === false ? [] : buildDefaultRules();
+      options.useDefaultPatterns === false
+        ? []
+        : buildDefaultRules(this.matchesSensitiveKey, checkEveryKey);
     const extra: CompiledRule[] = (options.patterns ?? []).map((pattern) => ({
       // Rebuilt with the global flag: a caller-supplied pattern without /g would
       // silently redact only the first occurrence in a line.
@@ -330,10 +640,11 @@ export class LogRedactor {
 
     this.rules = [...defaults, ...extra];
     this.sourceRules = [
-      ...(options.useDefaultPatterns === false ? [] : buildDefaultRules(true)),
+      ...(options.useDefaultPatterns === false
+        ? []
+        : buildDefaultRules(this.matchesSensitiveKey, checkEveryKey, true)),
       ...extra,
     ];
-    this.matchesSensitiveKey = createSensitiveKeyMatcher(options.keys);
   }
 
   /**
@@ -345,8 +656,18 @@ export class LogRedactor {
     return this.matchesSensitiveKey(key);
   }
 
+  /**
+   * Colour codes are taken out first. The forwarder strips them off a raw
+   * line, but a JSON logger writes the escape as `\u001b`, so they only come
+   * back once the line is decoded - and between a key and its value, or in
+   * front of a card number, they stop every rule matching.
+   */
   redactMessage(message: string): string {
-    return this.apply(message, this.rules, false);
+    return this.apply(
+      message.includes("\x1b") ? stripAnsi(message) : message,
+      this.rules,
+      false,
+    );
   }
 
   /**
@@ -386,15 +707,6 @@ export class LogRedactor {
       });
     }
 
-    if (this.redactCards) {
-      output = output.replace(CARD_CANDIDATE, (match) => {
-        const digits = match.replace(/[ -]/g, "");
-        return digits.length >= 13 && isLuhnValid(digits)
-          ? this.replacement
-          : match;
-      });
-    }
-
     return output;
   }
 
@@ -415,22 +727,43 @@ export class LogRedactor {
     if (typeof value === "string") {
       return this.redactMessage(value);
     }
+    if (typeof value === "number") {
+      return this.isCardNumber(value) ? this.replacement : value;
+    }
     if (Array.isArray(value)) {
       return value.map((item) => this.redactValue(item, depth + 1));
     }
     if (value && typeof value === "object") {
       return Object.fromEntries(
         Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-          key,
+          this.redactKey(key),
           // A sensitive key masks its value whatever the shape - an object under
           // `credentials` is exactly what must not be walked into and partially
           // preserved.
-          this.matchesSensitiveKey(key)
+          this.matchesSensitiveKey(key.includes("\x1b") ? stripAnsi(key) : key)
             ? this.replacement
             : this.redactValue(item, depth + 1),
         ]),
       );
     }
     return value;
+  }
+
+  /**
+   * A key is a name, but not always: a JSON body parsed as a form is one key
+   * holding the whole document. Only a key long enough to hold a secret, or
+   * holding a pair, is read - the rest are the ordinary names they look like.
+   */
+  private redactKey(key: string): string {
+    return key.length > 12 || /[:=]/.test(key) ? this.redactMessage(key) : key;
+  }
+
+  /** A card number written as a JSON number: `{"number": 4111111111111111}`. */
+  private isCardNumber(value: number): boolean {
+    if (!this.redactCards || !Number.isInteger(value) || value < 1e12) {
+      return false;
+    }
+    const digits = String(value);
+    return digits.length <= 19 && /^\d+$/.test(digits) && isLuhnValid(digits);
   }
 }
