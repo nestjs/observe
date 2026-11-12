@@ -156,6 +156,22 @@ class DeskGateway {
     return { event: "sampled-out-done", data: null };
   }
 
+  // Ends its own client's connection, as a logout or a kick does, and
+  // finishes after it: socket.io emits `disconnect` from inside `disconnect()`.
+  @SubscribeMessage("leave")
+  async leave(
+    @ConnectedSocket()
+    socket: EventEmitter & { disconnect?: () => void; close?: () => void },
+  ) {
+    if (typeof socket.disconnect === "function") {
+      socket.disconnect();
+    } else {
+      socket.close?.();
+    }
+    await Promise.resolve();
+    return { event: "left", data: true };
+  }
+
   // Waits for what only its client could supply - an acknowledgement, the
   // next frame - until the test answers for it.
   @SubscribeMessage("hold")
@@ -580,6 +596,15 @@ describe.each<Platform>(["ws", "socket.io"])(
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
         expect(collected.operationIds).not.toContain("DeskGateway:hold");
+      });
+
+      it("still reports a handler that ends its own client's connection", async () => {
+        const leaving = await connectClient(platform, port);
+
+        leaving.send("leave");
+
+        await expect(snapshotOf("leave")).resolves.toBeDefined();
+        leaving.close();
       });
     });
 

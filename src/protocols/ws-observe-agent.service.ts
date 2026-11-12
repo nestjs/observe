@@ -270,10 +270,18 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
           typeof socket.disconnect === "function" ? "disconnect" : "close",
           () => {
             watched.gone = true;
-            for (const abandonTrace of watched.open) {
-              abandonTrace();
-            }
-            watched.open.clear();
+            // One macrotask later, not at once: a handler that ends its own
+            // client's connection - a logout, a kick - is still running when
+            // socket.io emits this, from inside `disconnect()`, and would
+            // lose the trace it is about to finish. A trace that settles
+            // meanwhile has left `open`; the rest are still dropped, a tick
+            // after the client left.
+            setImmediate(() => {
+              for (const abandonTrace of watched.open) {
+                abandonTrace();
+              }
+              watched.open.clear();
+            });
           },
         );
       } catch {

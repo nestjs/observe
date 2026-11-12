@@ -103,11 +103,33 @@ describe("WsObserveAgentService", () => {
     void handle(socket, "payload");
     expect(socket.listenerCount("disconnect")).toBe(1);
     socket.emit("disconnect");
+    // A tick later: a handler that disconnected its own client gets to finish.
+    expect(registry.abandonTrace).not.toHaveBeenCalled();
+    await new Promise((resolve) => setImmediate(resolve));
 
     expect(registry.abandonTrace.mock.calls.map(([id]) => id)).toEqual(
       tracedIds(),
     );
     expect(registry.endTrace).not.toHaveBeenCalled();
+  });
+
+  it("reports a handler that ends its own client's connection and then settles", async () => {
+    const socket = Object.assign(new EventEmitter(), {
+      disconnect() {
+        socket.emit("disconnect");
+      },
+    });
+    const handle = instrument(async () => {
+      socket.disconnect();
+      await Promise.resolve();
+      return "bye";
+    });
+
+    await handle(socket, "logout");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(registry.endTrace).toHaveBeenCalledTimes(1);
+    expect(registry.abandonTrace).not.toHaveBeenCalled();
   });
 
   it("drops the trace of a message whose ws client closes, and forgets one that settled first", async () => {
