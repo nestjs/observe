@@ -28,7 +28,10 @@ import {
 } from "./interfaces/observe-options.interface.js";
 import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "./observe.constants.js";
 import { GraphQLObserveAgentService } from "./protocols/graphql-observe-agent.service.js";
-import { HttpObserveAgentService } from "./protocols/http-observe-agent.service.js";
+import {
+  HttpObserveAgentService,
+  shareHttpAdapterHooks,
+} from "./protocols/http-observe-agent.service.js";
 import { OutgoingObserveAgentService } from "./outgoing/outgoing-observe-agent.service.js";
 import { OtlpTraceExporter } from "./otlp/otlp-trace-exporter.service.js";
 import {
@@ -477,6 +480,7 @@ export function createObserveModule<Store extends Record<string, unknown>>(
           },
         );
         return (instance: unknown) => {
+          shareHooksOfHttpAdapter(instance);
           deliverRepliesToTheirCaller(instance, asyncLocalStorage);
           propagateTraceIdThrough(
             instance,
@@ -493,6 +497,23 @@ export function createObserveModule<Store extends Record<string, unknown>>(
     } as NestApplicationOptions["instrument"],
     ObserveModule,
   };
+}
+
+/**
+ * Shares the HTTP adapter's request and response hooks with the application
+ * from the moment Nest creates the `HttpAdapterHost`, ahead of every provider
+ * of the application's, so a hook it sets on the adapter runs beside the
+ * agent's - see `shareHttpAdapterHooks`.
+ */
+function shareHooksOfHttpAdapter(instance: unknown): void {
+  try {
+    if (instance instanceof HttpAdapterHost) {
+      shareHttpAdapterHooks(instance);
+    }
+  } catch {
+    // `instanceof` runs a proxy's prototype trap, which may throw, and Nest
+    // 11 does not guard the instance decorator.
+  }
 }
 
 /**

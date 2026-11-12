@@ -29,6 +29,7 @@ import { openTelemetryTraceIdGenerator } from "../utils/default-trace-id-generat
 import { usesDefaultTraceIdGenerator } from "../utils/trace-id-generator-origin.util.js";
 import { inboundTraceContext } from "../utils/trace-context.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
+import { setAgentHook, shareHookSlot } from "../utils/shared-hook-slot.util.js";
 import {
   deferTraceCompletion,
   generateTraceIdSafely,
@@ -50,6 +51,46 @@ interface IncomingHttpRequest {
   method: string;
   protocol: string;
   headers?: Record<string, string | string[] | undefined>;
+}
+
+type RequestHook = (
+  req: any,
+  res: any,
+  done: (err?: Error) => unknown,
+) => unknown;
+type ResponseHook = (req: any, res: any, done?: () => void) => unknown;
+type RouteTriggeredHook = (requestMethod: RequestMethod, path: string) => void;
+
+/**
+ * Takes the adapter's request and response hooks over as soon as there is an
+ * adapter, so that hooks the application sets on it from then on run beside
+ * the agent's rather than in their place: from a provider, from `main.ts`
+ * before `listen()`. They have no getter, so a hook set on the adapter before
+ * it reached Nest cannot be found, and stays the agent's to replace. Called
+ * from the instance decorator, the moment Nest creates the `HttpAdapterHost`,
+ * and again from the agent, for an application without the decorator. On
+ * `init$` rather than the adapter itself: `@nestjs/testing` attaches the
+ * adapter only once the testing module is compiled.
+ */
+export function shareHttpAdapterHooks(
+  httpAdapterHost: Pick<HttpAdapterHost, "httpAdapter" | "init$">,
+): void {
+  const share = () => {
+    try {
+      const { httpAdapter } = httpAdapterHost;
+      if (httpAdapter) {
+        shareHookSlot(httpAdapter, "setOnRequestHook");
+        shareHookSlot(httpAdapter, "setOnResponseHook");
+      }
+    } catch {
+      // An adapter that cannot be read is one there is nothing to share on.
+    }
+  };
+  try {
+    httpAdapterHost.init$?.subscribe(share);
+  } catch {
+    // Run from the instance decorator, which Nest 11 does not guard.
+  }
 }
 
 @Injectable()
@@ -95,6 +136,8 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       this.options.http?.queryParamsObfuscateRegex,
     );
 
+    shareHttpAdapterHooks(this.httpAdapterHost);
+
     // The "setOnRouteTriggered" hook must be set immediately
     // to ensure that route metadata is captured correctly.
     const { httpAdapter } = this.httpAdapterHost;
@@ -102,8 +145,13 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       return;
     }
 
-    httpAdapter.setOnRouteTriggered(
-      (requestMethod: RequestMethod, path: string) => {
+    // Beside the application's, one set before (found through the getter,
+    // which Nest's router reads the hook from too, and is left to it) or
+    // after.
+    setAgentHook<RouteTriggeredHook>(
+      httpAdapter,
+      "setOnRouteTriggered",
+      (requestMethod, path) => {
         const store = this.asyncLocalStorage.getStore();
         if (!store) {
           return;
@@ -118,6 +166,8 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
           path,
         );
       },
+      composeRouteTriggered,
+      { getter: "getOnRouteTriggered" },
     );
   }
 
@@ -139,37 +189,38 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       return;
     }
 
-    httpAdapter.setOnRequestHook(
-      (req: IncomingHttpRequest, res: unknown, done: () => void) => {
-        this.startHttpRequestTracing(req, res, done);
-      },
+    // Set beside the application's hooks, which `shareHttpAdapterHooks` has
+    // made the slots keep.
+    setAgentHook<RequestHook>(
+      httpAdapter,
+      "setOnRequestHook",
+      (req: IncomingHttpRequest, res, done) =>
+        this.startHttpRequestTracing(req, res, done),
+      composeRequestHook,
     );
-
-    // Fastify waits for `done` before it runs the next onResponse hook.
-    // Express does not pass one.
-    httpAdapter.setOnResponseHook(
-      (
-        req: unknown,
-        res: {
-          statusCode: number;
-        },
-        done?: () => void,
-      ) => {
-        this.endHttpRequestTracing(req, res);
-        done?.();
-      },
+    setAgentHook<ResponseHook>(
+      httpAdapter,
+      "setOnResponseHook",
+      (req, res: { statusCode: number }) =>
+        this.endHttpRequestTracing(req, res),
+      composeResponseHook,
     );
   }
 
+  /**
+   * Opens the request's trace and calls `done` inside its store, handing back
+   * what `done` returns: an application's request hook runs inside it, and
+   * the adapter waits on or fails the request by what that hook returns.
+   */
   startHttpRequestTracing(
     req: IncomingHttpRequest,
     res: unknown,
-    done: () => void,
-  ) {
+    done: () => unknown,
+  ): unknown {
     // The same map `run` is given, rather than `getStore()` inside the callback:
     // identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
-    this.asyncLocalStorage.run(store, () => {
+    return this.asyncLocalStorage.run(store, () => {
       // OpenTelemetry interop runs only beside reporting to NestJS Observe -
       // see `ObserveAgentSharedBuffer.isReporting`. Asked once per request,
       // so a request is named and carried on one way throughout.
@@ -261,7 +312,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         this.operationTraceRegistry.keepWithoutSpans(registryKey);
       }
       this.evictTraceOnClientAbort(res, registryKey);
-      done();
+      return done();
     });
   }
 
@@ -422,6 +473,80 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     }
     return false;
   }
+}
+
+/**
+ * The request hook the adapter is given: the agent's outside, and the
+ * application's inside the agent's `done`, so it runs in the request's store
+ * - its log lines and calls carry the trace - and whatever it returns, a
+ * promise the adapter fails the request by, goes back to the adapter. It
+ * refuses a request with `done(err)`, by throwing or by answering it itself,
+ * as without the agent; the response hook still closes the trace.
+ */
+function composeRequestHook(
+  application: RequestHook | undefined,
+  agent: RequestHook,
+): RequestHook {
+  if (!application) {
+    return agent;
+  }
+  return function (this: unknown, req, res, done) {
+    return agent.call(this, req, res, () =>
+      application.call(this, req, res, done),
+    );
+  };
+}
+
+/**
+ * The response hook the adapter is given: the agent's first, whatever the
+ * application's does, then the application's, handed `done` - Fastify waits
+ * for it before its next `onResponse` hook, Express passes none - and
+ * returning what it returns.
+ */
+function composeResponseHook(
+  application: ResponseHook | undefined,
+  agent: ResponseHook,
+): ResponseHook {
+  return function (this: unknown, req, res, done) {
+    if (!application) {
+      agent.call(this, req, res);
+      return done?.();
+    }
+    let returned: unknown;
+    try {
+      agent.call(this, req, res);
+    } finally {
+      returned = application.call(this, req, res, done);
+    }
+    return returned;
+  };
+}
+
+/**
+ * How deep composed route hooks are running. The getter Nest's router reads
+ * the hook from hands an application the composed hook, and one chaining
+ * "the previous hook" calls it from inside the next composed one: there only
+ * the hook it wraps runs, as the agent's part already has.
+ */
+let routeTriggeredDepth = 0;
+
+/** The route hook the adapter is given: the agent's part, then the application's. */
+function composeRouteTriggered(
+  application: RouteTriggeredHook | undefined,
+  agent: RouteTriggeredHook,
+): RouteTriggeredHook {
+  return function (this: unknown, requestMethod, path) {
+    if (routeTriggeredDepth > 0) {
+      return application?.call(this, requestMethod, path);
+    }
+    routeTriggeredDepth++;
+    try {
+      agent.call(this, requestMethod, path);
+      return application?.call(this, requestMethod, path);
+    } finally {
+      routeTriggeredDepth--;
+    }
+  };
 }
 
 /**
