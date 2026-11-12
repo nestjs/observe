@@ -54,6 +54,7 @@ import { TraceSamplerService } from "./services/trace-sampler.service.js";
 import { TracerService } from "./services/tracer.service.js";
 import { KeyOf } from "./types/key-of.type.js";
 import { assertModuleOptions } from "./utils/assert-module-options.util.js";
+import { setAgentHook } from "./utils/shared-hook-slot.util.js";
 import { defaultTraceIdGenerator } from "./utils/default-trace-id-generator.util.js";
 import { recordTraceIdGeneratorOrigin } from "./utils/trace-id-generator-origin.util.js";
 import {
@@ -534,17 +535,21 @@ function shareHooksOfHttpAdapter(instance: unknown): void {
  * With OpenTelemetry interop on, `traceparentFor` names a W3C `traceparent`
  * to send beside it, which the receiving agent hands to an OpenTelemetry SDK
  * in its process - see `traceparentToHandOn`.
+ *
+ * The hook is the application's to set too - Nest names a tenant and a
+ * locale as packet metadata - so the agent's part is set beside it: a
+ * dispatch hook the application sets on the client from here on runs first,
+ * and the agent's after it, adding the id beside what it wrote and never
+ * over an id it chose. Nest hands the same client over again for an alias,
+ * which replaces the agent's part rather than nesting it. A hook set in the
+ * client's own factory is already in place, and cannot be read.
  */
 function propagateTraceIdThrough(
   instance: unknown,
   currentTraceId: () => unknown,
   traceparentFor: (traceId: string) => string | undefined,
 ): void {
-  const client = instance as {
-    setOnDispatchHook?: (
-      hook: (packet: { metadata?: Record<string, string> }) => void,
-    ) => void;
-  };
+  const client = instance as { setOnDispatchHook?: unknown };
   try {
     if (typeof client?.setOnDispatchHook !== "function") {
       return;
@@ -554,26 +559,47 @@ function propagateTraceIdThrough(
     // exclusions deal with it; it is certainly not a microservice client.
     return;
   }
-  client.setOnDispatchHook((packet) => {
-    const traceId = currentTraceId();
-    if (typeof traceId !== "string") {
-      return;
-    }
-    if (!packet.metadata?.["x-request-id"]) {
-      packet.metadata = { ...packet.metadata, "x-request-id": traceId };
-    }
-    // Only beside the id this operation sends: an id the application chose
-    // names a trace of its own, and the packet is left as it made it.
-    if (
-      packet.metadata?.["x-request-id"] === traceId &&
-      !packet.metadata["traceparent"]
-    ) {
-      const traceparent = traceparentFor(traceId);
-      if (traceparent) {
-        packet.metadata = { ...packet.metadata, traceparent };
+  setAgentHook<DispatchHook>(
+    client,
+    "setOnDispatchHook",
+    (packet) => {
+      const traceId = currentTraceId();
+      if (typeof traceId !== "string") {
+        return;
       }
-    }
-  });
+      if (!packet.metadata?.["x-request-id"]) {
+        packet.metadata = { ...packet.metadata, "x-request-id": traceId };
+      }
+      // Only beside the id this operation sends: an id the application chose
+      // names a trace of its own, and the packet is left as it made it.
+      if (
+        packet.metadata?.["x-request-id"] === traceId &&
+        !packet.metadata["traceparent"]
+      ) {
+        const traceparent = traceparentFor(traceId);
+        if (traceparent) {
+          packet.metadata = { ...packet.metadata, traceparent };
+        }
+      }
+    },
+    composeDispatchHook,
+  );
+}
+
+type DispatchHook = (packet: { metadata?: Record<string, string> }) => void;
+
+/** The dispatch hook the client is given: the application's, then the agent's. */
+function composeDispatchHook(
+  application: DispatchHook | undefined,
+  agent: DispatchHook,
+): DispatchHook {
+  if (!application) {
+    return agent;
+  }
+  return function (this: unknown, packet) {
+    application.call(this, packet);
+    agent.call(this, packet);
+  };
 }
 
 /**
