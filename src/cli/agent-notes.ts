@@ -1,5 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isProjectFile } from "./project-files.js";
+
+/** What would take a path out of its backticks in the notes. */
+// eslint-disable-next-line no-control-regex -- control characters are what it finds.
+const UNQUOTABLE = /[`\u0000-\u001f\u007f\u0085\u2028\u2029]/;
 
 /** The file coding agents read for a repository's working notes. */
 export const AGENTS_FILE = "AGENTS.md";
@@ -64,14 +69,18 @@ export function pendingAgentNotes(cwd: string): AgentNotesChange[] {
   };
   const changes: AgentNotesChange[] = [];
 
-  const agents = read(AGENTS_FILE);
+  // A file that leads out of the project - a link to anywhere the person
+  // can write - is not the project's notes, and is left alone.
+  const agents = isProjectFile(cwd, AGENTS_FILE) ? read(AGENTS_FILE) : null;
   if (agents === undefined) {
     changes.push({ file: AGENTS_FILE, created: true });
-  } else if (!agents.includes(AGENT_NOTES_HEADING)) {
+  } else if (agents !== null && !agents.includes(AGENT_NOTES_HEADING)) {
     changes.push({ file: AGENTS_FILE, created: false });
   }
 
-  const claude = read(CLAUDE_FILE);
+  const claude = isProjectFile(cwd, CLAUDE_FILE)
+    ? read(CLAUDE_FILE)
+    : undefined;
   if (
     claude !== undefined &&
     !claude.includes(AGENT_NOTES_HEADING) &&
@@ -92,7 +101,11 @@ export function writeAgentNotes(
   rootModule?: string,
 ): AgentNotesChange[] {
   const changes = pendingAgentNotes(cwd);
-  const notes = agentNotes(rootModule ? `\`${rootModule}\`` : undefined);
+  // Quoted only when the path cannot leave its quotes: a directory name is
+  // the project's to choose, and a backtick or a line break in it would
+  // put text of its own into the notes.
+  const quotable = rootModule !== undefined && !UNQUOTABLE.test(rootModule);
+  const notes = agentNotes(quotable ? `\`${rootModule}\`` : undefined);
   for (const change of changes) {
     const path = join(cwd, change.file);
     if (change.created) {

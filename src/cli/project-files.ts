@@ -1,6 +1,52 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, relative } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+
+/** The files `link` writes in every project, whatever else it does. */
+export const LINK_FILES = [".env", ".gitignore", "package.json"];
+
+/**
+ * Whether `path`, relative to `cwd`, is a file of the project's own once
+ * links are followed - where `link` may write.
+ *
+ * A checkout's files can be links to anywhere the person can write, and a
+ * project's own paths can climb out with `../`: written through, the key
+ * pair, the notes or the wiring would land in someone else's file, reported
+ * under an in-project name. A file still to be created is the project's when
+ * its directory is; a link that leads nowhere is not, because writing to it
+ * would create the file it points at.
+ */
+export function isProjectFile(cwd: string, path: string): boolean {
+  let root: string;
+  try {
+    root = realpathSync.native(cwd);
+  } catch {
+    return false;
+  }
+  const file = join(cwd, path);
+  let real: string;
+  try {
+    real = realpathSync.native(file);
+  } catch {
+    if (lstatSync(file, { throwIfNoEntry: false }) !== undefined) {
+      return false;
+    }
+    const parent = dirname(path);
+    return parent === path ? false : isProjectFile(cwd, parent);
+  }
+  const fromRoot = relative(root, real);
+  return (
+    fromRoot !== ".." &&
+    !fromRoot.startsWith(`..${sep}`) &&
+    !isAbsolute(fromRoot)
+  );
+}
 
 /** The variables `ObserveModule` falls back to for its key pair. */
 export const KEY_VARIABLE = "OBSERVE_APP_KEY";

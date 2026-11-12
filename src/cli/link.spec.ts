@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -322,6 +323,34 @@ describe("npx @nestjs/observe link", () => {
     );
     expect(existsSync(join(cwd, ".env"))).toBe(false);
   });
+
+  // A checkout's own files can be links to anywhere the person can write:
+  // the pair, the ignore rule and the scripts go into the project or nowhere.
+  it.each([[".env"], [".gitignore"], ["package.json"]])(
+    "turns the project away, before asking for a code, when %s leads out of it",
+    async (file) => {
+      const outside = mkdtempSync(join(tmpdir(), "observe-outside-"));
+      try {
+        const target = join(outside, "target");
+        writeFileSync(
+          target,
+          file === "package.json" ? read("package.json") : "THEIRS=1\n",
+        );
+        rmSync(join(cwd, file), { force: true });
+        symlinkSync(target, join(cwd, file));
+        const before = readFileSync(target, "utf8");
+        const h = harness([{ status: 200, body: LINKED }]);
+
+        expect(await run(h)).toBe(1);
+
+        expect(h.requests).toEqual([]);
+        expect(h.lines.join("\n")).toContain(`${file} leads out of`);
+        expect(readFileSync(target, "utf8")).toBe(before);
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
 
   describe("in a git repository", () => {
     // Git as installed, but none of this machine's own configuration.

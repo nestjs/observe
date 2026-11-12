@@ -9,6 +9,8 @@ import {
   addEnvFileToStartScripts,
   ensureEnvIgnored,
   isEnvFileValue,
+  isProjectFile,
+  LINK_FILES,
   readPackageName,
   trackedEnvFile,
   writeEnvFile,
@@ -104,8 +106,15 @@ export async function link(
     deps.log(`${setup.unsupported}. Nothing was written.`);
     return 1;
   }
-  // Before a code is asked for: no pair is issued for a project it cannot
-  // be kept out of git in.
+  // Before a code is asked for: no pair is issued for a project whose own
+  // files lead somewhere else, nor for one it cannot be kept out of git in.
+  const outside = LINK_FILES.find((file) => !isProjectFile(options.cwd, file));
+  if (outside) {
+    deps.log(
+      `${outside} leads out of ${options.cwd} - a link, or one that leads nowhere - so link will not write to it. Nothing was written.`,
+    );
+    return 1;
+  }
   const tracked = trackedEnvFile(options.cwd);
   if (tracked) {
     deps.log(
