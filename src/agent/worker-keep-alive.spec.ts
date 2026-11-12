@@ -176,4 +176,35 @@ describe("the detached worker's connection to the collector", () => {
     expect(requests).toBe(3);
     expect(connections).toBe(2);
   }, 20_000);
+
+  // The reply is held, decoded and parsed in the application's process:
+  // without a limit its size, and many times that once parsed, would be the
+  // sender's to choose.
+  it("stops reading a reply past 64 KiB, and still acts on its status", async () => {
+    let written = 0;
+    collector = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        const chunk = Buffer.alloc(16 * 1024, " ");
+        const more = () => {
+          // A reply that never ends; it stops only when the worker hangs up.
+          while (!res.destroyed && res.write(chunk)) {
+            written += chunk.length;
+            if (written > 8 * 1024 * 1024) {
+              return;
+            }
+          }
+          res.once("drain", more);
+        };
+        more();
+      });
+    });
+    worker = startWorker(await listen(collector));
+
+    worker.send({ traces: [] });
+    await worker.sends(1);
+
+    expect(written).toBeLessThan(8 * 1024 * 1024);
+  }, 20_000);
 });

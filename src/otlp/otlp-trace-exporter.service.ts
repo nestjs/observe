@@ -74,6 +74,14 @@ const RETRY_AFTER_MAX_MS = 5 * 60_000;
 /** How long an idle connection to the receiver is kept for the next batch. */
 const KEEP_ALIVE_IDLE_MS = 30_000;
 
+/**
+ * The most of a receiver's reply that is read. Only its first 300 characters
+ * are ever shown, and it is held and decoded on the application's thread:
+ * past this, the reading stops and the connection goes with it, and the
+ * status is acted on as it stands.
+ */
+const MAX_REPLY_BYTES = 64 * 1024;
+
 interface ReceiverReply {
   status: number;
   retryAfter: string | undefined;
@@ -472,9 +480,8 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
         },
         (response) => {
           const chunks: Buffer[] = [];
-          response.on("data", (chunk: Buffer) => chunks.push(chunk));
-          response.on("error", reject);
-          response.on("end", () => {
+          let received = 0;
+          const settle = () => {
             const retryAfter = response.headers["retry-after"];
             resolve({
               status: response.statusCode ?? 0,
@@ -482,9 +489,25 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
                 ? retryAfter[0]
                 : retryAfter,
               contentType: response.headers["content-type"],
-              body: Buffer.concat(chunks).toString("utf8"),
+              body: Buffer.concat(
+                chunks,
+                Math.min(received, MAX_REPLY_BYTES),
+              ).toString("utf8"),
             });
+          };
+          response.on("data", (chunk: Buffer) => {
+            if (received >= MAX_REPLY_BYTES) {
+              return;
+            }
+            chunks.push(chunk);
+            received += chunk.length;
+            if (received >= MAX_REPLY_BYTES) {
+              response.destroy();
+              settle();
+            }
           });
+          response.on("error", reject);
+          response.on("end", settle);
         },
       );
       request.on("error", reject);

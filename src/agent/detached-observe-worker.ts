@@ -336,6 +336,20 @@ export const detachedObserveWorker = (
    */
   const REQUEST_TIMEOUT_MS = 15_000;
 
+  /**
+   * The most of a reply that is read.
+   *
+   * Collector replies are a few hundred bytes; the rest is room for a proxy's
+   * error page, of which 500 characters are ever shown. The reply is held,
+   * decoded and parsed in the application's process, so without a limit its
+   * size - and many times that once parsed - would be the sender's to choose,
+   * up to a heap out of memory that ends the whole process. Past the limit
+   * the reading stops and the connection goes with it. The status still
+   * counts: the collector did answer, and a body cut short does not parse as
+   * JSON, which every reader below already treats as no body at all.
+   */
+  const MAX_REPLY_BYTES = 64 * 1024;
+
   /** What the code below reads from a collector reply. */
   interface CollectorResponse {
     ok: boolean;
@@ -347,11 +361,12 @@ export const detachedObserveWorker = (
   }
 
   /**
-   * One POST, with the reply read to the end before it resolves.
+   * One POST, with the reply read before it resolves - to the end, or as far
+   * as `MAX_REPLY_BYTES`.
    *
    * Read whatever the status: a reply left unread keeps its socket busy, and
    * the next batch opens another connection - the 401/403 path never read
-   * its body under `fetch`. Collector replies are a few hundred bytes.
+   * its body under `fetch`.
    *
    * A transport failure rejects with the failure as `cause`, the shape the
    * reporting below reads (ECONNREFUSED and friends on `err.cause.code`), and
@@ -368,12 +383,12 @@ export const detachedObserveWorker = (
         },
         (res: IncomingMessage) => {
           const chunks: Buffer[] = [];
-          res.on("data", (chunk: Buffer) => chunks.push(chunk));
-          res.on("error", (err: Error) =>
-            reject(new Error("collector reply failed", { cause: err })),
-          );
-          res.on("end", () => {
-            const text = Buffer.concat(chunks).toString("utf8");
+          let received = 0;
+          const settle = () => {
+            const text = Buffer.concat(
+              chunks,
+              Math.min(received, MAX_REPLY_BYTES),
+            ).toString("utf8");
             const status = res.statusCode ?? 0;
             resolve({
               ok: status >= 200 && status < 300,
@@ -391,7 +406,22 @@ export const detachedObserveWorker = (
               text: async () => text,
               json: async () => JSON.parse(text),
             });
+          };
+          res.on("data", (chunk: Buffer) => {
+            if (received >= MAX_REPLY_BYTES) {
+              return;
+            }
+            chunks.push(chunk);
+            received += chunk.length;
+            if (received >= MAX_REPLY_BYTES) {
+              res.destroy();
+              settle();
+            }
           });
+          res.on("error", (err: Error) =>
+            reject(new Error("collector reply failed", { cause: err })),
+          );
+          res.on("end", settle);
         },
       );
       req.on("error", (err: Error) =>

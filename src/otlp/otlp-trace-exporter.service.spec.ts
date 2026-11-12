@@ -1,5 +1,9 @@
 import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
+import {
+  createServer as createHttpServer,
+  Server as HttpServer,
+} from "node:http";
 import { createServer, Server, Socket } from "net";
 import type { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import type { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
@@ -364,6 +368,57 @@ describe("OtlpTraceExporter", () => {
     // Only the third batch arrived: the refused two were not resent.
     expect(receiver.exports).toHaveLength(1);
     await exporter.onApplicationShutdown();
+  });
+
+  describe("against a receiver that answers out of the ordinary", () => {
+    let odd: HttpServer;
+    let oddUrl: string;
+
+    const start = async (handler: Parameters<typeof createHttpServer>[1]) => {
+      odd = createHttpServer(handler);
+      await new Promise<void>((resolve) => odd.listen(0, "127.0.0.1", resolve));
+      oddUrl = `http://127.0.0.1:${(odd.address() as { port: number }).port}`;
+    };
+
+    afterEach(async () => {
+      odd.closeAllConnections();
+      await new Promise((resolve) => odd.close(resolve));
+    });
+
+    // Read on the application's thread: past 64 KiB a reply is no longer
+    // the receiver's to size.
+    it("stops reading a reply past 64 KiB, and still acts on its status", async () => {
+      let written = 0;
+      await start((req, res) => {
+        req.resume();
+        res.writeHead(400, { "content-type": "text/plain" });
+        const chunk = Buffer.alloc(16 * 1024, "x");
+        const more = () => {
+          while (!res.destroyed && written < 8 * 1024 * 1024) {
+            written += chunk.length;
+            if (!res.write(chunk)) {
+              res.once("drain", more);
+              return;
+            }
+          }
+        };
+        more();
+      });
+      const exporter = exporterFor(oddUrl);
+      exporter.exportRequestSnapshot(snapshot());
+      exporter.flush();
+
+      await waitFor(
+        () =>
+          warn.mock.calls.some((call: unknown[]) =>
+            String(call[0]).includes("answered 400"),
+          ),
+        3_000,
+        "the refusal",
+      );
+      expect(written).toBeLessThan(8 * 1024 * 1024);
+      await exporter.onApplicationShutdown();
+    }, 10_000);
   });
 
   describe("against a receiver that never answers", () => {
