@@ -444,6 +444,34 @@ describe("sanitizeTelemetryEntry", () => {
       ).toEqual([]);
     });
 
+    // What the worker parses back from a refused batch: `JSON.stringify` has
+    // already made a non-finite number `null` - a Bull job's
+    // `attempts: Infinity` arrives as `"ma": null`. Removing it is a repair,
+    // and a repair not reported is a batch dropped instead of re-sent.
+    it("reports the removal of a null, so the repaired batch is sent again", () => {
+      const payload = JSON.parse(
+        JSON.stringify({
+          serviceId: "svc",
+          snapshots: [{ ti: "t-1", op: "/users", t: [], u: null }],
+        }),
+      ) as Record<string, unknown>;
+
+      const result = sanitizeTelemetryBatch(payload);
+
+      expect(result.changed).toBe(true);
+      expect(result.problems).toEqual(["snapshots.u: null, removed"]);
+      expect(payload.snapshots).toEqual([{ ti: "t-1", op: "/users", t: [] }]);
+    });
+
+    it("reports nothing for a field that holds undefined, which never reaches the wire", () => {
+      const payload: Record<string, unknown> = {
+        serviceId: "svc",
+        snapshots: [{ ti: "t-1", op: "/users", t: [], u: undefined }],
+      };
+
+      expect(sanitizeTelemetryBatch(payload).changed).toBe(false);
+    });
+
     it("takes the operation id a renamed request replaced", () => {
       const payload: Record<string, unknown> = {
         serviceId: "svc",
