@@ -15,6 +15,15 @@ const DEFAULT_LABEL = "default" as const;
 const DEFAULT_SAMPLE_SIZE = 2048;
 
 /**
+ * A record keyed by label, with no prototype. A summary that declared no
+ * labels takes any, and on a plain object a label such as `constructor` or
+ * `toString` found an inherited member: its first observation was added to a
+ * function, and refused as a total past the largest number.
+ */
+const byLabel = <T>(): Record<string, T> =>
+  Object.create(null) as Record<string, T>;
+
+/**
  * A distribution of observations - request latency being the usual case.
  *
  * Quantiles are computed here, in-process, over the observations seen since the
@@ -82,14 +91,14 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
    * Exact per-label aggregates for the current window. Tracked apart from the
    * sample below so they describe every observation, not just the retained ones.
    */
-  private _count: Record<string, number> = {};
-  private _sum: Record<string, number> = {};
-  private _max: Record<string, number> = {};
+  private _count = byLabel<number>();
+  private _sum = byLabel<number>();
+  private _max = byLabel<number>();
 
   /**
    * Bounded per-label sample the quantiles are read off.
    */
-  private _samples: Record<string, number[]> = {};
+  private _samples = byLabel<number[]>();
 
   /**
    * The medians, doubling as the metric's headline reading.
@@ -261,10 +270,10 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
    */
   markFlushed(): void {
     this._windowLabels = 0;
-    this._count = {};
-    this._sum = {};
-    this._max = {};
-    this._samples = {};
+    this._count = byLabel();
+    this._sum = byLabel();
+    this._max = byLabel();
+    this._samples = byLabel();
   }
 
   /**
@@ -342,7 +351,7 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
    * Nearest-rank quantile per label, read off a sorted copy of the sample.
    */
   private quantile(percentile: number): Record<string, number> {
-    const quantiles: Record<string, number> = {};
+    const quantiles = byLabel<number>();
     for (const [key, samples] of Object.entries(this._samples)) {
       if (!samples.length) {
         continue;
@@ -351,6 +360,6 @@ export class Summary<TLabel extends string = typeof DEFAULT_LABEL>
       const rank = Math.ceil(percentile * sorted.length) - 1;
       quantiles[key] = sorted[Math.min(Math.max(rank, 0), sorted.length - 1)];
     }
-    return quantiles;
+    return { ...quantiles };
   }
 }
