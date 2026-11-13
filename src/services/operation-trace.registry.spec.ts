@@ -1154,6 +1154,36 @@ describe("OperationTraceRegistry", () => {
       expect(JSON.stringify(snapshot.traces)).not.toContain("render page");
     });
 
+    it("runs a root span past the limit without recording it", async () => {
+      quietWarnings();
+      const labels = { className: "kafka", methodKey: "orders.created" };
+      registry.startTrace("cap-job", {
+        id: "run-1",
+        traceId: "cap-job",
+        queueName: "kafka",
+        name: "orders.created",
+        traces: [],
+      });
+      await registry.createRootSpan("cap-job", labels, "first", () => {
+        const callerId = als.getStore()?.get(CALLER_METADATA_KEY) as string;
+        openAndClose("cap-job", callerId, 9_999);
+      });
+
+      const result = await registry.createRootSpan(
+        "cap-job",
+        labels,
+        "second",
+        () => "handled",
+      );
+      registry.endTrace("cap-job", { status: "completed" });
+      const snapshot = await registry.pluckSnapshot("cap-job");
+
+      expect(result).toBe("handled");
+      expect(registry.hasOpenSpans("cap-job")).toBe(false);
+      expect(snapshot!.tags).toEqual({ [UNRECORDED_SPANS_TAG]: 1 });
+      expect(snapshot!.traces.map((node) => node.name)).toEqual(["first"]);
+    });
+
     it("counts each operation against the limit on its own", async () => {
       quietWarnings();
       startRequest("cap-3");
@@ -1980,6 +2010,160 @@ describe("OperationTraceRegistry", () => {
         expect(manualId).toBeDefined();
         expect(spanIds).toContain(manualId);
       } finally {
+        setActiveSliceRecorder(null);
+      }
+    });
+  });
+
+  describe("root spans", () => {
+    const labels = { className: "kafka", methodKey: "orders.created" };
+
+    const startJob = (traceId: string) =>
+      registry.startTrace(traceId, {
+        id: "run-1",
+        traceId,
+        queueName: "kafka",
+        name: "orders.created",
+        traces: [],
+      });
+
+    it("opens the span at the trace root, labelled with the job", async () => {
+      startJob("r1");
+
+      const result = await registry.createRootSpan(
+        "r1",
+        labels,
+        "orders.created",
+        (span) => {
+          span.setTag("partition", 3);
+          return "handled";
+        },
+      );
+      registry.endTrace("r1", { status: "completed" });
+
+      expect(result).toBe("handled");
+      const snapshot = await registry.pluckSnapshot("r1");
+      expect(snapshot!.traces).toEqual([
+        expect.objectContaining({
+          name: "orders.created",
+          origin: "manual",
+          className: "kafka",
+          methodKey: "orders.created",
+          tags: { partition: 3 },
+        }),
+      ]);
+    });
+
+    it("nests the spans opened inside it", async () => {
+      startJob("r2");
+
+      await registry.createRootSpan("r2", labels, "orders.created", () => {
+        const callerId = als.getStore()?.get(CALLER_METADATA_KEY) as string;
+        const stepId = registry.internalStartTraceStep(
+          "r2",
+          "OrdersService",
+          "save",
+          callerId,
+        );
+        registry.internalEndTraceStep(
+          "r2",
+          stepId,
+          "OrdersService",
+          "save",
+          stepId,
+        );
+        return registry.createManualSpan("r2", callerId, "publish", () => 1);
+      });
+      registry.endTrace("r2", { status: "completed" });
+
+      const snapshot = await registry.pluckSnapshot("r2");
+      expect(snapshot!.traces).toHaveLength(1);
+      expect(snapshot!.traces[0].children).toEqual([
+        expect.objectContaining({
+          className: "OrdersService",
+          methodKey: "save",
+        }),
+        expect.objectContaining({ name: "publish", origin: "manual" }),
+      ]);
+    });
+
+    it("balances the span ledger whether the callback returns or throws", async () => {
+      startJob("r3");
+      await registry.createRootSpan("r3", labels, "ok", async () => "done");
+      expect(registry.hasOpenSpans("r3")).toBe(false);
+
+      startJob("r4");
+      const failure = new Error("consumer boom");
+      await expect(
+        registry.createRootSpan("r4", labels, "failing", async () => {
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+      expect(registry.hasOpenSpans("r4")).toBe(false);
+
+      registry.endTrace("r4", { status: "failed" });
+      const snapshot = await registry.pluckSnapshot("r4");
+      expect(snapshot!.error).toMatchObject({ message: "consumer boom" });
+    });
+
+    it("runs the callback with a detached span when the trace is not open", async () => {
+      const result = await registry.createRootSpan(
+        "never-started",
+        labels,
+        "orders.created",
+        (span) => span.id,
+      );
+
+      expect(result).toBe("");
+    });
+
+    it("keeps a failure to close the span from replacing the callback's outcome", async () => {
+      const recorder = new SpanSliceRecorder();
+      vi.spyOn(recorder, "exit").mockImplementation(() => {
+        throw new Error("bookkeeping");
+      });
+      setActiveSliceRecorder(recorder);
+      const warn = vi
+        .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+        .mockImplementation(() => {});
+      try {
+        startJob("r5");
+        await expect(
+          registry.createRootSpan("r5", labels, "ok", () => "value"),
+        ).resolves.toBe("value");
+        expect(registry.hasOpenSpans("r5")).toBe(false);
+
+        startJob("r6");
+        const failure = new Error("consumer boom");
+        await expect(
+          registry.createRootSpan("r6", labels, "failing", () => {
+            throw failure;
+          }),
+        ).rejects.toBe(failure);
+        expect(registry.hasOpenSpans("r6")).toBe(false);
+
+        // The span is still finished in full, not just counted as complete.
+        registry.endTrace("r5", { status: "completed" });
+        const completed = await registry.pluckSnapshot("r5");
+        expect(completed!.traces[0]).toMatchObject({
+          name: "ok",
+          duration: expect.any(Number),
+        });
+        expect(completed!.tags?.[UNFINISHED_SPANS_TAG]).toBeUndefined();
+
+        registry.endTrace("r6", { status: "failed" });
+        const failed = await registry.pluckSnapshot("r6");
+        expect(failed!.traces[0]).toMatchObject({
+          name: "failing",
+          duration: expect.any(Number),
+        });
+        expect(failed!.error).toMatchObject({ message: "consumer boom" });
+
+        // A recorder that fails once fails on every span: reported once.
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toContain("bookkeeping");
+      } finally {
+        warn.mockRestore();
         setActiveSliceRecorder(null);
       }
     });
