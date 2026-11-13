@@ -141,6 +141,24 @@ describe("series cardinality cap", () => {
       expect(warn).toHaveBeenCalledTimes(1);
     });
 
+    it("records a label named like a member of Object.prototype", () => {
+      const summary = new Summary<string>("search_ms");
+      const labels = ["constructor", "toString", "__proto__"];
+
+      for (const label of labels) {
+        summary.observe(12, label);
+      }
+
+      for (const label of labels) {
+        expect(Object.hasOwn(summary.observations, label), label).toBe(true);
+        expect(summary.observations[label], label).toBe(1);
+        expect(summary.total[label], label).toBe(12);
+        expect(summary.maximum[label], label).toBe(12);
+        expect(summary.p50[label], label).toBe(12);
+      }
+      expect(warn).not.toHaveBeenCalled();
+    });
+
     it("leaves a summary that declared its labels alone", () => {
       const labels = Array.from(
         { length: MAX_SERIES_PER_METRIC + 1 },
