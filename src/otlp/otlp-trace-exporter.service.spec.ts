@@ -435,6 +435,221 @@ describe("OtlpTraceExporter", () => {
       await new Promise((resolve) => odd.close(resolve));
     });
 
+    /**
+     * A receiver that answers 503 to every export `refuses`, and takes the
+     * rest, noting the `url.path` of each request it took.
+     */
+    const startRefusing = async (refuses: (body: string) => boolean) => {
+      const taken: string[] = [];
+      const refused: string[] = [];
+      await start((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf8");
+          const paths = pathsIn(body);
+          if (refuses(body)) {
+            refused.push(...paths);
+            res.writeHead(503, { "content-type": "text/plain" });
+            res.end("busy");
+            return;
+          }
+          taken.push(...paths);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      const exporter = exporterFor(oddUrl, {
+        otlp: { endpoint: oddUrl, protocol: "http/json", compression: "none" },
+      });
+      return { exporter, taken, refused };
+    };
+
+    const pathsIn = (body: string): string[] => {
+      const parsed = JSON.parse(body) as {
+        resourceSpans: Array<{
+          scopeSpans: Array<{
+            spans: Array<{
+              attributes: Array<{
+                key: string;
+                value: { stringValue?: string };
+              }>;
+            }>;
+          }>;
+        }>;
+      };
+      return parsed.resourceSpans.flatMap(({ scopeSpans }) =>
+        scopeSpans.flatMap(({ spans }) =>
+          spans.flatMap(({ attributes }) =>
+            attributes
+              .filter(({ key }) => key === "url.path")
+              .map(({ value }) => value.stringValue ?? ""),
+          ),
+        ),
+      );
+    };
+
+    const request = (path: string) =>
+      snapshot(0, {
+        attributes: { method: "GET", statusCode: 200, originalUrl: path },
+      });
+
+    /** One export, waited out to its answer - and past the backoff it set. */
+    const exportOnce = async (exporter: OtlpTraceExporter) => {
+      const state = exporter as unknown as { sending: Promise<void> | null };
+      exporter.flush();
+      while (state.sending) {
+        await state.sending;
+      }
+      vi.setSystemTime(Date.now() + 5 * 60_000);
+    };
+
+    const internals = (exporter: OtlpTraceExporter) =>
+      exporter as unknown as {
+        queue: unknown[];
+        queuedChars: number;
+        refusedSpans: number;
+      };
+
+    // A receiver may refuse a batch for what is in it - more than what it
+    // passes spans on to takes - with the statuses it uses when it is away.
+    // Retried first, and with whatever was queued since, such a batch kept
+    // every later trace from being exported for as long as the process ran.
+    it("lets later batches go ahead of one the receiver keeps turning away, and drops it once one of them got through", async () => {
+      // Only the clock the backoff reads: the sockets keep theirs.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const { exporter, taken, refused } = await startRefusing((body) =>
+          body.includes("/poison"),
+        );
+        exporter.exportRequestSnapshot(request("/poison"));
+        await exportOnce(exporter);
+        expect(refused).toEqual(["/poison"]);
+
+        exporter.exportRequestSnapshot(request("/later/1"));
+        exporter.exportRequestSnapshot(request("/later/2"));
+        await exportOnce(exporter);
+        // The later batch went alone and got through; the refused one went
+        // once more right after it, and was refused again.
+        expect(taken).toEqual(["/later/1", "/later/2"]);
+        expect(refused).toEqual(["/poison", "/poison"]);
+
+        // Twice more, a backoff step apart, and it is gone: what waited
+        // behind it goes next.
+        exporter.exportRequestSnapshot(request("/later/3"));
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await exportOnce(exporter);
+        }
+        expect(refused).toHaveLength(4);
+        expect(taken).toEqual(["/later/1", "/later/2", "/later/3"]);
+
+        exporter.exportRequestSnapshot(request("/later/4"));
+        await exportOnce(exporter);
+        await exporter.onApplicationShutdown();
+
+        expect(taken).toEqual(["/later/1", "/later/2", "/later/3", "/later/4"]);
+        expect(refused).toHaveLength(4);
+        expect(
+          log.mock.calls.some((call: unknown[]) =>
+            String(call[0]).includes("2 spans were dropped"),
+          ),
+        ).toBe(true);
+        expect(internals(exporter)).toMatchObject({
+          queue: [],
+          queuedChars: 0,
+          refusedSpans: 0,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // What the change above must not cost: a receiver that is away refuses
+    // everything, and each batch goes again once it is back.
+    it("loses nothing to a receiver that is away for a while", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        let away = true;
+        const { exporter, taken, refused } = await startRefusing(() => away);
+        for (const index of [1, 2, 3]) {
+          exporter.exportRequestSnapshot(request(`/during/${index}`));
+          await exportOnce(exporter);
+        }
+        expect(refused).toEqual(["/during/1", "/during/2", "/during/3"]);
+        // Set aside one by one, never dropped while nothing got through.
+        expect(internals(exporter).refusedSpans).toBe(6);
+
+        away = false;
+        exporter.exportRequestSnapshot(request("/after"));
+        await exportOnce(exporter);
+        await exporter.onApplicationShutdown();
+
+        expect(taken).toEqual([
+          "/after",
+          "/during/1",
+          "/during/2",
+          "/during/3",
+        ]);
+        expect(
+          log.mock.calls.some((call: unknown[]) =>
+            String(call[0]).includes("dropped"),
+          ),
+        ).toBe(false);
+        expect(internals(exporter)).toMatchObject({
+          queue: [],
+          queuedChars: 0,
+          refusedSpans: 0,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // Nor a receiver that limits how often it is sent to, and turns away
+    // the export that comes right after the one it let through.
+    it("loses nothing to a receiver that refuses an export right after one it took", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        let tookLast = true;
+        const { exporter, taken, refused } = await startRefusing(() => {
+          const refuses = tookLast;
+          tookLast = !refuses;
+          return refuses;
+        });
+        exporter.exportRequestSnapshot(request("/first"));
+        await exportOnce(exporter);
+        exporter.exportRequestSnapshot(request("/second"));
+        await exportOnce(exporter);
+        await exportOnce(exporter);
+        await exporter.onApplicationShutdown();
+
+        expect(refused).toEqual(["/first", "/first"]);
+        expect(taken).toEqual(["/second", "/first"]);
+        expect(
+          log.mock.calls.some((call: unknown[]) =>
+            String(call[0]).includes("dropped"),
+          ),
+        ).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("exports at shutdown what waits behind a batch the receiver refuses", async () => {
+      const { exporter, taken, refused } = await startRefusing((body) =>
+        body.includes("/poison"),
+      );
+      exporter.exportRequestSnapshot(request("/poison"));
+      exporter.flush();
+      await waitFor(() => refused.length === 1, 3_000, "the refusal");
+      exporter.exportRequestSnapshot(request("/later"));
+
+      // No backoff is waited out at shutdown, and a refusal ends nothing.
+      await exporter.onApplicationShutdown();
+
+      expect(taken).toEqual(["/later"]);
+    });
+
     // Read on the application's thread: past 64 KiB a reply is no longer
     // the receiver's to size.
     it("stops reading a reply past 64 KiB, and still acts on its status", async () => {

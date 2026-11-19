@@ -87,6 +87,14 @@ const DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_MS = 2_000;
  */
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 
+/**
+ * How often a refused batch may be refused again once a later export was
+ * accepted, before it is dropped: what tells a batch the receiver will
+ * never take from one a rate limiter turned away just after letting the
+ * export before it through.
+ */
+const MAX_REFUSALS_ONCE_OUTLIVED = 3;
+
 /** The first wait before an export is retried; it doubles to the ceiling. */
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 60_000;
@@ -114,6 +122,19 @@ const MAX_INTERIM_REPLIES = 8;
 
 /** The longest a timer runs; a longer delay would fire at once instead. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** A batch the receiver turned away, waiting at the front of the queue. */
+interface RefusedBatch {
+  /** How many spans it is. */
+  spans: number;
+  /**
+   * Whether an export was accepted since it was refused: the receiver is
+   * there, so a refusal of it now is likely about what is in it.
+   */
+  outlived: boolean;
+  /** How often it was refused since then. */
+  refusalsOnceOutlived: number;
+}
 
 interface ReceiverReply {
   status: number;
@@ -154,6 +175,13 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   private readonly queue: OtlpSpan[] = [];
   /** What `charsOf` counts in `queue`, kept as spans come and go. */
   private queuedChars = 0;
+  /**
+   * The batches the receiver turned away and that wait for another try,
+   * oldest first. Their spans are the first `refusedSpans` of `queue`, in
+   * the same order; everything behind them has not been sent yet.
+   */
+  private readonly refused: RefusedBatch[] = [];
+  private refusedSpans = 0;
   private sending: Promise<void> | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private shutdownPromise: Promise<void> | null = null;
@@ -167,8 +195,6 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   /** No export starts before this (epoch ms): a retry is waiting. */
   private retryNotBefore = 0;
   private retryDelayMs = 0;
-  /** Whether the last export failed - the final flush does not retry it. */
-  private lastSendFailed = false;
   /**
    * What the last failure was, while exports are failing: said once when it
    * starts or changes, and again when exports recover. Null while healthy.
@@ -320,11 +346,31 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     ) {
       return;
     }
-    const batch = this.takeBatch();
-    this.sending = this.send(batch).finally(() => {
+    // A batch the receiver turned away goes again once a later one got
+    // through, or when nothing later is waiting to go ahead of it; until
+    // then, later batches go first.
+    const oldest = this.refused[0];
+    let batch: OtlpSpan[];
+    let retried: RefusedBatch | undefined;
+    if (
+      oldest &&
+      (oldest.outlived || this.queue.length === this.refusedSpans)
+    ) {
+      retried = this.refused.shift()!;
+      this.refusedSpans -= retried.spans;
+      batch = this.queue.splice(0, retried.spans);
+      this.queuedChars -= totalChars(batch);
+    } else {
+      batch = this.takeBatch(this.refusedSpans);
+    }
+    this.sending = this.send(batch, retried).finally(() => {
       this.sending = null;
-      // A backlog left behind a full batch goes straight out after it.
-      if (this.holdsFullBatch() && !this.shutdownPromise) {
+      if (this.shutdownPromise) {
+        return;
+      }
+      // A backlog left behind a full batch goes straight out after it, as
+      // does a refused batch a later one has just outlived.
+      if (this.refused[0]?.outlived || this.holdsFullBatch()) {
         this.flush();
       }
     });
@@ -376,15 +422,15 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   }
 
   /**
-   * Takes the next batch off the front of the queue: as many spans as fit
+   * Takes the next batch off the queue from `start`: as many spans as fit
    * in `MAX_BATCH_SPANS` and `MAX_BATCH_CHARS`, and always at least one, so
    * a span larger than a batch on its own still goes out.
    */
-  private takeBatch(): OtlpSpan[] {
+  private takeBatch(start: number): OtlpSpan[] {
     let count = 0;
     let chars = 0;
-    while (count < this.queue.length && count < MAX_BATCH_SPANS) {
-      const next = charsOf(this.queue[count]);
+    while (start + count < this.queue.length && count < MAX_BATCH_SPANS) {
+      const next = charsOf(this.queue[start + count]);
       if (count > 0 && chars + next > MAX_BATCH_CHARS) {
         break;
       }
@@ -392,14 +438,18 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
       count += 1;
     }
     this.queuedChars -= chars;
-    return this.queue.splice(0, count);
+    return this.queue.splice(start, count);
   }
 
   /**
-   * One export. Resolves whatever happens: a failure is reported and either
-   * put back for a retry or dropped, never thrown.
+   * One export - of `retried`, when it is a refused batch going again.
+   * Resolves whatever happens: a failure is reported and either put back
+   * for a retry or dropped, never thrown.
    */
-  private async send(batch: OtlpSpan[]): Promise<void> {
+  private async send(
+    batch: OtlpSpan[],
+    retried: RefusedBatch | undefined,
+  ): Promise<void> {
     const settings = this.settings!;
     let body: Buffer;
     try {
@@ -411,7 +461,6 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
         settings.compression === "gzip" ? await gzipAsync(encoded) : encoded;
     } catch (error) {
       // Nothing a retry would change: the batch is lost, and said so.
-      this.lastSendFailed = true;
       this.reportFailure(
         `the batch could not be encoded (${String(error)})`,
         false,
@@ -430,10 +479,10 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
         return;
       }
       const code = (error as { code?: string }).code;
-      this.retryLater(batch, undefined);
+      const retrying = this.retryLater(batch, retried, undefined);
       this.reportFailure(
         `the receiver could not be reached (${code ?? String(error)})`,
-        true,
+        retrying,
       );
       return;
     }
@@ -442,27 +491,79 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
       this.recovered(batch.length);
       return;
     }
-    const retryable = RETRYABLE_STATUSES.has(reply.status);
-    if (retryable) {
-      this.retryLater(batch, reply.retryAfter);
-    } else {
-      this.lastSendFailed = true;
-    }
+    const retrying =
+      RETRYABLE_STATUSES.has(reply.status) &&
+      this.retryLater(batch, retried, reply.retryAfter);
     const detail =
       reply.body && /json|text/.test(reply.contentType ?? "")
         ? ` - ${reply.body.slice(0, 300)}`
         : "";
-    this.reportFailure(`it answered ${reply.status}${detail}`, retryable);
+    this.reportFailure(`it answered ${reply.status}${detail}`, retrying);
   }
 
   /**
-   * Puts a batch back at the front of the queue, if it still fits, and holds
-   * exports back for the receiver's `Retry-After` or the next backoff step.
+   * Sets a batch the receiver turned away aside for a retry, behind the
+   * batches refused before it and ahead of everything else, if it still
+   * fits; and holds exports back for the receiver's `Retry-After` or the
+   * next backoff step. Returns whether it will be retried.
+   *
+   * A receiver that is away refuses whatever it is sent, but one may also
+   * refuse a batch for what is in it - larger than what it passes spans on
+   * to takes, say - with the same statuses. Put back at the front and sent
+   * again first, as it was, such a batch was refused for as long as the
+   * process ran, took in every span queued behind it at each try, and not
+   * one trace was exported after it. So later batches now go ahead of it,
+   * and once one of them got through it goes again first, a second apart
+   * or as long as `Retry-After` asks, and is dropped - counted, and the
+   * backoff left as the accepted export reset it - when it has been
+   * refused `MAX_REFUSALS_ONCE_OUTLIVED` times more: a receiver that only
+   * limits how often it is sent to takes it within those. During an outage
+   * nothing gets through, so nothing is dropped before the queue is full;
+   * each refused batch goes again once the receiver is back. At shutdown
+   * nothing is put back: the drain gives each batch one try.
    */
-  private retryLater(batch: OtlpSpan[], retryAfter: string | undefined): void {
-    this.lastSendFailed = true;
-    if (this.fits(batch)) {
+  private retryLater(
+    batch: OtlpSpan[],
+    retried: RefusedBatch | undefined,
+    retryAfter: string | undefined,
+  ): boolean {
+    if (this.shutdownPromise) {
+      this.droppedSpans += batch.length;
+      return false;
+    }
+    if (retried?.outlived) {
+      // The receiver took an export since this one was first refused: it
+      // is not away, so this does not add to the backoff.
+      retried.refusalsOnceOutlived += 1;
+      if (
+        retried.refusalsOnceOutlived >= MAX_REFUSALS_ONCE_OUTLIVED ||
+        !this.fits(batch)
+      ) {
+        this.droppedSpans += batch.length;
+        this.holdBack(retryAfter, 0);
+        return false;
+      }
       this.queue.unshift(...batch);
+      this.refused.unshift(retried);
+      this.refusedSpans += batch.length;
+      this.queuedChars += totalChars(batch);
+      this.holdBack(retryAfter, RETRY_BASE_MS);
+      return true;
+    }
+    if (this.fits(batch)) {
+      const refused: RefusedBatch = {
+        spans: batch.length,
+        outlived: false,
+        refusalsOnceOutlived: 0,
+      };
+      if (retried) {
+        this.queue.unshift(...batch);
+        this.refused.unshift(refused);
+      } else {
+        this.queue.splice(this.refusedSpans, 0, ...batch);
+        this.refused.push(refused);
+      }
+      this.refusedSpans += batch.length;
       this.queuedChars += totalChars(batch);
     } else {
       this.droppedSpans += batch.length;
@@ -471,22 +572,38 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
       this.retryDelayMs === 0
         ? RETRY_BASE_MS
         : Math.min(this.retryDelayMs * 2, RETRY_MAX_MS);
-    // Never sooner than the first backoff step. `Retry-After` is whole
-    // seconds, so no receiver that follows HTTP asks for less; one that
-    // answered `0.0000001` had every flush - and the follow-up after each
-    // full batch - send the same export again at once, as fast as the
-    // application's thread could encode it.
+    this.holdBack(retryAfter, this.retryDelayMs);
+    return true;
+  }
+
+  /**
+   * Holds exports back for the receiver's `Retry-After`, or else for
+   * `otherwiseMs`.
+   *
+   * Never sooner than the first backoff step when the receiver asks.
+   * `Retry-After` is whole seconds, so no receiver that follows HTTP asks
+   * for less; one that answered `0.0000001` had every flush - and the
+   * follow-up after each full batch - send the same export again at once,
+   * as fast as the application's thread could encode it.
+   */
+  private holdBack(retryAfter: string | undefined, otherwiseMs: number): void {
     const asked = Number(retryAfter);
     const delay =
       Number.isFinite(asked) && asked > 0
         ? Math.min(Math.max(asked * 1000, RETRY_BASE_MS), RETRY_AFTER_MAX_MS)
-        : this.retryDelayMs;
+        : otherwiseMs;
     this.retryNotBefore = Date.now() + delay;
   }
 
-  /** Clears the failure state after an accepted export, and says so. */
+  /**
+   * Clears the failure state after an accepted export, and says so. Every
+   * batch refused before it has now outlived a refusal that may have been
+   * the receiver's, and goes again next.
+   */
   private recovered(exported: number): void {
-    this.lastSendFailed = false;
+    for (const refused of this.refused) {
+      refused.outlived = true;
+    }
     this.retryDelayMs = 0;
     this.retryNotBefore = 0;
     if (this.failure !== null || this.droppedSpans > 0) {
@@ -648,8 +765,11 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
    * Operations finish their traces a tick after their response, and one
    * whose spans were still open waits a further second in the registry, so
    * the drain waits for both before deciding it is done - as the Observe
-   * worker's final flush does. A receiver that fails the final export is not
-   * retried: shutdown is not the time to wait out a backoff.
+   * worker's final flush does. Each batch still waiting is sent once, with
+   * no backoff in between: one the receiver fails is not retried - shutdown
+   * is not the time to wait one out - and the drain goes on with the next,
+   * so the batch a receiver refuses for what is in it no longer takes every
+   * later one with it.
    */
   private async shutDown(): Promise<void> {
     if (this.flushTimer) {
@@ -697,9 +817,6 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
           ),
         ]);
         timeout.abort();
-        if (this.lastSendFailed) {
-          return;
-        }
         continue;
       }
       if (this.operationTraceRegistry.hasSnapshotsAwaitingCompletion()) {
