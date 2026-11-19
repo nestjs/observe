@@ -49,6 +49,62 @@ describe("detectPackageManager", () => {
   });
 });
 
+// A project unpacked from an archive, copied into a container without its
+// .git, or kept in another VCS: no repository root to stop at.
+describe("detectPackageManager outside a repository", () => {
+  let scratch: string;
+  let project: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "observe-pm-"));
+    project = join(scratch, "alice", "orders-api");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}");
+  });
+
+  afterEach(() => rmSync(scratch, { recursive: true, force: true }));
+
+  it("takes no lockfile from a directory above the project", () => {
+    writeFileSync(join(scratch, "yarn.lock"), "");
+    expect(detectPackageManager(project)).toBe("npm");
+
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ packageManager: "pnpm@9.12.0" }),
+    );
+    expect(detectPackageManager(project)).toBe("pnpm");
+  });
+
+  it("reads the project's own lockfile", () => {
+    writeFileSync(join(scratch, "yarn.lock"), "");
+    writeFileSync(join(project, "bun.lock"), "");
+
+    expect(detectPackageManager(project)).toBe("bun");
+  });
+
+  it.each([
+    [
+      "package.json's workspaces",
+      "package.json",
+      JSON.stringify({ workspaces: ["alice/*"] }),
+    ],
+    [
+      "Yarn's workspaces.packages",
+      "package.json",
+      JSON.stringify({ workspaces: { packages: ["alice/*"] } }),
+    ],
+    ["pnpm-workspace.yaml", "pnpm-workspace.yaml", "packages:\n  - alice/*\n"],
+  ])(
+    "finds a workspace's lockfile at a root it names with %s",
+    (_name, file, text) => {
+      writeFileSync(join(scratch, file), text);
+      writeFileSync(join(scratch, "pnpm-lock.yaml"), "");
+
+      expect(detectPackageManager(project)).toBe("pnpm");
+    },
+  );
+});
+
 describe("addDependencyCommand", () => {
   it("installs with npm and adds with the rest", () => {
     expect(addDependencyCommand("npm", "x@^1.0.0")).toEqual([

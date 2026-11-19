@@ -23,20 +23,86 @@ const MANAGERS = new Set<string>(["npm", "pnpm", "yarn", "bun"]);
  * one, Corepack's `packageManager` field in package.json does, and npm is
  * the answer when neither says anything. Running `npx` says nothing either
  * way: it is how the command was started, not how the project installs.
+ *
+ * A project in no repository has no root to stop at, and a lockfile above
+ * it - a forgotten one in the home directory, say - belongs to something
+ * else: it made link install with a manager the project does not use, and
+ * outranked the project's own `packageManager` field. There, only `cwd` and
+ * the workspace it is a package of, if any, are looked in.
  */
 export function detectPackageManager(cwd: string): PackageManager {
+  const root = repositoryRoot(cwd);
+  if (root === undefined) {
+    const workspace = workspaceRoot(cwd);
+    return (
+      lockfileIn(cwd) ??
+      (workspace === undefined ? undefined : lockfileIn(workspace)) ??
+      declaredPackageManager(cwd) ??
+      (workspace === undefined
+        ? undefined
+        : declaredPackageManager(workspace)) ??
+      "npm"
+    );
+  }
   for (let dir = cwd; ; dir = dirname(dir)) {
-    const found = LOCKFILES.find(([file]) => existsSync(join(dir, file)));
+    const found = lockfileIn(dir);
     if (found) {
-      return found[1];
+      return found;
     }
     // The repository's root is as far as the project goes: a lockfile
     // above it belongs to something else.
-    if (existsSync(join(dir, ".git")) || dirname(dir) === dir) {
+    if (dir === root) {
       break;
     }
   }
   return declaredPackageManager(cwd) ?? "npm";
+}
+
+function lockfileIn(dir: string): PackageManager | undefined {
+  return LOCKFILES.find(([file]) => existsSync(join(dir, file)))?.[1];
+}
+
+/** The nearest directory from `cwd` up that holds a `.git`. */
+function repositoryRoot(cwd: string): string | undefined {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, ".git"))) {
+      return dir;
+    }
+    if (dirname(dir) === dir) {
+      return undefined;
+    }
+  }
+}
+
+/**
+ * The nearest directory above `cwd` that is a workspace's root - one with a
+ * `pnpm-workspace.yaml`, or a package.json that lists `workspaces` - where
+ * the lockfile of a package inside it is.
+ */
+function workspaceRoot(cwd: string): string | undefined {
+  for (let dir = dirname(cwd); ; dir = dirname(dir)) {
+    if (existsSync(join(dir, "pnpm-workspace.yaml")) || listsWorkspaces(dir)) {
+      return dir;
+    }
+    if (dirname(dir) === dir) {
+      return undefined;
+    }
+  }
+}
+
+/** Whether `<dir>/package.json` lists `workspaces`, as npm, Yarn and Bun read them. */
+function listsWorkspaces(dir: string): boolean {
+  try {
+    const { workspaces } = JSON.parse(
+      readFileSync(join(dir, "package.json"), "utf8"),
+    ) as { workspaces?: unknown };
+    return (
+      Array.isArray(workspaces) ||
+      Array.isArray((workspaces as { packages?: unknown } | null)?.packages)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** `"pnpm@9.12.0"` in package.json's `packageManager` field, as `"pnpm"`. */
