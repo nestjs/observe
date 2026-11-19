@@ -13,6 +13,7 @@ import {
   X509Certificate,
 } from "node:crypto";
 import { PassThrough } from "node:stream";
+import { promisify } from "node:util";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
@@ -1078,6 +1079,58 @@ describe("createInstanceDecorator", () => {
       const wrapped = decorate(raw) as typeof raw;
 
       expect(withTrace(() => wrapped.Legacy)).toBe(Legacy);
+    });
+
+    describe("that nothing tells from a plain function", () => {
+      // The error types of jsonwebtoken, and of anything else built with
+      // `util.inherits`: an ES5-style constructor whose prototype holds
+      // nothing but `constructor`. Handed out as a wrapper in its place,
+      // every `instanceof` against it was false and `new` ran it against
+      // the provider.
+      const makeErrorType = () => {
+        const TokenError = function (this: Error, message: string) {
+          this.message = message;
+        } as unknown as new (message: string) => Error;
+        TokenError.prototype = Object.create(Error.prototype) as Error;
+        TokenError.prototype.constructor = TokenError;
+        return TokenError;
+      };
+
+      it("answers `instanceof` as the constructor itself does", () => {
+        const raw = { TokenError: makeErrorType() };
+        const wrapped = decorate(raw) as typeof raw;
+        const error = new raw.TokenError("jwt expired");
+
+        expect(error instanceof wrapped.TokenError).toBe(true);
+        expect(withTrace(() => error instanceof wrapped.TokenError)).toBe(true);
+        expect(new Error("other") instanceof wrapped.TokenError).toBe(false);
+      });
+
+      it("constructs with `new`, not against the provider", () => {
+        const raw = { TokenError: makeErrorType() };
+        const wrapped = decorate(raw) as typeof raw;
+
+        const error = withTrace(() => new wrapped.TokenError("jwt expired"));
+
+        expect(error).toBeInstanceOf(raw.TokenError);
+        expect(error.message).toEqual("jwt expired");
+        expect(raw).not.toHaveProperty("message");
+        expect(startedSteps).toEqual([]);
+      });
+
+      it("keeps what hangs off the function under a symbol", () => {
+        // `util.promisify` finds a function's own promise-returning form
+        // there, as `child_process.execFile` has one.
+        const execFile = (done: (err: null, stdout: string) => void) =>
+          done(null, "out");
+        const promisified = () => Promise.resolve({ stdout: "out" });
+        Object.defineProperty(execFile, promisify.custom, {
+          value: promisified,
+        });
+        const wrapped = decorate({ execFile }) as { execFile: typeof execFile };
+
+        expect(promisify(wrapped.execFile)).toBe(promisified);
+      });
     });
 
     it("keeps handing the constructor out untouched on later reads", () => {
