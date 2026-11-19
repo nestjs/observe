@@ -289,11 +289,14 @@ function readFirstFieldName(source: string, from: number): string | undefined {
 /**
  * Blanks out comments, strings and numbers, so none can be mistaken for a name
  * or a brace. Offsets are not preserved - nothing downstream maps back to the
- * original text.
+ * original text. A document with a string that is never closed is kept only
+ * up to its first string.
  */
 function stripIgnoredTokens(document: string): string {
   let out = "";
   let index = 0;
+  // Where in `out` the document's first string went.
+  let firstString = -1;
 
   while (index < document.length) {
     const char = document[index];
@@ -313,14 +316,21 @@ function stripIgnoredTokens(document: string): string {
     }
 
     if (char === '"') {
-      if (document.startsWith('"""', index)) {
-        index = endOfBlockString(document, index + 3);
-      } else {
-        index += 1;
-        while (index < document.length && document[index] !== '"') {
-          index += document[index] === "\\" ? 2 : 1;
-        }
-        index += 1;
+      if (firstString === -1) {
+        firstString = out.length;
+      }
+      index = document.startsWith('"""', index)
+        ? endOfBlockString(document, index + 3)
+        : endOfString(document, index + 1);
+      if (index === -1) {
+        // Never closed, so the server refuses the document - and its quotes
+        // do not pair. Paired regardless, a stray quote took the opening
+        // quote of the next literal for its close, and from there every
+        // string was recorded while the text between them was blanked. Which
+        // side of a quote is a literal cannot be told for the earlier quotes
+        // either: in `"24" monitor"`, the ` monitor` a user typed is already
+        // in `out`. Nothing from the first string on is recorded.
+        return out.slice(0, firstString) + "_";
       }
       // Left as a token that is neither a name nor a brace, so a default value
       // of `""` still reads as a value rather than as nothing at all.
@@ -368,17 +378,40 @@ function stripIgnoredTokens(document: string): string {
 
 /**
  * Where a block string that opened before `from` ends, its closing quotes
- * included. `\"""` is three quotes of content, as graphql-js reads it, not the
- * end: ended there, the rest of the literal was recorded as document syntax.
- * A block string has no other escape, so a backslash before the quotes always
- * escapes them.
+ * included, or -1 when it is never closed. `\"""` is three quotes of content,
+ * as graphql-js reads it, not the end: ended there, the rest of the literal
+ * was recorded as document syntax. A block string has no other escape, so a
+ * backslash before the quotes always escapes them.
  */
 function endOfBlockString(document: string, from: number): number {
   let end = document.indexOf('"""', from);
   while (end > from && document[end - 1] === "\\") {
     end = document.indexOf('"""', end + 3);
   }
-  return end === -1 ? document.length : end + 3;
+  return end === -1 ? -1 : end + 3;
+}
+
+/**
+ * Where a `"` string whose content starts at `from` ends, its closing quote
+ * included, or -1 when it is not closed on its line. graphql-js ends a string
+ * at a line terminator, and refuses it there: a quote found beyond one is the
+ * opening quote of the next literal. Only `\"` and `\\` are stepped over, so
+ * that a backslash cannot carry the scan past the line end either.
+ */
+function endOfString(document: string, from: number): number {
+  let index = from;
+  while (index < document.length) {
+    const char = document[index];
+    if (char === '"') {
+      return index + 1;
+    }
+    if (char === "\n" || char === "\r") {
+      return -1;
+    }
+    const next = document[index + 1];
+    index += char === "\\" && (next === '"' || next === "\\") ? 2 : 1;
+  }
+  return -1;
 }
 
 function isDigit(char: string): boolean {

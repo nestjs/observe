@@ -247,6 +247,69 @@ describe("parseGraphQLOperation", () => {
       });
     });
 
+    it("records nothing from the first string on when a string is not closed on its line", () => {
+      // graphql-js ends a string at the line end, and refuses it. Read on
+      // past it, a stray quote paired with the next literal's opening quote,
+      // and every later string was recorded while the text between them was
+      // blanked - `body`'s password included.
+      for (const lineEnd of ["\n", "\r\n", "\r"]) {
+        expect(
+          parseGraphQLOperation(
+            `mutation {${lineEnd}createTicket(${lineEnd}subject: "24" monitor",${lineEnd}body: "door password is UpYB"${lineEnd}) }`,
+          ),
+        ).toMatchObject({
+          rootTypeName: "Mutation",
+          fieldName: "createTicket",
+          sanitizedDocument: "mutation { createTicket( subject: _",
+        });
+      }
+      // A closing quote forgotten, on one line and over two.
+      expect(
+        parseGraphQLOperation(
+          'mutation { login(email: "a", password: "sec"ret") { token } }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { login(email: _");
+      expect(
+        parseGraphQLOperation(
+          'mutation {\n login(\n id: 7, email: "ann@example.com,\n password: "hunter2"\n ) }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { login( id: _, email: _");
+      // Nor does a backslash carry a string over the line end.
+      expect(
+        parseGraphQLOperation(
+          'mutation { note(a: "x\\\n b: "hunter2", c: "y\\\n d: "z") }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { note(a: _");
+    });
+
+    it("records nothing from the first string on when a block string is not closed", () => {
+      expect(
+        parseGraphQLOperation(
+          'mutation { note(subject: "24", body: """hunter2 ) }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { note(subject: _");
+      expect(
+        parseGraphQLOperation(
+          'mutation { note(text: """a \\""" hunter2 \\""" b) }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { note(text: _");
+    });
+
+    it("reads a string on past an escaped quote, and a block string past a line end", () => {
+      expect(
+        parseGraphQLOperation(
+          'mutation { note(subject: "24\\" monitor \\\\", body: """a\nb""") { id } }',
+        )?.sanitizedDocument,
+      ).toBe("mutation { note(subject: _, body: _) { id } }");
+    });
+
+    it("leaves a document unlabelled when its unclosed string stands before the first brace", () => {
+      // A field name read after an unpaired quote may be literal text.
+      expect(
+        parseGraphQLOperation('query Q($a: String = "x) { secret }'),
+      ).toBeUndefined();
+    });
+
     it("drops comments", () => {
       expect(
         parseGraphQLOperation("# top secret\n{ orders { id } }")
