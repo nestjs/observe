@@ -60,6 +60,13 @@ const snapshot = (
     ...overrides,
   }) as RequestSnapshot;
 
+/** A hundred tags of 16 KiB each - the longest a tag is exported - one string. */
+const LARGE_TAG = "x".repeat(16 * 1024);
+const largeTags = () =>
+  Object.fromEntries(
+    Array.from({ length: 100 }, (_, index) => [`large.${index}`, LARGE_TAG]),
+  );
+
 function exporterFor(endpoint: string, overrides = {}) {
   const exporter = new OtlpTraceExporter(
     options({ otlp: { endpoint, protocol: "http/json" }, ...overrides }),
@@ -335,6 +342,27 @@ describe("OtlpTraceExporter", () => {
     expect(receiver.spans()).toHaveLength(1_202);
   });
 
+  // A receiver takes exports up to a size: a thousand large spans in one
+  // would be refused whole.
+  it("fills a batch by the text in it too, and sends the rest on at once", async () => {
+    const exporter = exporterFor(receiver.url);
+    for (let index = 0; index < 3; index++) {
+      exporter.exportRequestSnapshot(snapshot(0, { tags: largeTags() }));
+    }
+
+    // About 1.6 M characters an operation: two do not fit in one batch of
+    // 2 Mi, and the second goes out after the first without a flush.
+    await waitFor(() => receiver.exports.length === 2, 3_000, "two exports");
+    await exporter.onApplicationShutdown();
+
+    expect(receiver.exports.map((received) => received.spans.length)).toEqual([
+      2, 2, 2,
+    ]);
+    expect((exporter as unknown as { queuedChars: number }).queuedChars).toBe(
+      0,
+    );
+  });
+
   it("drops an answer that will not change - a 400 - says so once, and says when it works again", async () => {
     const exporter = exporterFor(receiver.url);
     receiver.answerNextWith(400);
@@ -474,7 +502,8 @@ describe("OtlpTraceExporter", () => {
       },
     });
     try {
-      // One full batch, too much for the kernel to take unread.
+      // One full batch, too much for the kernel to take unread. Three bytes
+      // a character, so that it stays one batch, within its characters.
       const [handler] = snapshot().traces as unknown as Array<
         Record<string, unknown>
       >;
@@ -486,7 +515,7 @@ describe("OtlpTraceExporter", () => {
               children: Array.from({ length: 999 }, () => ({
                 origin: "auto",
                 className: "OrdersService",
-                methodKey: "m".repeat(4_000),
+                methodKey: "€".repeat(950),
                 duration: 1,
                 startOffset: 1,
               })),
@@ -676,6 +705,31 @@ describe("OtlpTraceExporter", () => {
       // The first export took 1,000 and left one span behind; nine more
       // operations fit whole behind it, and the last two not at all.
       expect(queued.length).toBe(1 + 9 * 1_001);
+      const drops = warn.mock.calls.filter((call: unknown[]) =>
+        String(call[0]).includes("falling behind"),
+      );
+      expect(drops).toHaveLength(1);
+
+      await exporter.onApplicationShutdown();
+    });
+
+    it("bounds what waits by the text in it too, however few the spans", async () => {
+      const exporter = exporterFor(silentUrl);
+
+      // About 1.6 M characters an operation, in 16 KiB tags: 40 of them
+      // are 80 spans, far from the limit on spans.
+      for (let index = 0; index < 40; index++) {
+        exporter.exportRequestSnapshot(snapshot(0, { tags: largeTags() }));
+      }
+
+      const state = exporter as unknown as {
+        queue: unknown[];
+        queuedChars: number;
+      };
+      // The first export took one operation and never returns; twenty more
+      // fit in 32 Mi characters behind it, and the rest not at all.
+      expect(state.queue).toHaveLength(2 * 20);
+      expect(state.queuedChars).toBeLessThanOrEqual(32 * 1024 * 1024);
       const drops = warn.mock.calls.filter((call: unknown[]) =>
         String(call[0]).includes("falling behind"),
       );

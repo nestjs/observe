@@ -408,6 +408,37 @@ describe("requestSnapshotSpans", () => {
     expect(server.attributes).toHaveLength(128);
     expect(server.droppedAttributesCount).toBeGreaterThan(0);
   });
+
+  // A client's text in an outgoing call's URL is as long as the client
+  // made it, and waited in the export queue at that length.
+  it("cuts a long string attribute to 16 KiB, keeping its head", () => {
+    const url = `https://api.stripe.com/v1/coupons/${"x".repeat(200_000)}`;
+    const snapshot = orderRequest({
+      tags: { short: "kept" },
+      traces: [
+        {
+          origin: "auto",
+          className: "http",
+          methodKey: "GET api.stripe.com",
+          duration: 1,
+          startOffset: 0,
+          tags: { "http.method": "GET", "http.url": url },
+          children: [],
+        },
+      ],
+    });
+    const [server, call] = requestSnapshotSpans(snapshot, undefined);
+    const attributes = attributesOf(call);
+
+    for (const key of ["http.url", "url.full"]) {
+      const value = String(attributes[key]);
+      expect(value).toHaveLength(16 * 1024);
+      expect(url.startsWith(value.slice(0, value.indexOf("~")))).toBe(true);
+    }
+    // Read off the whole URL, before the cut.
+    expect(attributes["server.address"]).toBe("api.stripe.com");
+    expect(attributesOf(server).short).toBe("kept");
+  });
 });
 
 describe("jobSnapshotSpans", () => {

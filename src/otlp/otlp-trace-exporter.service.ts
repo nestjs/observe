@@ -48,11 +48,33 @@ const gzipAsync = promisify(gzip);
 const MAX_QUEUED_SPANS = 10_000;
 
 /**
+ * The most characters waiting to be exported, counted over every string the
+ * waiting spans carry (see `charsOf`). Past it, as past `MAX_QUEUED_SPANS`,
+ * a finished operation's spans are dropped whole and counted.
+ *
+ * A count of spans alone does not bound the memory: a span is as large as
+ * its tags, its status and its exception event, and some of them are as
+ * long as a client made them. Ten thousand spans that each carried a few
+ * outgoing calls' URLs with a client's text in them ran the process out of
+ * heap while the receiver was down.
+ */
+const MAX_QUEUED_CHARS = 32 * 1024 * 1024;
+
+/**
  * The most spans one export carries. A full batch is sent at once rather
  * than at the next interval, so a busy service exports in step with what it
  * records instead of building up a backlog between ticks.
  */
 const MAX_BATCH_SPANS = 1_000;
+
+/**
+ * The most characters one export carries, counted as for the queue: a batch
+ * is full at whichever of the two it reaches first, and holds at least one
+ * span. Receivers limit the size of what they take - a collector's request
+ * body, the message size of whatever it passes spans on to - and a thousand
+ * large spans in one export would be refused whole, every time it is tried.
+ */
+const MAX_BATCH_CHARS = 2 * 1024 * 1024;
 
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const MIN_FLUSH_INTERVAL_MS = 1_000;
@@ -130,6 +152,8 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   private readonly scope: OtlpScope = { name: "@nestjs/observe", version: "" };
   private readonly agent: http.Agent | undefined;
   private readonly queue: OtlpSpan[] = [];
+  /** What `charsOf` counts in `queue`, kept as spans come and go. */
+  private queuedChars = 0;
   private sending: Promise<void> | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private shutdownPromise: Promise<void> | null = null;
@@ -296,11 +320,11 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     ) {
       return;
     }
-    const batch = this.queue.splice(0, MAX_BATCH_SPANS);
+    const batch = this.takeBatch();
     this.sending = this.send(batch).finally(() => {
       this.sending = null;
       // A backlog left behind a full batch goes straight out after it.
-      if (this.queue.length >= MAX_BATCH_SPANS && !this.shutdownPromise) {
+      if (this.holdsFullBatch() && !this.shutdownPromise) {
         this.flush();
       }
     });
@@ -312,22 +336,63 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
   }
 
   private enqueue(spans: OtlpSpan[]): void {
-    if (this.queue.length + spans.length > MAX_QUEUED_SPANS) {
+    if (!this.fits(spans)) {
       this.droppedSpans += spans.length;
       if (!this.reportedDrop) {
         this.reportedDrop = true;
         this.logger.warn(
-          `OTLP export is falling behind: more than ${MAX_QUEUED_SPANS} spans are waiting for ${this.settings?.url}, so newer traces are dropped until it catches up. Dropped spans are counted and reported when it does.`,
+          `OTLP export is falling behind: the spans waiting for ${this.settings?.url} have reached the limit of what is held (${MAX_QUEUED_SPANS} spans, or ${MAX_QUEUED_CHARS} characters of text in them), so newer traces are dropped until it catches up. Dropped spans are counted and reported when it does.`,
         );
       }
       return;
     }
+    this.queueAtEnd(spans);
+    if (this.holdsFullBatch()) {
+      this.flush();
+    }
+  }
+
+  /** Whether `spans` can wait in the queue as it stands, within both limits. */
+  private fits(spans: OtlpSpan[]): boolean {
+    return (
+      this.queue.length + spans.length <= MAX_QUEUED_SPANS &&
+      this.queuedChars + totalChars(spans) <= MAX_QUEUED_CHARS
+    );
+  }
+
+  private queueAtEnd(spans: OtlpSpan[]): void {
     for (const span of spans) {
       this.queue.push(span);
     }
-    if (this.queue.length >= MAX_BATCH_SPANS) {
-      this.flush();
+    this.queuedChars += totalChars(spans);
+  }
+
+  /** Whether what waits fills a batch by either of its limits. */
+  private holdsFullBatch(): boolean {
+    return (
+      this.queue.length >= MAX_BATCH_SPANS ||
+      this.queuedChars >= MAX_BATCH_CHARS
+    );
+  }
+
+  /**
+   * Takes the next batch off the front of the queue: as many spans as fit
+   * in `MAX_BATCH_SPANS` and `MAX_BATCH_CHARS`, and always at least one, so
+   * a span larger than a batch on its own still goes out.
+   */
+  private takeBatch(): OtlpSpan[] {
+    let count = 0;
+    let chars = 0;
+    while (count < this.queue.length && count < MAX_BATCH_SPANS) {
+      const next = charsOf(this.queue[count]);
+      if (count > 0 && chars + next > MAX_BATCH_CHARS) {
+        break;
+      }
+      chars += next;
+      count += 1;
     }
+    this.queuedChars -= chars;
+    return this.queue.splice(0, count);
   }
 
   /**
@@ -396,8 +461,9 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
    */
   private retryLater(batch: OtlpSpan[], retryAfter: string | undefined): void {
     this.lastSendFailed = true;
-    if (this.queue.length + batch.length <= MAX_QUEUED_SPANS) {
+    if (this.fits(batch)) {
       this.queue.unshift(...batch);
+      this.queuedChars += totalChars(batch);
     } else {
       this.droppedSpans += batch.length;
     }
@@ -647,4 +713,50 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
       this.flush();
     }
   }
+}
+
+/** What `charsOf` has counted, so a span is walked once however often it moves. */
+const countedChars = new WeakMap<OtlpSpan, number>();
+
+/**
+ * How many characters of text a span carries: its ids and name, its trace
+ * state and status message, and the keys and string values of its
+ * attributes and its events'. What the queue and a batch are measured in -
+ * not the bytes an export takes, which the encoding decides, but what grows
+ * with them.
+ */
+function charsOf(span: OtlpSpan): number {
+  let chars = countedChars.get(span);
+  if (chars !== undefined) {
+    return chars;
+  }
+  chars =
+    span.traceId.length +
+    span.spanId.length +
+    (span.parentSpanId?.length ?? 0) +
+    (span.traceState?.length ?? 0) +
+    span.name.length +
+    (span.status?.message?.length ?? 0) +
+    attributeChars(span.attributes);
+  for (const event of span.events) {
+    chars += event.name.length + attributeChars(event.attributes);
+  }
+  countedChars.set(span, chars);
+  return chars;
+}
+
+function attributeChars(attributes: OtlpAttribute[]): number {
+  let chars = 0;
+  for (const { key, value } of attributes) {
+    chars += key.length + (typeof value === "string" ? value.length : 0);
+  }
+  return chars;
+}
+
+function totalChars(spans: OtlpSpan[]): number {
+  let chars = 0;
+  for (const span of spans) {
+    chars += charsOf(span);
+  }
+  return chars;
 }

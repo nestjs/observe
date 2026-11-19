@@ -4,6 +4,7 @@ import type {
   CompleteTraceEventNode,
   OngoingTraceEventNode,
 } from "../interfaces/trace-events.interfaces.js";
+import { fitToLength } from "../utils/fit-to-length.util.js";
 import {
   randomSpanId,
   TraceContext,
@@ -40,6 +41,17 @@ const REMOTE_PARENT_FLAGS = LOCAL_PARENT_FLAGS | IS_REMOTE_FLAG;
  * OpenTelemetry SDKs' default limit.
  */
 const MAX_ATTRIBUTES_PER_SPAN = 128;
+
+/**
+ * The most of a string attribute that is exported, as the OpenTelemetry
+ * SDKs' `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT` would cut it.
+ *
+ * A tag is as long as whatever it was made from, and some are made from
+ * what a client sent: an outgoing call's `url.full` with the client's text
+ * in its path, a GraphQL document. Uncut, each one waited in the export
+ * queue, and in every retry of it, at its full length.
+ */
+const MAX_ATTRIBUTE_VALUE_LENGTH = 16 * 1024;
 
 /**
  * The span classes the outgoing integrations open - see
@@ -401,6 +413,8 @@ function errorStatus(
 /**
  * Attributes from a flat record, in its order, without the keys that hold
  * nothing - and at most `MAX_ATTRIBUTES_PER_SPAN` of them, the rest counted.
+ * A string longer than `MAX_ATTRIBUTE_VALUE_LENGTH` is cut to a copy of its
+ * head that ends in a hash of the whole (see `fitToLength`).
  */
 export function toAttributes(
   record: Record<string, OtlpAttributeValue | undefined | null>,
@@ -426,7 +440,13 @@ export function toAttributes(
       droppedAttributesCount += 1;
       continue;
     }
-    attributes.push({ key, value });
+    attributes.push({
+      key,
+      value:
+        typeof value === "string"
+          ? fitToLength(value, MAX_ATTRIBUTE_VALUE_LENGTH)
+          : value,
+    });
   }
   return { attributes, droppedAttributesCount };
 }
