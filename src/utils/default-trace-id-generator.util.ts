@@ -1,3 +1,4 @@
+import { readContextAccessor } from "./context-accessor.util.js";
 import { inboundTraceId, w3cTraceIdOf } from "./trace-context.util.js";
 import { uuidv7 } from "./uuid-v7.util.js";
 
@@ -30,15 +31,12 @@ export function defaultTraceIdGenerator(req: unknown) {
   // which gave their contexts - and the context gRPC hands the processing
   // hooks - the same `getMetadata()`. Held to the same shape as the header - a
   // packet is no more trustworthy than a request.
-  const getMetadata = (req as { getMetadata?: unknown } | null)?.getMetadata;
-  if (typeof getMetadata === "function") {
-    const metadata: unknown = getMetadata.call(req);
-    const requestId = (metadata as Record<string, unknown> | undefined)?.[
-      "x-request-id"
-    ];
-    if (typeof requestId === "string" && REQUEST_ID_PATTERN.test(requestId)) {
-      return requestId;
-    }
+  const metadata = readContextAccessor(req, "getMetadata");
+  const requestId = (metadata as Record<string, unknown> | undefined)?.[
+    "x-request-id"
+  ];
+  if (typeof requestId === "string" && REQUEST_ID_PATTERN.test(requestId)) {
+    return requestId;
   }
   // Minted here, so it can carry its time - see uuidv7.
   return uuidv7();

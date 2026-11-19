@@ -14,6 +14,7 @@ import {
   TRACE_CONTEXT_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
+import { readContextAccessor } from "../utils/context-accessor.util.js";
 import { handedOnTraceContext } from "../utils/trace-context.util.js";
 import { continueHandedOnTrace } from "../utils/trace-handoff.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
@@ -558,7 +559,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         // `toProtocolName` - and there is no universal accessor for its
         // routing key. Throwing here would fail the message before `done()`
         // ever ran, so fall back to a conventional accessor when one exists.
-        const pattern = (ctx as { getPattern?: () => unknown })?.getPattern?.();
+        const pattern = readContextAccessor(ctx, "getPattern");
         return typeof pattern === "string"
           ? this.toRoute(pattern, target)
           : "unknown";
@@ -622,11 +623,7 @@ function composeEndHook(
  */
 function handedOnTraceparent(ctx: BaseRpcContext): unknown {
   try {
-    const getMetadata = (ctx as { getMetadata?: unknown } | null)?.getMetadata;
-    if (typeof getMetadata !== "function") {
-      return undefined;
-    }
-    const metadata: unknown = getMetadata.call(ctx);
+    const metadata = readContextAccessor(ctx, "getMetadata");
     return (metadata as Record<string, unknown> | undefined)?.["traceparent"];
   } catch {
     // A context that cannot be read carries nothing to continue.

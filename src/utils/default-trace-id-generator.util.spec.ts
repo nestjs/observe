@@ -79,6 +79,26 @@ describe("defaultTraceIdGenerator", () => {
       );
     }
   });
+
+  it("mints its own for a context whose metadata is asynchronous, and handles its rejection", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      // A custom transporter's context that checks the message's signature
+      // before answering, and rejects a forged one.
+      const ctx = {
+        getMetadata: () =>
+          Promise.reject(new Error("event signature does not match")),
+      };
+
+      expect(defaultTraceIdGenerator(ctx)).toMatch(UUID);
+      // An unhandled rejection is reported once the microtasks have run.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
 });
 
 /**
