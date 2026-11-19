@@ -405,10 +405,15 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
       this.retryDelayMs === 0
         ? RETRY_BASE_MS
         : Math.min(this.retryDelayMs * 2, RETRY_MAX_MS);
+    // Never sooner than the first backoff step. `Retry-After` is whole
+    // seconds, so no receiver that follows HTTP asks for less; one that
+    // answered `0.0000001` had every flush - and the follow-up after each
+    // full batch - send the same export again at once, as fast as the
+    // application's thread could encode it.
     const asked = Number(retryAfter);
     const delay =
       Number.isFinite(asked) && asked > 0
-        ? Math.min(asked * 1000, RETRY_AFTER_MAX_MS)
+        ? Math.min(Math.max(asked * 1000, RETRY_BASE_MS), RETRY_AFTER_MAX_MS)
         : this.retryDelayMs;
     this.retryNotBefore = Date.now() + delay;
   }

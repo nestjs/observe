@@ -370,6 +370,28 @@ describe("OtlpTraceExporter", () => {
     await exporter.onApplicationShutdown();
   });
 
+  // `Retry-After` is whole seconds: a fraction of one is no reason to send
+  // the same export again at once, on every flush.
+  it("waits at least a second when the receiver asks to retry sooner", async () => {
+    const exporter = exporterFor(receiver.url);
+    receiver.answerNextWith(503, { "retry-after": "0.0000001" });
+    exporter.exportRequestSnapshot(snapshot());
+    exporter.flush();
+    await waitFor(() => receiver.requests.length === 1, 3_000, "the export");
+    const state = exporter as unknown as { sending: unknown };
+    await waitFor(() => state.sending === null, 3_000, "the refusal");
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      exporter.flush();
+    }
+    expect(receiver.requests).toHaveLength(1);
+
+    await exporter.onApplicationShutdown();
+    // The final export does not wait out the delay.
+    expect(receiver.spans()).toHaveLength(2);
+  });
+
   describe("against a receiver that answers out of the ordinary", () => {
     let odd: HttpServer;
     let oddUrl: string;
