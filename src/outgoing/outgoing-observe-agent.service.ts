@@ -146,8 +146,15 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
         DRIVER_DEPENDENTS.mongodb,
         (module) => patchMongodb(module, recorder),
       );
-      this.patchDriver("mssql", "mssql", DRIVER_DEPENDENTS.mssql, (module) =>
-        patchMssql(module, recorder),
+      // The class that is patched, not `mssql` itself: loading that entry
+      // makes tedious the driver of every request mssql creates on its own
+      // behalf, which breaks an application that runs on
+      // `mssql/msnodesqlv8`.
+      this.patchDriver(
+        "mssql",
+        "mssql/lib/tedious/request",
+        DRIVER_DEPENDENTS.mssql,
+        (Request) => patchMssql({ Request }, recorder),
       );
     }
 

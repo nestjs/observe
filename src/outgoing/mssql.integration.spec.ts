@@ -849,6 +849,58 @@ describe("MSSQL statement sanitization", () => {
 });
 
 describe("MSSQL startup registration", () => {
+  it("leaves the driver the application has loaded registered", () => {
+    const require = createRequire(import.meta.url);
+    const { driver } = require("mssql/lib/shared") as {
+      driver: { name: string; Request: unknown };
+    };
+    const registered = { ...driver };
+    // As in an application that has loaded `mssql/msnodesqlv8` and not
+    // `mssql`: the other driver is registered, and the entry point of
+    // tedious has not run.
+    const entries = ["mssql", "mssql/lib/tedious"].map((specifier) => {
+      const path = require.resolve(specifier);
+      const loaded = require.cache[path];
+      delete require.cache[path];
+      return { path, loaded };
+    });
+    class OtherRequest {}
+    driver.name = "msnodesqlv8";
+    driver.Request = OtherRequest;
+    const h = createRecorder();
+    const prototype = mssql.Request.prototype;
+    const originals = ["_query", "_execute"].map((method) => ({
+      method,
+      descriptor: Object.getOwnPropertyDescriptor(prototype, method)!,
+      key: Symbol.for(`nestjs.observe.original.${method}`),
+    }));
+    try {
+      new OutgoingObserveAgentService(
+        {
+          outgoing: { http: false },
+          traceIdKey: "traceId",
+        } as ObserveModuleOptionsWithDefaults,
+        h.registry,
+        h.storage,
+      ).onApplicationShutdown();
+      expect(driver.name).toBe("msnodesqlv8");
+      expect(driver.Request).toBe(OtherRequest);
+      // The tedious request class is still the one patched.
+      for (const { method, descriptor } of originals) {
+        expect(Reflect.get(prototype, method)).not.toBe(descriptor.value);
+      }
+    } finally {
+      Object.assign(driver, registered);
+      for (const { path, loaded } of entries) {
+        require.cache[path] = loaded;
+      }
+      for (const { method, descriptor, key } of originals) {
+        Object.defineProperty(prototype, method, descriptor);
+        Reflect.deleteProperty(prototype, key);
+      }
+    }
+  });
+
   it("enables MSSQL automatically and respects outgoing opt-outs", async () => {
     const h = createRecorder();
     const prototype = mssql.Request.prototype;
