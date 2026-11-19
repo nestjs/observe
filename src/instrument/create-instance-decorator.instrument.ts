@@ -815,6 +815,9 @@ function isCallableObject(fn: AnyFunction): boolean {
  * `%TypedArray%.prototype` (reached via `Uint8Array`'s parent) covers every
  * typed array - and, through it, Node's `Buffer`. `Array` is deliberately
  * absent: its methods are generic and proxy-safe.
+ *
+ * The `Intl` services are read off the namespace instead of being spelled
+ * out, see `intlServicePrototypes()`.
  */
 const SLOT_BACKED_PROTOTYPES = new Set<object>([
   Map.prototype,
@@ -832,7 +835,35 @@ const SLOT_BACKED_PROTOTYPES = new Set<object>([
   WeakRef.prototype,
   FinalizationRegistry.prototype,
   Object.getPrototypeOf(Uint8Array.prototype) as object,
+  ...intlServicePrototypes(),
 ]);
+
+/**
+ * Prototypes of the `Intl` services (`NumberFormat`, `DateTimeFormat`,
+ * `Collator`, `PluralRules`, `Locale`, ...). Their methods, and the `format`
+ * and `compare` accessors that hand out a bound function, read
+ * `[[InitializedNumberFormat]]` and the like off their receiver, so a
+ * formatter registered as a provider threw "called on incompatible receiver"
+ * on its first use.
+ *
+ * Which services there are depends on the runtime - `DurationFormat` only
+ * arrived in Node 23, and a Node built without ICU has no `Intl` at all - so
+ * the constructors are collected from the namespace. Its plain functions
+ * (`getCanonicalLocales`, `supportedValuesOf`) have no `prototype`.
+ */
+function intlServicePrototypes(): object[] {
+  if (typeof Intl === "undefined") {
+    return [];
+  }
+  return Object.getOwnPropertyNames(Intl).flatMap((name) => {
+    const service: unknown = Reflect.get(Intl, name);
+    const prototype: unknown =
+      typeof service === "function" ? service.prototype : undefined;
+    return typeof prototype === "object" && prototype !== null
+      ? [prototype]
+      : [];
+  });
+}
 
 /**
  * Whether the instance's prototype chain passes through a slot-backed

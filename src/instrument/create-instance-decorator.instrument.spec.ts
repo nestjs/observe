@@ -1516,6 +1516,45 @@ describe("createInstanceDecorator", () => {
       ).toEqual([true, 0, true]);
     });
 
+    it("returns a bare Intl formatter untouched", () => {
+      // `format` is an accessor that reads `[[InitializedNumberFormat]]` off
+      // its receiver, and `formatToParts` a method that does: through the
+      // proxy both threw "called on incompatible receiver".
+      const money = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+      });
+      const dates = new Intl.DateTimeFormat("en-US", { timeZone: "UTC" });
+
+      expect(decorate(money)).toBe(money);
+      expect(decorate(dates)).toBe(dates);
+      expect(startedSteps).toEqual([]);
+    });
+
+    it("invokes the natives an Intl subclass inherits without throwing", () => {
+      class Prices extends Intl.NumberFormat {
+        constructor() {
+          super("en-US", { style: "currency", currency: "USD" });
+        }
+
+        price(cents: number) {
+          return this.format(cents / 100);
+        }
+      }
+      const prices = decorate(new Prices()) as Prices;
+
+      expect(prices.format(12.5)).toEqual("$12.50");
+      expect(withTrace(() => prices.price(1250))).toEqual("$12.50");
+      expect(withTrace(() => prices.formatToParts(1)[0])).toEqual({
+        type: "currency",
+        value: "$",
+      });
+      expect(startedSteps).toEqual([
+        { className: "Prices", methodName: "price" },
+        { className: "Prices", methodName: "formatToParts" },
+      ]);
+    });
+
     it("invokes native methods inherited by a subclass without throwing", () => {
       class TenantCache extends Map<string, string> {
         lookup(id: string) {
