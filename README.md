@@ -446,6 +446,23 @@ Several of the places the agent hooks into hold one hook each: GraphQL's `Resolv
 
 Set those after instead: on `app.getHttpAdapter()` before `listen()`, on `app.getTransportServer()`, or on the injected client from a provider.
 
+### The request's async store
+
+`ObserveModule` provides its `AsyncLocalStorage` to the whole application, under the `AsyncLocalStorage` class, so request context needs no other package: inject it anywhere. Each request, message, job or operation the agent handles runs with a `Map` of its own as the store, which holds what `setAttributes` returns and the trace id (under `traceIdKey`), and which you can read and write too. `TracerService.getAttribute()` and `setAttribute()` are the typed way in.
+
+```ts
+@Injectable()
+export class CurrentTenant {
+  constructor(private readonly als: AsyncLocalStorage<Map<string, unknown>>) {}
+
+  get id() {
+    return this.als.getStore()?.get("tenantId") as string | undefined;
+  }
+}
+```
+
+The store is the agent's, so leave opening it to the agent: calling `run()` or `enterWith()` on it with a store of your own replaces the request's `Map`, and the agent loses the request. For a store of your own - Nest's async-local-storage recipe, say - provide it under a token of your own instead of the `AsyncLocalStorage` class, which would otherwise resolve to either one depending on the order of the imports. `enabled: false` does not change any of this: the store is provided either way.
+
 ### Guards and the handler they are handed
 
 With `instrument: ObserveInstrument`, the controller and gateway methods Nest routes to are the agent's traced stand-ins for your methods, so `context.getHandler()` in a guard or interceptor returns the stand-in, not `MyController.prototype.method`. The stand-in carries the method's name and a copy of its metadata, taken when Nest registers the route. Reading that metadata through `Reflector`, as Nest's documentation does (`SetMetadata`, `Reflector.createDecorator()`), works the same with the agent as without it. Two things do not:
