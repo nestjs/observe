@@ -1,11 +1,20 @@
 import { AsyncResource } from "node:async_hooks";
 import { connect } from "node:net";
-import { Controller, Get, INestApplication, Module } from "@nestjs/common";
+import {
+  Controller,
+  Get,
+  INestApplication,
+  Module,
+  Next,
+  Req,
+  Res,
+} from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { ExpressAdapter } from "@nestjs/platform-express";
 import { FastifyAdapter } from "@nestjs/platform-fastify";
 import request from "supertest";
 import { createObserveModule } from "../observe.module.js";
+import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
 import { createNodeAdapter, onPlatforms } from "../testing/nest-version.js";
 import {
@@ -37,6 +46,8 @@ const executions = new Map<string, Execution>();
 let tracerRef: TracerService | undefined;
 // A callback a finished request leaves behind, still bound to its store.
 let lateCallback: (() => void) | undefined;
+// Hands a request back to the app's router, as the platform does it.
+let routeAgain: ((req: any, res: any, next: () => void) => void) | undefined;
 
 const { ObserveModule, ObserveInstrument } = createObserveModule({
   sourceContext: false,
@@ -60,6 +71,11 @@ class OrdersController {
   @Get("quick")
   quick() {
     return { ok: true };
+  }
+
+  @Get("latest")
+  latest(@Req() req: any, @Res() res: any, @Next() next: () => void) {
+    routeAgain!(req, res, next);
   }
 
   @Get("leaves-callback")
@@ -136,6 +152,16 @@ describe.each<Platform>(onPlatforms(["express", "node", "fastify"]))(
       // connection - including the other request still held at its gate.
       await app.listen(0, "127.0.0.1");
       tracerRef = app.get(TracerService);
+      routeAgain =
+        platform === "fastify"
+          ? (req, res) => {
+              req.raw.url = "/quick";
+              app.getHttpAdapter().getInstance().routing(req.raw, res.raw);
+            }
+          : (req, res, next) => {
+              req.url = "/quick";
+              req.app(req, res, next);
+            };
     });
 
     afterAll(async () => {
@@ -250,6 +276,25 @@ describe.each<Platform>(onPlatforms(["express", "node", "fastify"]))(
 
       expect(collected.items.map((item) => item.traceId).sort()).toEqual(ids);
     });
+
+    // The Node adapter runs its hooks outside the router, so a request it
+    // routes again does not pass them twice.
+    it.skipIf(platform === "node")(
+      "traces a request the app routes again once, and leaves no trace open",
+      async () => {
+        await get("/latest").expect(200, { ok: true });
+        await waitForSnapshot(collected, () => true);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        expect(collected.items).toHaveLength(1);
+        expect(collected.items[0].attributes?.originalUrl).toBe("/latest");
+        const registry = app.get(OperationTraceRegistry, { strict: false });
+        expect(
+          (registry as unknown as { traceSnapshots: Map<string, unknown> })
+            .traceSnapshots.size,
+        ).toBe(0);
+      },
+    );
 
     it("does not let a finished request rename a later one with the same id", async () => {
       await get("/leaves-callback").expect(200);

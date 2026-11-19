@@ -107,15 +107,26 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
   private httpAdapterInitSubscription: Subscription | undefined;
 
   /**
-   * The registry key each request was started under, by the request object -
-   * which every adapter hands to both of its hooks. The response hook cannot
-   * ask the async store: it runs from `finish`, in the async context of
-   * whatever ended the response, and that need not be the request's own. A
-   * request pipelined behind another has its `finish` emitted from the
-   * earlier one's; a stream piped into the response ends it where its source
-   * emits - for a pooled database connection, in the request that opened it.
+   * The registry key each request was started under, by the Node request -
+   * see `nodeRequestOf` - which every adapter hands to both of its hooks. The
+   * response hook cannot ask the async store: it runs from `finish`, in the
+   * async context of whatever ended the response, and that need not be the
+   * request's own. A request pipelined behind another has its `finish`
+   * emitted from the earlier one's; a stream piped into the response ends it
+   * where its source emits - for a pooled database connection, in the
+   * request that opened it. Taken out by the first response hook to run, so
+   * a request routed twice is completed once.
    */
   private readonly registryKeys = new WeakMap<object, string>();
+
+  /**
+   * The store each request runs in, by the Node request, for a request that
+   * comes through the router again - see `startHttpRequestTracing`.
+   */
+  private readonly requestStores = new WeakMap<
+    object,
+    Map<KeyOf<Store>, any>
+  >();
 
   /**
    * `http.queryParamsObfuscateRegex`, rebuilt with the global flag when it was
@@ -222,9 +233,28 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     res: unknown,
     done: () => unknown,
   ): unknown {
+    // A request the application routes again - `req.app(req, res, next)` or
+    // `app.handle()` on Express, `routing()` on Fastify - passes the
+    // adapter's hooks once per pass. Traced anew each time, the first pass's
+    // trace was never completed: both response hooks completed the last
+    // one, and every such request left a trace in the registry for the life
+    // of the process, holding the URL the client sent. It is one request,
+    // traced once, on the URL it arrived with: the later pass runs in the
+    // first one's store, or in the context it is in when that is a span of
+    // the request already.
+    const request = nodeRequestOf(req);
+    const started = this.requestStores.get(request);
+    if (started) {
+      const current = this.asyncLocalStorage.getStore();
+      return current?.get(TRACE_REGISTRY_KEY) ===
+        started.get(TRACE_REGISTRY_KEY)
+        ? done()
+        : this.asyncLocalStorage.run(started, done);
+    }
     // The same map `run` is given, rather than `getStore()` inside the callback:
     // identical object, one lookup fewer, and it is known to exist.
     const store = new Map<KeyOf<Store>, any>();
+    this.requestStores.set(request, store);
     return this.asyncLocalStorage.run(store, () => {
       // OpenTelemetry interop runs only beside reporting to NestJS Observe -
       // see `ObserveAgentSharedBuffer.isReporting`. Asked once per request,
@@ -249,7 +279,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
       // lookups stay off a recorded request sharing its id.
       const registryKey = uuidv7();
       store.set(TRACE_REGISTRY_KEY, registryKey);
-      this.registryKeys.set(req, registryKey);
+      this.registryKeys.set(request, registryKey);
       // Ended when the response closes, recorded or not, answered or
       // aborted: see `liveTraceId`.
       this.watchResponseClose(res, openOperation(store), registryKey);
@@ -329,14 +359,17 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
     // here is that of whatever ended the response, a finished request's or
     // another one still running, and neither may be completed in this one's
     // place, nor leave this one open.
+    const request =
+      typeof req === "object" && req !== null ? nodeRequestOf(req) : undefined;
     const registryKey =
-      typeof req === "object" && req !== null
-        ? this.registryKeys.get(req)
-        : undefined;
-    if (
-      registryKey === undefined ||
-      !this.operationTraceRegistry.hasTrace(registryKey)
-    ) {
+      request === undefined ? undefined : this.registryKeys.get(request);
+    if (registryKey === undefined) {
+      return;
+    }
+    // A request routed twice has a response hook per pass, and both run
+    // before the first completion takes the trace out of the registry.
+    this.registryKeys.delete(request!);
+    if (!this.operationTraceRegistry.hasTrace(registryKey)) {
       return;
     }
     deferTraceCompletion(
@@ -605,6 +638,20 @@ function testIgnoreRegex(pattern: RegExp, value: string): boolean {
  * an application's own `OPTIONS` handler is still traced as a request. Every
  * adapter lower-cases header names.
  */
+/**
+ * The Node request under what an adapter hands its hooks, which a request
+ * routed again shares between its passes: Express and the Node adapter hand
+ * over the Node request itself, and Fastify a request object of its own per
+ * pass, which is no emitter, with the Node request under it as `raw`.
+ */
+function nodeRequestOf(req: object): object {
+  if (typeof (req as { on?: unknown }).on === "function") {
+    return req;
+  }
+  const raw = (req as { raw?: unknown }).raw;
+  return typeof raw === "object" && raw !== null ? raw : req;
+}
+
 function isPreflight(req: IncomingHttpRequest): boolean {
   return (
     req.method === "OPTIONS" &&

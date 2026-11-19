@@ -498,6 +498,120 @@ describe("HttpObserveAgentService", () => {
       ]);
     });
 
+    /**
+     * An application that answers an alias by handing the request back to
+     * its router - `req.app(req, res, next)` - runs it through the adapter's
+     * hooks again: a second request hook, and a second response hook on the
+     * same `finish`.
+     */
+    describe("a request routed again", () => {
+      /** Records a finished span for the request whose store this runs in. */
+      const recordSpan = (
+        context: ReturnType<typeof createContext>,
+        name: string,
+      ) => {
+        const registryKey = context.als.getStore()!.get(TRACE_REGISTRY_KEY);
+        const spanId = context.registry.internalStartTraceStep(
+          registryKey,
+          "OrdersController",
+          name,
+          undefined,
+        );
+        context.registry.internalEndTraceStep(
+          registryKey,
+          spanId,
+          "OrdersController",
+          name,
+          spanId,
+        );
+        return registryKey as string;
+      };
+      /** How many traces the registry holds open. */
+      const openTraces = (context: ReturnType<typeof createContext>) =>
+        (
+          context.registry as unknown as {
+            traceSnapshots: Map<string, unknown>;
+          }
+        ).traceSnapshots.size;
+
+      it("is traced once, on the URL it arrived with, and completed once", async () => {
+        const context = createContext();
+        const req = {
+          url: "/orders/latest",
+          method: "GET",
+          protocol: "http",
+        };
+        const keys: string[] = [];
+
+        context.agent.startHttpRequestTracing(req, {}, () => {
+          keys.push(recordSpan(context, "latest"));
+          req.url = "/orders/1042";
+          context.agent.startHttpRequestTracing(req, {}, () => {
+            keys.push(recordSpan(context, "findOne"));
+          });
+        });
+        // Both passes' response hooks, on the one `finish`.
+        context.agent.endHttpRequestTracing(req, { statusCode: 200 });
+        context.agent.endHttpRequestTracing(req, { statusCode: 200 });
+        await waitFor(() => context.snapshots.length === 1, 2000, "snapshot");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(keys[1]).toBe(keys[0]);
+        expect(context.snapshots).toHaveLength(1);
+        expect(context.snapshots[0].attributes?.originalUrl).toBe(
+          "/orders/latest",
+        );
+        expect(context.getUserId).toHaveBeenCalledOnce();
+        expect(openTraces(context)).toBe(0);
+      });
+
+      it("runs a later pass in the request's own store, wherever it starts", async () => {
+        const context = createContext();
+        // Fastify hands each pass a request of its own, the Node request
+        // under it.
+        const raw = Object.assign(new EventEmitter(), {
+          url: "/orders/latest",
+        });
+        const pass = () => ({
+          url: raw.url,
+          method: "GET",
+          protocol: "http",
+          raw,
+        });
+        const first = pass();
+        const second = pass();
+        const keys: string[] = [];
+
+        context.agent.startHttpRequestTracing(first, {}, () => {
+          keys.push(recordSpan(context, "latest"));
+        });
+        // Re-entered from a callback of no request's.
+        context.als.exit(() =>
+          context.agent.startHttpRequestTracing(second, {}, () => {
+            keys.push(recordSpan(context, "findOne"));
+          }),
+        );
+        context.agent.endHttpRequestTracing(second, { statusCode: 200 });
+        context.agent.endHttpRequestTracing(first, { statusCode: 200 });
+        await waitFor(() => context.snapshots.length === 1, 2000, "snapshot");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(keys[1]).toBe(keys[0]);
+        expect(context.snapshots).toHaveLength(1);
+        expect(openTraces(context)).toBe(0);
+      });
+
+      it("returns what done returns on a later pass", () => {
+        const context = createContext();
+        const req = { url: "/orders/latest", method: "GET", protocol: "http" };
+        context.agent.startHttpRequestTracing(req, {}, () => undefined);
+
+        expect(
+          context.agent.startHttpRequestTracing(req, {}, () => "handled"),
+        ).toBe("handled");
+      });
+    });
+
     it("holds completion while a span of its own is still open", async () => {
       // Asked under any key but this request's own, the open-span check finds
       // no trace, answers that none is open, and the trace completes in a
