@@ -1,3 +1,4 @@
+import { PassThrough } from "stream";
 import {
   captureRequest,
   shouldCaptureRequest,
@@ -210,6 +211,89 @@ describe("captureRequest", () => {
         ),
       ).toBeUndefined();
     }
+  });
+
+  it("records no stream, buffer or class instance as a body, at any depth", () => {
+    // Fastify leaves the raw request stream where a body would be for a
+    // content type it has no parser for. Walked as fields, its buffered
+    // chunks went out as arrays of numbers that no rule reads as a secret.
+    const stream = new PassThrough();
+    stream.write("Cookie: session=s3cr3t-cookie");
+    class Upload {
+      apiKey = "s3cr3t-key";
+    }
+
+    for (const body of [stream, new Upload(), new Uint8Array([1, 2])]) {
+      expect(
+        captureRequest(
+          { headers: {}, body },
+          { headers: false, body: true },
+          redactor,
+        ),
+      ).toBeUndefined();
+    }
+
+    const captured = captureRequest(
+      {
+        headers: {},
+        body: {
+          note: "hello",
+          raw: stream,
+          file: Buffer.from("s3cr3t-file"),
+          upload: new Upload(),
+          list: [stream, 1],
+        },
+      },
+      { headers: false, body: true },
+      redactor,
+    );
+
+    expect(JSON.parse(captured!.body!)).toEqual({
+      note: "hello",
+      list: [null, 1],
+    });
+    stream.destroy();
+  });
+
+  it("records a body a parser made without a prototype", () => {
+    // What multer and qs hand over for a form.
+    const body = Object.assign(Object.create(null) as object, {
+      name: "a",
+      nested: Object.assign(Object.create(null) as object, { b: 1 }),
+    });
+
+    const captured = captureRequest(
+      { headers: {}, body },
+      { headers: false, body: true },
+      redactor,
+    );
+
+    expect(JSON.parse(captured!.body!)).toEqual({
+      name: "a",
+      nested: { b: 1 },
+    });
+  });
+
+  it("records a form Fastify parsed, whose prototype is as bare", () => {
+    // `fast-querystring` makes its objects with `new Empty()`, where
+    // `Empty.prototype = Object.create(null)`.
+    function Empty() {}
+    Empty.prototype = Object.create(null) as object;
+    const body = Object.assign(new (Empty as unknown as new () => object)(), {
+      email: "k@example.com",
+      password: "hunter2",
+    });
+
+    const captured = captureRequest(
+      { headers: {}, body },
+      { headers: false, body: true },
+      redactor,
+    );
+
+    expect(JSON.parse(captured!.body!)).toEqual({
+      email: "k@example.com",
+      password: "[REDACTED]",
+    });
   });
 });
 

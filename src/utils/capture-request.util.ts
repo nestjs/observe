@@ -182,7 +182,7 @@ function serializeBody(
     }
     body = parsed;
   }
-  if (Buffer.isBuffer(body) || typeof body !== "object" || body === null) {
+  if (!isParsed(body)) {
     // A raw buffer is a file or an unparsed stream - nothing readable to show.
     return undefined;
   }
@@ -215,6 +215,37 @@ function parseJsonDocument(body: string): object | undefined {
 const MAX_BOUNDED_DEPTH = 10;
 
 /**
+ * Whether a value is what a body parser makes - an array, or an object that
+ * is only its fields: JSON, urlencoded and multer bodies all are. Some with
+ * no prototype at all, and Fastify's form parser (`fast-querystring`) with
+ * one that is itself empty and has none, which is as bare.
+ *
+ * Anything else is not a parsed body but something left where one would be:
+ * Fastify's raw request stream, a Buffer, a typed array, an instance of a
+ * class. Walked as fields, a stream's are its internals - its buffered
+ * chunks, the request's headers, cookies and API keys included, written out
+ * as numbers that no rule reads as a secret - and a Buffer's `toJSON` turns
+ * it into the same. So none of these is recorded, at any depth.
+ */
+function isParsed(value: unknown): value is object {
+  if (Array.isArray(value)) {
+    return true;
+  }
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  let prototype = Object.getPrototypeOf(value) as object | null;
+  while (prototype !== null && prototype !== Object.prototype) {
+    // A class's prototype has a `constructor` at least.
+    if (Reflect.ownKeys(prototype).length > 0) {
+      return false;
+    }
+    prototype = Object.getPrototypeOf(prototype) as object | null;
+  }
+  return true;
+}
+
+/**
  * A copy of the body holding only the nodes that can still show up in the
  * first `maxBytes` of its JSON, in the order JSON writes them. Every value
  * and key takes at least a byte, so past `maxBytes` of them the rest is cut
@@ -228,16 +259,13 @@ function boundToCap(
   ancestors: Set<object>,
 ): unknown {
   budget.nodes -= 1;
-  // What JSON.stringify would write for it: a Date its ISO string, and so on.
-  const toJSON: unknown =
-    value !== null && typeof value === "object"
-      ? (value as { toJSON?: unknown }).toJSON
-      : undefined;
-  if (typeof toJSON === "function") {
-    value = (toJSON as () => unknown).call(value);
-  }
   if (value === null || typeof value !== "object") {
     return value;
+  }
+  if (!isParsed(value)) {
+    // Left out, as JSON.stringify leaves out a function: no field, and
+    // `null` in an array.
+    return undefined;
   }
   if (ancestors.has(value)) {
     throw new TypeError("Converting circular structure to JSON");
