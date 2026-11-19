@@ -90,9 +90,9 @@ const TRACE_NODE: Shape = {
   t: { type: "object" },
   d: { type: "number" },
   // Boolean is the "an error occurred but was handled, details not captured"
-  // form - every failed non-root span, and a root span failing on a thrown
-  // primitive, reports `e: true` rather than an error object. See
-  // `TraceSpan.error`.
+  // form - every failed non-root span, a root span failing on a thrown
+  // primitive, and a failed root span past the trace's 20 recorded errors,
+  // reports `e: true` rather than an error object. See `TraceSpan.error`.
   e: { type: "object", alsoAccepts: ["boolean"] },
   c: { type: "string", required: true, maxLength: 255 },
   m: { type: "string", required: true, maxLength: 255 },

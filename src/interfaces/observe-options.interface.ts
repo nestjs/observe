@@ -65,7 +65,9 @@ export interface CreateObserveModuleOptions {
   /**
    * The trace ID key used to identify the trace in the context.
    * This key is used to store the trace ID in the context for later retrieval.
-   * If not provided, the default key 'traceId' will be used.
+   * If not provided, the default key 'traceId' will be used. An attribute of
+   * the same name returned by a `setAttributes` callback is ignored, with a
+   * warning, so a sender cannot choose the trace id.
    * @default 'traceId'
    */
   traceIdKey?: string;
@@ -661,7 +663,10 @@ export interface ObserveOptions {
      *
      * Matching on a field name skips the whole operation the field leads, not
      * just that field: an operation is measured end to end, so it is traced or
-     * it is not.
+     * it is not. Over HTTP the request's trace is dropped with it, provider and
+     * outgoing spans included, unless the request already names an operation
+     * of its own; in a batch, the first operation decides for the request.
+     * `setAttributes` still runs for an ignored operation.
      * @example (info) => info.fieldName === 'healthcheck'
      */
     ignore?: (info: GraphQLResolveInfoLike) => boolean;
@@ -692,7 +697,8 @@ export interface ObserveOptions {
      * Only consulted for operations that are *not* already inside an HTTP
      * trace - a query over HTTP takes its user id from `http.getUserId`, which
      * sees the whole request. This covers the transports that have no such
-     * hook, subscriptions over a websocket in particular.
+     * hook. Operations Apollo runs over `graphql-ws` are not traced yet, so
+     * it is not consulted for those.
      * @example (context) => context.req?.user?.id
      * @default undefined
      */

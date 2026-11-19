@@ -152,9 +152,10 @@ export class TracerService<
    * Captures an error and associates it with the current trace.
    * This method should be called within an async context where the AsyncLocalStorage is active.
    *
-   * The details of at most 20 errors are recorded per trace; the span an
-   * error is captured on after that is marked as failed, and its tags are
-   * still recorded.
+   * The details of at most 20 errors are recorded per trace, counting the
+   * root spans that fail as well as captured errors; the span an error is
+   * captured on after that is marked as failed, and its tags are still
+   * recorded.
    *
    * Called outside any async context, it records nothing and says so once.
    */
