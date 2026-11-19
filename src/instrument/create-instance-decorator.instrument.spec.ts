@@ -1520,6 +1520,35 @@ describe("createInstanceDecorator", () => {
       expect(result).toEqual("[secret:a]");
     });
 
+    it("detects private members on a class that mixins were copied onto", () => {
+      // The TypeScript handbook's `applyMixins` copies every own property of
+      // the mixins' prototypes, `constructor` included, so the class's
+      // prototype names the last mixin - whose source has no `#` in it.
+      class Auditable {
+        audit() {
+          return "audited";
+        }
+      }
+      class Account {
+        #balances = new Map([["a", 100]]);
+
+        balance(id: string) {
+          return this.#balances.get(id);
+        }
+      }
+      for (const name of Object.getOwnPropertyNames(Auditable.prototype)) {
+        Object.defineProperty(
+          Account.prototype,
+          name,
+          Object.getOwnPropertyDescriptor(Auditable.prototype, name)!,
+        );
+      }
+      const account = decorate(new Account()) as Account & Auditable;
+
+      expect(withTrace(() => account.balance("a"))).toEqual(100);
+      expect(withTrace(() => account.audit())).toEqual("audited");
+    });
+
     it("still records spans for methods on private-member classes", () => {
       const service = decorate(new SecretService()) as SecretService;
 

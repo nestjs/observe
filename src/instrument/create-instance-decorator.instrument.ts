@@ -917,8 +917,7 @@ function isNativeFunction(fn: unknown): boolean {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
-const privateMemberCache = new WeakMap<Function, boolean>();
+const privateMemberCache = new WeakMap<object, boolean>();
 
 /**
  * Whether any class in the instance's prototype chain declares native private
@@ -934,30 +933,60 @@ const privateMemberCache = new WeakMap<Function, boolean>();
 function usesNativePrivateMembers(instance: object): boolean {
   let proto: object | null = Object.getPrototypeOf(instance);
   while (proto && proto !== Object.prototype) {
-    const ctor = proto.constructor;
-    if (typeof ctor === "function" && ctor !== Object) {
-      let hasPrivate = privateMemberCache.get(ctor);
-      if (hasPrivate === undefined) {
-        hasPrivate = declaresPrivateMembers(ctor);
-        privateMemberCache.set(ctor, hasPrivate);
-      }
-      if (hasPrivate) {
-        return true;
-      }
+    let hasPrivate = privateMemberCache.get(proto);
+    if (hasPrivate === undefined) {
+      hasPrivate = prototypeUsesPrivateMembers(proto);
+      privateMemberCache.set(proto, hasPrivate);
+    }
+    if (hasPrivate) {
+      return true;
     }
     proto = Object.getPrototypeOf(proto);
   }
   return false;
 }
 
+/**
+ * Whether the class a prototype belongs to declares native private members.
+ *
+ * `constructor` leads to that class only while it is the one the class
+ * definition put there, which is when its `prototype` is this very object. A
+ * helper that mixes classes in by copying the own properties of their
+ * prototypes - the TypeScript handbook's `applyMixins`, ioredis's
+ * `applyMixin` - copies `constructor` along, and the receiving prototype then
+ * names the last class mixed in, whose source says nothing about the one
+ * being inspected. That one's own body can no longer be reached from here,
+ * but its methods and accessors can: each one's text is a part of the class
+ * body, and a brand check made on `this` shows in it.
+ */
+function prototypeUsesPrivateMembers(proto: object): boolean {
+  const ctor: unknown = Object.hasOwn(proto, "constructor")
+    ? (Object.getOwnPropertyDescriptor(proto, "constructor")?.value as unknown)
+    : undefined;
+  if (typeof ctor === "function" && ctor.prototype === proto) {
+    return ctor !== Object && declaresPrivateMembers(ctor);
+  }
+  return Reflect.ownKeys(proto).some((key) => {
+    if (key === "constructor") {
+      return false;
+    }
+    // Read as descriptors, so that no getter runs.
+    const descriptor = Reflect.getOwnPropertyDescriptor(proto, key);
+    return [descriptor?.value, descriptor?.get, descriptor?.set].some(
+      (member) =>
+        typeof member === "function" && declaresPrivateMembers(member),
+    );
+  });
+}
+
 // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
-function declaresPrivateMembers(ctor: Function): boolean {
+function declaresPrivateMembers(fn: Function): boolean {
   try {
     // `#` starting a private name is never preceded by an identifier
     // character; `obj.#x` and `#x in obj` and declarations all match.
-    return /(^|[^\w$])#[\w$]/.test(Function.prototype.toString.call(ctor));
+    return /(^|[^\w$])#[\w$]/.test(Function.prototype.toString.call(fn));
   } catch {
-    // A constructor whose source is unavailable (bound functions, some
+    // A function whose source is unavailable (bound functions, some
     // natives) cannot be a class body with private members.
     return false;
   }
