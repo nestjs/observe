@@ -45,7 +45,9 @@ export function patchMysql2(
         args[last] = AsyncResource.bind(args[last]);
       }
       const sql = typeof first === "string" ? first : first?.sql;
-      if (typeof sql !== "string") {
+      // Asked before the statement is described: an untraced or sampled-out
+      // call should not pay for tokenizing it.
+      if (typeof sql !== "string" || !recorder.isRecording()) {
         return original.apply(this, args);
       }
       const { operation, statement } = describeSqlStatement(sql, "mysql");

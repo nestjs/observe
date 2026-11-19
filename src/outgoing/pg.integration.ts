@@ -37,6 +37,11 @@ export function patchPg(pg: PgModule, recorder: OutgoingSpanRecorder): boolean {
       if (typeof text !== "string" || typeof config?.submit === "function") {
         return original.apply(this, args);
       }
+      // Asked before the statement is described: an untraced or sampled-out
+      // call should not pay for tokenizing it.
+      if (!recorder.isRecording()) {
+        return original.apply(this, args);
+      }
       const { operation, statement } = describeSqlStatement(text, "postgresql");
       const span = recorder.open("pg", operation, {
         "db.system": "postgresql",

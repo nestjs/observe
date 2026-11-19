@@ -187,6 +187,26 @@ describe("patchMysql2", () => {
     commands[0].emit("end");
     expect(spans[0].ended).toBe(1);
   });
+
+  it("does not describe a query nobody will record", () => {
+    const { module, commands } = fakeMysql2();
+    const { recorder, spans } = fakeRecorder();
+    const notRecording = Object.assign(Object.create(recorder), {
+      isRecording: () => false,
+    });
+    patchMysql2(module, notRecording);
+    const callback = vi.fn();
+
+    new module.Connection().query(
+      "SELECT * FROM users WHERE id = 5",
+      [],
+      callback,
+    );
+    commands[0].onResult(null, []);
+
+    expect(spans).toHaveLength(0);
+    expect(callback).toHaveBeenCalledWith(null, []);
+  });
 });
 
 /**
@@ -207,6 +227,7 @@ const contextRecorder = (record = true) => {
       return { end: () => (span.ended += 1) };
     },
     cover: <T>(fn: () => T) => covered.run(true, fn),
+    isRecording: () => record && !covered.getStore(),
     endWhenSettled: OutgoingSpanRecorder.prototype.endWhenSettled,
   } as unknown as OutgoingSpanRecorder;
   return { recorder, spans };
@@ -280,6 +301,26 @@ describe("patchPg", () => {
 
     expect(spans).toEqual([{ methodKey: "SELECT products", ended: 1 }]);
     expect(seen).toBe("caller");
+  });
+
+  it("does not describe a query nobody will record", () => {
+    const { module, answers } = fakePg();
+    const { recorder, spans } = fakeRecorder();
+    const notRecording = Object.assign(Object.create(recorder), {
+      isRecording: () => false,
+    });
+    patchPg(module, notRecording);
+    const callback = vi.fn();
+
+    new module.Client().query(
+      "SELECT * FROM users WHERE id = $1",
+      [5],
+      callback,
+    );
+    answers.shift()!();
+
+    expect(spans).toHaveLength(0);
+    expect(callback).toHaveBeenCalledWith(null, { rows: [] });
   });
 });
 
