@@ -325,6 +325,7 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
         store,
         this.logger,
         "ws",
+        this.options.traceIdKey,
       );
 
       if (

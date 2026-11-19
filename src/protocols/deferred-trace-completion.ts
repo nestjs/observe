@@ -1,4 +1,10 @@
 import type { Logger } from "@nestjs/common";
+import {
+  CALLER_METADATA_KEY,
+  TRACE_CONTEXT_KEY,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
+import { OPERATION_STATE_KEY } from "../utils/operation-state.util.js";
 import { SHARED_ATTRIBUTES_KEY } from "../utils/shared-attributes.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 
@@ -95,7 +101,32 @@ export function generateTraceIdSafely(
   );
 }
 
-/** Copies an operation's `setAttributes` into its store, unless it throws. */
+/**
+ * What the agent keeps in an operation's store for itself, beside the trace
+ * id under `traceIdKey`. Attributes share that store, and their names can
+ * come from a sender - a message's metadata, a query string spread into the
+ * result - so one named like any of these is left out rather than written
+ * over the agent's own entry. A trace id that arrived that way had been
+ * through none of the checks an `x-request-id` goes through, and was sent on
+ * to every service called downstream; a registry key or a caller that
+ * arrived that way detached the operation from its trace.
+ */
+const AGENT_STORE_KEYS: ReadonlySet<string> = new Set([
+  CALLER_METADATA_KEY,
+  TRACE_REGISTRY_KEY,
+  TRACE_CONTEXT_KEY,
+  OPERATION_STATE_KEY,
+]);
+
+const reportedReservedKeys = new WeakSet<Function>();
+
+/**
+ * Copies an operation's `setAttributes` into its store, unless it throws.
+ *
+ * An attribute named `traceIdKey`, or like one of `AGENT_STORE_KEYS`, is left
+ * out: the store keeps the agent's own entry there. The first such key each
+ * callback returns is reported; later ones are not.
+ */
 export function setAttributesSafely<TArgs extends unknown[]>(
   callback: ((...args: TArgs) => Record<string, unknown>) | undefined,
   args: TArgs,
@@ -103,6 +134,7 @@ export function setAttributesSafely<TArgs extends unknown[]>(
   store: Map<any, unknown>,
   logger: Logger,
   transport: string,
+  traceIdKey: string,
 ): void {
   if (!callback) {
     return;
@@ -127,6 +159,16 @@ export function setAttributesSafely<TArgs extends unknown[]>(
     | Map<unknown, unknown>
     | undefined;
   for (const [key, value] of Object.entries(attributes)) {
+    if (key === traceIdKey || AGENT_STORE_KEYS.has(key)) {
+      if (!reportedReservedKeys.has(callback)) {
+        reportedReservedKeys.add(callback);
+        warnSafely(
+          logger,
+          `"${transport}.setAttributes" returned an attribute named "${key.slice(0, 100)}", a key the agent keeps for itself; it is left out. Later ones are not reported.`,
+        );
+      }
+      continue;
+    }
     store.set(key, value);
     shared?.set(key, value);
   }

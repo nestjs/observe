@@ -840,6 +840,7 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       store,
       this.logger,
       "graphql",
+      this.options.traceIdKey,
     );
   }
 }

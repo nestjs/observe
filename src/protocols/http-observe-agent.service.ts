@@ -276,6 +276,7 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
         store,
         this.logger,
         "http",
+        this.options.traceIdKey,
       );
 
       if (this.shouldIgnoreRequest(req) || this.isUntracedPreflight(req)) {

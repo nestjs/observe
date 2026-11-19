@@ -402,6 +402,7 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         store,
         this.logger,
         "jobs",
+        this.options.traceIdKey,
       );
 
       if (this.isIgnored(context)) {

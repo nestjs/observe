@@ -266,6 +266,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         store,
         this.logger,
         "rpc",
+        this.options.traceIdKey,
       );
 
       if (
@@ -358,6 +359,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         store,
         this.logger,
         "grpc",
+        this.options.traceIdKey,
       );
 
       // `done` runs before the hook returns, as for any other transport. Nest

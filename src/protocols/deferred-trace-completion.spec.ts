@@ -103,7 +103,7 @@ describe("what each callback falls back to", () => {
   it("setAttributes: the store as it was", () => {
     const store = new Map<string, unknown>([["tenant", "acme"]]);
 
-    setAttributesSafely(throwing(), [], null, store, logger, "http");
+    setAttributesSafely(throwing(), [], null, store, logger, "http", "traceId");
     setAttributesSafely(
       () => ({ region: "eu" }),
       [],
@@ -111,9 +111,49 @@ describe("what each callback falls back to", () => {
       store,
       logger,
       "http",
+      "traceId",
     );
 
     expect(Object.fromEntries(store)).toEqual({ tenant: "acme", region: "eu" });
+  });
+
+  it("setAttributes: leaves what the agent keeps in the store alone", () => {
+    // Attribute names a sender picks - a message's metadata spread into the
+    // result - that name the trace id under `traceIdKey`, the registry key,
+    // the caller, the trace context and the operation's state.
+    const kept = {
+      requestId: "the-trace-id",
+      "#registryKey": "the-registry-key",
+      "#caller": "the-open-span",
+      "#traceContext": { traceId: "0af7651916cd43dd8448eb211c80319c" },
+      "#operation": { endedAt: undefined },
+    };
+    const store = new Map<string, unknown>(Object.entries(kept));
+    const warn = vi.fn();
+    const setAttributes = () => ({
+      tenant: "acme",
+      requestId: "not a trace id; the warehouse answers 431",
+      "#registryKey": 0,
+      "#caller": "another span",
+      "#traceContext": { traceId: "not hex" },
+      "#operation": null,
+    });
+
+    for (let call = 0; call < 2; call++) {
+      setAttributesSafely(
+        setAttributes,
+        [],
+        null,
+        store,
+        { warn } as unknown as Logger,
+        "rpc",
+        "requestId",
+      );
+    }
+
+    expect(Object.fromEntries(store)).toEqual({ ...kept, tenant: "acme" });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0][0]).toContain('"rpc.setAttributes"');
   });
 
   it("ignore: excluding the operation", () => {

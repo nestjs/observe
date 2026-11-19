@@ -306,6 +306,7 @@ describe("TracerService", () => {
             als.getStore()!,
             new Logger(),
             "graphql",
+            TRACE_ID_KEY,
           );
         });
 
