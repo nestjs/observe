@@ -211,6 +211,17 @@ describe("LogRedactor", () => {
       ).toBe("{ password: [REDACTED], card: [REDACTED] }");
     });
 
+    it("masks a value behind an escape a client left unfinished", () => {
+      // What an error on a trace says when a client's tenant name ends in
+      // `ESC [;`: stripping it must not take the `P` of the key after it.
+      const output = redactor.redactMessage(
+        "Cannot read from Server=db;User Id=tenant_acme\x1b[;Password=22d0274d8dd6;Encrypt=true",
+      );
+
+      expect(output).not.toContain("22d0274d8dd6");
+      expect(output).toContain("Password=[REDACTED];Encrypt=true");
+    });
+
     it.each([
       ["unclosed brackets", "password=[".repeat(30_000)],
       ["unclosed quotes", 'password="'.repeat(30_000)],

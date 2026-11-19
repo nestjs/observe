@@ -308,5 +308,21 @@ describe("parseLogLine", () => {
         "array[0] and cost[USD]",
       );
     });
+
+    it("strips the cursor and erase moves a progress bar writes", () => {
+      expect(
+        stripAnsi("\x1b[2K\x1b[1G\x1b[38;2;255;0;0m50%\x1b[0m\x1b[H\x1b[2J"),
+      ).toBe("50%");
+    });
+
+    it("takes no letter of the text after a sequence that is not one", () => {
+      // The escape can come from a client, in front of the application's own
+      // `Password=`: eating its `P` left a name no rule calls a credential.
+      expect(stripAnsi("User Id=acme\x1b[;Password=x")).toBe(
+        "User Id=acme\x1b[;Password=x",
+      );
+      expect(stripAnsi("id=\x1b[1;Password=x")).toBe("id=\x1b[1;Password=x");
+      expect(stripAnsi("\x1b[Token: abc")).toBe("\x1b[Token: abc");
+    });
   });
 });

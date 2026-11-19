@@ -37,12 +37,20 @@ export interface ParsedLogLine {
   format: "json" | "nest" | "plain";
 }
 /**
- * CSI escape sequences - colour codes and cursor moves. Narrower than a
- * general-purpose ANSI stripper on purpose: this only has to undo what console
- * loggers emit, and a tight pattern cannot eat real log content.
+ * CSI escape sequences - colour codes, and the cursor and erase moves a
+ * progress bar writes. Narrower than a general-purpose ANSI stripper on
+ * purpose: this only has to undo what console loggers emit, and a tight
+ * pattern cannot eat real log content.
+ *
+ * Only well-formed ones, ending in one of those few letters. The pattern this
+ * replaced took any run of digits and `;` and any letter behind `ESC [`, and
+ * the escape may come from a client: a value ending in `ESC [;` in front of
+ * the application's own `Password=x` took the `P` with it, and what was left
+ * - `assword=x` - names no credential. It runs before redaction, on error
+ * messages and stacks as well as on forwarded lines.
  */
 // eslint-disable-next-line no-control-regex
-const ANSI_PATTERN = /\x1B\[[0-9;]*[A-Za-z]/g;
+const ANSI_PATTERN = /\x1B\[(?:\d{1,3}(?:;\d{1,3})*)?[GHJKm]/g;
 
 /**
  * Nest's default ConsoleLogger line:
