@@ -240,10 +240,22 @@ function parseFrameLine(raw: string): Omit<ParsedFrame, "path"> | undefined {
   }
 
   return {
-    file: location.slice(0, lineAt),
+    file: ownCopy(location.slice(0, lineAt)),
     line: Number(line),
     column: Number(column),
   };
+}
+
+/**
+ * Its own copy of a frame's path. V8 keeps a substring as a slice of the
+ * string it was cut from, and the path is cut from the stack, which repeats
+ * a message as long as whoever threw made it: a code frame's `file`, kept on
+ * an error payload until the flush, held the whole stack alive for a path of
+ * a few dozen characters. UTF-16 both ways, so a path with a lone surrogate
+ * is copied as it is.
+ */
+function ownCopy(text: string): string {
+  return Buffer.from(text, "utf16le").toString("utf16le");
 }
 
 /**

@@ -3,6 +3,8 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, join, relative } from "path";
 import { pathToFileURL } from "url";
+import { setFlagsFromString } from "v8";
+import { runInNewContext } from "vm";
 import { LogRedactor } from "./log-redactor.js";
 import { collectCodeFrames } from "./source-context.util.js";
 import { resetSourceMapCache } from "./source-map-resolver.util.js";
@@ -316,6 +318,38 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     expect(read(join(linked, "spelt.js"))?.lines[0]).toBe("const first = 1;");
     // Each frame is still reported as it was written.
     expect(first?.file).toBe(`${inside}/./spelt.js`);
+  });
+
+  it("keeps none of the stacks its frames were read from alive", () => {
+    setFlagsFromString("--expose-gc");
+    const gc = runInNewContext("gc") as () => void;
+    const file = join(inside, "kept.js");
+    writeFileSync(file, "const kept = 1;\n");
+    // Read once first, so the file's own lines are not counted below.
+    collectCodeFrames(`Error: boom\n    at run (${file}:1:1)`, {
+      message: "boom",
+    });
+
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    // Each made inside, so that nothing but its frames can keep it: a
+    // message as long as a client made it, which the stack repeats. Kept as
+    // error payloads keep them, until the flush.
+    const kept = Array.from({ length: 8 }, (_, index) =>
+      ((message: string) =>
+        collectCodeFrames(`Error: ${message}\n    at run (${file}:1:1)`, {
+          message,
+        }))(String(index).repeat(2 * 1024 * 1024)),
+    );
+    // The last regular expression run holds on to what it was run against,
+    // which says nothing of what the frames hold.
+    /x/.test("x");
+    gc();
+    const retained = process.memoryUsage().heapUsed - before;
+
+    expect(kept.map((frames) => frames?.[0].file)).toEqual(Array(8).fill(file));
+    // 16 MB of stacks.
+    expect(retained).toBeLessThan(6 * 1024 * 1024);
   });
 
   it("does not follow a symlink out of the working directory", () => {
