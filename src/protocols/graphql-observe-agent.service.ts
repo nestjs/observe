@@ -114,13 +114,19 @@ interface OperationState {
   spanId: string;
   className: string;
   methodKey: string;
-  /** The caller this operation displaced, restored once it ends. */
+  /**
+   * The caller this operation displaced - for one of a batch, the caller the
+   * first of them displaced - restored once the last one open has ended.
+   */
   previousCallerId: string | undefined;
   store: Map<string, unknown> | undefined;
   /** Whether this service opened the trace, and therefore has to ship it. */
   ownsTrace: boolean;
   context: unknown;
-  /** Closed already: refused by the application's start hook. */
+  /**
+   * Closed already: by the end hook, or refused by the application's start
+   * hook. See `openOperationsByStore` too.
+   */
   ended?: boolean;
 }
 
@@ -169,6 +175,26 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
    * after the schema is built.
    */
   private resolverIndex: Map<string, ResolverHandler> | undefined;
+  /**
+   * The operations each async store has open, in the order they started.
+   *
+   * Usually one. A batched HTTP request (Apollo's `allowBatchedHttpRequests`)
+   * is the exception: its operations run at once in the one store the
+   * request has, so the caller a later one found there was the span of the
+   * one before it - a sibling, not a caller - and they end in any order.
+   * Nested that way, the trace was as deep as the client made the batch
+   * long, and a failure behind the first operation was on no root span, so
+   * the request was reported as a success.
+   *
+   * Beside the store rather than in it: a span's store is a copy of its
+   * caller's, and an operation started inside the copy really is a callee.
+   * Weakly keyed, so an unmatched start - see `onRequestEnd` - leaves
+   * nothing behind once the request's store is gone.
+   */
+  private readonly openOperationsByStore = new WeakMap<
+    object,
+    OperationState[]
+  >();
 
   constructor(
     private readonly asyncLocalStorage: AsyncLocalStorage<
@@ -458,13 +484,15 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     state.ended = true;
 
     if (state.store) {
-      // Handing the request back whatever owned it before this operation. The
-      // store is shared by reference across the request, so this is a real
-      // restore rather than a scoped one.
-      if (state.previousCallerId === undefined) {
+      // Handing the request to an operation of its still open, or back to
+      // whatever owned it before them. The store is shared by reference
+      // across the request, so this is a real restore rather than a scoped
+      // one.
+      const callerId = this.closeOperation(state, state.store);
+      if (callerId === undefined) {
         state.store.delete(CALLER_METADATA_KEY);
       } else {
-        state.store.set(CALLER_METADATA_KEY, state.previousCallerId);
+        state.store.set(CALLER_METADATA_KEY, callerId);
       }
     }
 
@@ -590,9 +618,15 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     const methodKey = handler?.methodKey ?? info.fieldName;
 
     const store = this.asyncLocalStorage.getStore();
-    const previousCallerId = store?.get(CALLER_METADATA_KEY) as
-      | string
-      | undefined;
+    // With another operation open in this store, the caller the store names
+    // is that operation: the one before this in a batch. This one takes the
+    // caller that one took instead, which makes the operations of a batch
+    // siblings - each a root span of the request, reporting its own failure.
+    const openOperations = store && this.openOperationsByStore.get(store);
+    const sibling = openOperations?.at(-1);
+    const previousCallerId = sibling
+      ? sibling.previousCallerId
+      : (store?.get(CALLER_METADATA_KEY) as string | undefined);
 
     const spanId = this.operationTraceRegistry.internalStartTraceStep(
       traceId,
@@ -609,7 +643,7 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
 
     store?.set(CALLER_METADATA_KEY, spanId);
 
-    return {
+    const state: OperationState = {
       traceId,
       spanId,
       className,
@@ -619,6 +653,43 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       ownsTrace,
       context: ctx.context,
     };
+    if (openOperations) {
+      openOperations.push(state);
+    } else if (store) {
+      this.openOperationsByStore.set(store, [state]);
+    }
+    return state;
+  }
+
+  /**
+   * Takes the operations that have ended off the ones a store has open, and
+   * returns the caller the store names from here on.
+   *
+   * While another operation is open there, that is the one of them that
+   * started last, whichever just ended: the work still running in the store
+   * belongs to an open operation, and a slot emptied or left naming an ended
+   * span put it at the root of the trace, beside the operation, and had
+   * `activeSpan()` find nothing. Once the last has ended, it is the caller
+   * they displaced.
+   */
+  private closeOperation(
+    state: OperationState,
+    store: Map<string, unknown>,
+  ): string | undefined {
+    const openOperations = this.openOperationsByStore.get(store);
+    // Ended ones are dropped once nothing open is left above them, so a batch
+    // that ends in the order it started does not search the list every time.
+    while (openOperations?.at(-1)?.ended) {
+      openOperations.pop();
+    }
+    const current = openOperations?.at(-1);
+    if (current) {
+      return current.spanId;
+    }
+    this.openOperationsByStore.delete(store);
+    // The same for every operation of a batch: each later one took it from
+    // the one before.
+    return state.previousCallerId;
   }
 
   /**

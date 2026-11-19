@@ -533,6 +533,13 @@ export class OperationTraceRegistry {
    */
   private readonly failedOutgoingRoots = new WeakSet<object>();
   /**
+   * The status code each root span that threw stands for. An operation with
+   * several - the operations of a batched GraphQL request, side by side - is
+   * reported with the error of the first, and so with its status: the one
+   * the last to end set left a 500's error filed as a 401.
+   */
+  private readonly rootErrorStatusCodes = new WeakMap<object, number>();
+  /**
    * Applied to every tree as it is plucked. Defaults are live from
    * construction rather than waiting for `configureSpanCollapse`, so a
    * registry the module has not (yet) configured still bounds what it ships.
@@ -804,10 +811,16 @@ export class OperationTraceRegistry {
     // have been caught and answered: a duplicate key turned into a 409, a
     // failed lookup into a 200 with a fallback. A transport that reports a
     // status code says how the operation ended, so there it does not stand in
-    // for one; on one that reports none, it is all there is to go on.
+    // for one; on one that reports none, it is all there is to go on. Of
+    // several root spans that threw, the first gives the operation its error
+    // below, and its status here.
+    const firstFailure = snapshot.traces.find((trace) =>
+      this.rootErrorStatusCodes.has(trace),
+    );
     const errorStatusCode =
       "protocol" in snapshot
-        ? snapshot.errorStatusCode ??
+        ? (firstFailure && this.rootErrorStatusCodes.get(firstFailure)) ??
+          snapshot.errorStatusCode ??
           (reportedStatusCode === undefined
             ? snapshot.outgoingErrorStatusCode
             : undefined)
@@ -1173,6 +1186,7 @@ export class OperationTraceRegistry {
         // have been caught and handled by its caller, in which case the
         // operation did not fail at all.
         snapshot.errorStatusCode = this.toErrorStatusCode(error);
+        this.rootErrorStatusCodes.set(activeTrace, snapshot.errorStatusCode);
       }
       if (isRootSpan) {
         // A root span keeps the error's details: it may become the

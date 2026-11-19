@@ -1,6 +1,11 @@
 import { ResolverDecoratorHost } from "@nestjs/graphql";
+import { UnauthorizedException } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
-import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { RequestSnapshot } from "../interfaces/index.js";
+import {
+  CALLER_METADATA_KEY,
+  TRACE_REGISTRY_KEY,
+} from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { GraphQLObserveAgentService } from "./graphql-observe-agent.service.js";
 
@@ -281,8 +286,11 @@ function createTracingAgent(graphql: Record<string, unknown> = {}) {
   };
   const start = (store: Map<string, unknown>, query: string) =>
     als.run(store, () => agent.onRequestStart({ query }));
-  const end = (store: Map<string, unknown>, state: unknown) =>
-    als.run(store, () => agent.onRequestEnd({ state }));
+  const end = (
+    store: Map<string, unknown>,
+    state: unknown,
+    errors?: Parameters<typeof agent.onRequestEnd>[0]["errors"],
+  ) => als.run(store, () => agent.onRequestEnd({ state, errors }));
   return { als, agent, registry, openRequest, start, end };
 }
 
@@ -344,5 +352,117 @@ describe("GraphQLObserveAgentService: graphql.ignore", () => {
 
     expect(registry.hasTrace("r1")).toBe(true);
     expect(registry.hasTrace("r2")).toBe(true);
+  });
+});
+
+/**
+ * Apollo runs the operations of a batched HTTP request at once, in the one
+ * async store that request has, and ends them in any order.
+ */
+describe("GraphQLObserveAgentService: a batched request", () => {
+  /** What graphql hands the end hook for a resolver that threw `error`. */
+  const failedWith = (error: Error) => [
+    { message: error.message, path: ["field"], originalError: error },
+  ];
+
+  /** Ends the request as the HTTP agent does, with graphql's 200. */
+  const shipped = async (registry: OperationTraceRegistry, key: string) => {
+    registry.endTrace(key, { statusCode: 200 });
+    return (await registry.pluckSnapshot(key)) as RequestSnapshot;
+  };
+
+  it("records its operations side by side, each a root span", async () => {
+    const { registry, openRequest, start, end } = createTracingAgent();
+    const store = openRequest("r1");
+
+    const states = ["{ first }", "{ second }", "{ third }"].map((query) =>
+      start(store, query),
+    );
+    // Only the last one fails. Nested under the others, it was on no root
+    // span, and the request was reported as a success.
+    end(store, states[0]);
+    end(store, states[1]);
+    end(store, states[2], failedWith(new Error("deliberate")));
+    const snapshot = await shipped(registry, "r1");
+
+    expect(snapshot.traces.map((span) => span.methodKey)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+    expect(snapshot.traces.every((span) => !span.children?.length)).toBe(true);
+    expect(snapshot.attributes?.statusCode).toBe(500);
+    expect(snapshot.error?.message).toBe("deliberate");
+  });
+
+  it.each([
+    ["the order they started in", [0, 1]],
+    ["the other order", [1, 0]],
+  ])(
+    "reports the status of the failure it reports the error of, ended in %s",
+    async (_order, endOrder) => {
+      const { registry, openRequest, start, end } = createTracingAgent();
+      const store = openRequest("r1");
+      const failures = [
+        new Error("the database is down"),
+        new UnauthorizedException("sign in first"),
+      ];
+
+      const states = ["{ first }", "{ second }"].map((query) =>
+        start(store, query),
+      );
+      for (const index of endOrder) {
+        end(store, states[index], failedWith(failures[index]));
+      }
+      const snapshot = await shipped(registry, "r1");
+
+      expect(snapshot.error?.message).toBe("the database is down");
+      expect(snapshot.attributes?.statusCode).toBe(500);
+    },
+  );
+
+  it.each([
+    ["the order they started in", [0, 1]],
+    ["the other order", [1, 0]],
+  ])(
+    "leaves the store naming an operation still open, ended in %s",
+    (_order, endOrder) => {
+      const { openRequest, start, end } = createTracingAgent();
+      const store = openRequest("r1");
+      // Whatever named the request before the batch: a middleware's span.
+      store.set(CALLER_METADATA_KEY, "outer");
+
+      const states = ["{ first }", "{ second }"].map(
+        (query) => start(store, query) as unknown as { spanId: string },
+      );
+      end(store, states[endOrder[0]]);
+
+      // The one still running reaches a provider after the other ended, and
+      // its call belongs under it - not at the root, nor under an ended span.
+      expect(store.get(CALLER_METADATA_KEY)).toBe(states[endOrder[1]].spanId);
+
+      end(store, states[endOrder[1]]);
+      expect(store.get(CALLER_METADATA_KEY)).toBe("outer");
+    },
+  );
+
+  it("nests an operation started inside a span's own store", async () => {
+    // A provider that runs an operation in-process: its span's store is a
+    // copy of the request's, and the operation really is its callee.
+    const { registry, openRequest, start, end } = createTracingAgent();
+    const store = openRequest("r1");
+    const outer = start(store, "{ report }") as unknown as { spanId: string };
+    const callee = new Map(store);
+
+    const inner = start(callee, "{ orders }");
+    end(callee, inner);
+    end(store, outer);
+    const snapshot = await shipped(registry, "r1");
+
+    expect(snapshot.traces).toHaveLength(1);
+    expect(snapshot.traces[0].children?.map((span) => span.methodKey)).toEqual([
+      "orders",
+    ]);
+    expect(callee.get(CALLER_METADATA_KEY)).toBe(outer.spanId);
   });
 });
