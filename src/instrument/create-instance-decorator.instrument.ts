@@ -1,5 +1,6 @@
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
+import { X509Certificate } from "node:crypto";
 import { types } from "node:util";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
@@ -8,6 +9,7 @@ import {
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { sharedAttributesOf } from "../utils/shared-attributes.util.js";
+import { registerRawReceiver } from "./raw-receiver.js";
 
 /**
  * Stand-in "class name" for instrumented standalone functions. Unlike methods,
@@ -150,6 +152,26 @@ function isPlainData(instance: object): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Whether an instance is a key or a certificate of `node:crypto`: a
+ * `KeyObject`, a Web Crypto `CryptoKey` or an `X509Certificate`.
+ *
+ * Node recognises each by a brand of its own (`#slots in key`, an internal
+ * slot) wherever one is handed in as an argument - to `createHmac`, `sign`,
+ * `subtle.sign`, `cert.checkIssued`, and through them `jsonwebtoken` - and no
+ * proxy carries it, so an injected key failed every call it was given to
+ * ("The "key" argument must be of type ... KeyObject"). Its methods run
+ * against the raw instance either way; handed out as a proxy, it is no longer
+ * the object Node made.
+ */
+function isCryptoHandle(instance: object): boolean {
+  return (
+    types.isKeyObject(instance) ||
+    types.isCryptoKey(instance) ||
+    instance instanceof X509Certificate
+  );
 }
 
 /**
@@ -552,11 +574,13 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       // A frozen object is handed back as it is: a proxy has to answer a read
       // of each of its members with the member itself, so there is nothing
       // it could trace - see `isReadOnlyOwnValue`. So is plain data, which
-      // has nothing to trace and which a proxy keeps from being cloned.
+      // has nothing to trace and which a proxy keeps from being cloned, and
+      // a key or certificate of Node's own.
       if (
         isFrameworkNoise(instance) ||
         Object.isFrozen(instance) ||
-        isPlainData(instance)
+        isPlainData(instance) ||
+        isCryptoHandle(instance)
       ) {
         return instance;
       }
@@ -723,7 +747,30 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         methodRefsCache.set(attributeValue, wrapped);
         return wrapped;
       },
+      // An assignment made on the provider runs a setter against the raw
+      // instance, as a read runs a getter: one that writes `this.#x` threw
+      // "Cannot write private member" with the proxy as `this`. Only for the
+      // classes whose methods get the raw instance; an object that inherits
+      // from the proxy assigns to itself, as it would without it.
+      ...(requiresRawReceiver && {
+        set: (
+          target: object,
+          prop: string | symbol,
+          value: unknown,
+          receiver: unknown,
+        ) =>
+          receiver === proxy
+            ? Reflect.set(target, prop, value)
+            : Reflect.set(target, prop, value, receiver),
+      }),
     });
+    // The raw instance only reaches the methods read through the proxy. A
+    // caller that reads one off the class prototype and applies it to the
+    // proxy - as `@nestjs/graphql` does with a resolver's - has to be handed
+    // the instance, and finds it through `rawReceiverOf`.
+    if (requiresRawReceiver) {
+      registerRawReceiver(proxy, instance);
+    }
     return proxy;
   };
 

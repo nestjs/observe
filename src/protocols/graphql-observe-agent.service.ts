@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { DiscoveryService, MetadataScanner, ModuleRef } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
+import { rawReceiverOf } from "../instrument/raw-receiver.js";
 import {
   GraphQLResolveInfoLike,
   RequestSnapshot,
@@ -16,6 +17,10 @@ import { OperationTraceRegistry } from "../services/operation-trace.registry.js"
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { setAgentHook } from "../utils/shared-hook-slot.util.js";
+import {
+  describePeerLoadError,
+  loadOptionalPeer,
+} from "../utils/optional-peer.util.js";
 import {
   parseGraphQLOperation,
   toResolveInfoLike,
@@ -209,6 +214,7 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     private readonly discoveryService: DiscoveryService,
     private readonly metadataScanner: MetadataScanner,
   ) {
+    this.patchResolversExplorer();
     // Attempted twice, and idempotent, because `GraphQLModule` may be
     // instantiated on either side of this service. Whichever module Nest
     // reaches first, one of the two attempts lands: if GraphQLModule came
@@ -299,6 +305,88 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       { getter: "getOnRequestEndHook", repointGetter: true },
     );
     this.isPatched = true;
+  }
+
+  /**
+   * Has `@nestjs/graphql` apply a resolver's methods to the instance itself
+   * where the instrumentation proxy cannot be their receiver.
+   *
+   * The explorer reads each `@Query`, `@Mutation`, `@Subscription` and
+   * `@ResolveField` method off the class prototype and applies it to the
+   * instance the container holds, which is the proxy. For a class with
+   * private members (`this.#x`), whose methods only the instance itself can
+   * run against, the first such read threw: the proxy only helps the methods
+   * read through it. `createContextCallback` is where every one of them is
+   * paired with its instance, the field resolvers' fast path included, so
+   * that is where the instance behind the proxy is handed over instead -
+   * what the explorer would have held without the agent. Only the receiver
+   * changes: the method is still the class's own, so `getHandler()`, guards,
+   * pipes and interceptors see what they saw before, and no span is added,
+   * as none is for any other resolver. A request-scoped resolver reads its
+   * method through the instance already, and is left alone.
+   *
+   * Patched on the prototype from the constructor, which Nest runs before any
+   * `onModuleInit`, `GraphQLModule`'s included, where the explorer does its
+   * work - synchronously, for the reason given on `loadOptionalPeer`. The
+   * original is parked under a symbol, so a second agent replaces the wrapper
+   * instead of wrapping it again.
+   */
+  private patchResolversExplorer(): void {
+    type Explorer = { ResolversExplorerService?: ResolversExplorerLike };
+    // The entry point first, although it does not export the explorer: the
+    // explorer's file sits on an import cycle that only resolves when the
+    // package is entered the way an application enters it. Loaded on its
+    // own, it throws "Cannot access 'ResolversExplorerService' before
+    // initialization".
+    const entryPoint = loadOptionalPeer<Explorer>("@nestjs/graphql");
+    if (!entryPoint.installed || !entryPoint.module) {
+      // An optional peer; absent, or unable to load, it serves no resolvers.
+      return;
+    }
+    let explorer = entryPoint.module.ResolversExplorerService;
+    let loadError: unknown;
+    if (!explorer) {
+      const deepPath = loadOptionalPeer<Explorer>(
+        "@nestjs/graphql",
+        "@nestjs/graphql/dist/services/resolvers-explorer.service.js",
+      );
+      if (deepPath.installed) {
+        explorer = deepPath.module?.ResolversExplorerService;
+        loadError = deepPath.error;
+      }
+    }
+    const prototype = explorer?.prototype;
+    const originalCreate = (prototype?.[ORIGINAL_CREATE_CONTEXT_CALLBACK] ??
+      prototype?.createContextCallback) as CreateContextCallback | undefined;
+    if (!prototype || typeof originalCreate !== "function") {
+      // Worth saying out loud: the symptom otherwise is a resolver that
+      // fails on its own private members for no visible reason.
+      const cause = loadError ? `: ${describePeerLoadError(loadError)}` : "";
+      this.logger.warn(
+        `The installed version of @nestjs/graphql does not expose 'ResolversExplorerService.createContextCallback', so resolvers that use private members (#field) will throw when instrumented${cause}. Skipping patching.`,
+      );
+      return;
+    }
+    prototype[ORIGINAL_CREATE_CONTEXT_CALLBACK] = originalCreate;
+
+    prototype.createContextCallback = function (
+      this: unknown,
+      instance: object,
+      resolverPrototype: unknown,
+      wrapper: unknown,
+      ...rest: unknown[]
+    ) {
+      // rest: [moduleRef, resolver, isRequestScoped, transform]
+      const receiver =
+        rest[2] === true ? instance : resolverReceiverOf(instance, wrapper);
+      return originalCreate.call(
+        this,
+        receiver,
+        resolverPrototype,
+        wrapper,
+        ...rest,
+      );
+    };
   }
 
   /**
@@ -929,4 +1017,48 @@ function toRefusal(first: GqlError, error: object): Error {
     },
   });
   return refusal;
+}
+
+type CreateContextCallback = (
+  instance: object,
+  prototype: unknown,
+  wrapper: unknown,
+  ...rest: unknown[]
+) => unknown;
+
+/** The `ResolversExplorerService` surface patched here, structurally typed. */
+interface ResolversExplorerLike {
+  prototype?: {
+    createContextCallback?: CreateContextCallback;
+    [key: symbol]: unknown;
+  };
+}
+
+const ORIGINAL_CREATE_CONTEXT_CALLBACK = Symbol.for(
+  "nestjs.observe.graphql.createContextCallback",
+);
+
+/**
+ * The instance `@nestjs/graphql` applies a resolver's methods to: the one
+ * behind the instrumentation proxy for a class whose methods cannot run
+ * against the proxy, the container's own for every other.
+ *
+ * Only for a resolver registered under its own class. Nest finds the module
+ * of one registered under another token
+ * (`{ provide: "TOKEN", useClass: Resolver }`) by looking for the instance
+ * the container holds, and with any other it finds none: the resolver would
+ * run with the guards, pipes and interceptors that module provides silently
+ * left out. Such a resolver keeps the proxy, and still fails on its private
+ * members.
+ */
+function resolverReceiverOf(instance: object, wrapper: unknown): object {
+  const receiver = rawReceiverOf(instance);
+  if (receiver === undefined) {
+    return instance;
+  }
+  const token = (wrapper as { token?: unknown } | null | undefined)?.token;
+  return typeof token === "function" &&
+    token.prototype === Object.getPrototypeOf(receiver)
+    ? receiver
+    : instance;
 }

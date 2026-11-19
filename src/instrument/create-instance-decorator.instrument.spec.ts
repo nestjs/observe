@@ -6,6 +6,12 @@ import { EventEmitter } from "events";
 import { Cluster, Redis } from "ioredis";
 import { Db, MongoClient } from "mongodb";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
+import {
+  createHmac,
+  createSecretKey,
+  subtle,
+  X509Certificate,
+} from "node:crypto";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
@@ -1726,6 +1732,84 @@ describe("createInstanceDecorator", () => {
           { className: "ApiKeyStore", methodName: "owner" },
           { className: "ApiKeyStore", methodName: "lookup" },
         ]);
+      });
+    });
+
+    it("assigns through a setter that writes a private field", () => {
+      // Without a `set` trap the setter ran with the proxy as `this`.
+      class Thermostat {
+        #target = 20;
+
+        set target(value: number) {
+          this.#target = value;
+        }
+
+        get target() {
+          return this.#target;
+        }
+
+        read() {
+          return this.#target;
+        }
+      }
+      const thermostat = decorate(new Thermostat()) as Thermostat;
+
+      thermostat.target = 22;
+      withTrace(() => {
+        thermostat.target = 23;
+      });
+
+      expect(thermostat.target).toEqual(23);
+      expect(withTrace(() => thermostat.read())).toEqual(23);
+    });
+
+    describe("from node:crypto", () => {
+      // Node recognises its key and certificate objects by a brand of their
+      // own (`#slots in key`) wherever one is handed in as an argument, and
+      // no proxy carries it: an injected key failed every `createHmac`,
+      // `sign` and `jsonwebtoken` call it was given to.
+      const CERTIFICATE = [
+        "-----BEGIN CERTIFICATE-----",
+        "MIIBhDCCASugAwIBAgIUYhOyPNcnQmLKi4iYy1m4Knpwx4EwCgYIKoZIzj0EAwIw",
+        "FzEVMBMGA1UEAwwMb2JzZXJ2ZS10ZXN0MCAXDTI2MTExOTA4NDUxNloYDzIxMjYx",
+        "MDI2MDg0NTE2WjAXMRUwEwYDVQQDDAxvYnNlcnZlLXRlc3QwWTATBgcqhkjOPQIB",
+        "BggqhkjOPQMBBwNCAARN0Ci49a6tU2t8UNNykkSXX+PpY+imc+uPy3xz24VfexWx",
+        "y81VbFhLj+Hggekpa5XvH+rwpIvtCLb3lP74xvhvo1MwUTAdBgNVHQ4EFgQUZZzK",
+        "1LBE5rKSdC3SloD9Dh/6Si8wHwYDVR0jBBgwFoAUZZzK1LBE5rKSdC3SloD9Dh/6",
+        "Si8wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAc7c4WTAQj8eFf",
+        "MWcbjYUltrLHEgdzeJP65UMbUdqdKwIgIQFjzDWXWe9b62Q9umbVUkVM7bK55r3a",
+        "RNvtH3y/7Lw=",
+        "-----END CERTIFICATE-----",
+      ].join("\n");
+
+      it("hands a KeyObject back untouched", () => {
+        const raw = createSecretKey(Buffer.from("secret"));
+        const key = decorate(raw) as typeof raw;
+
+        expect(key).toBe(raw);
+        expect(
+          withTrace(() => createHmac("sha256", key).update("a").digest("hex")),
+        ).toHaveLength(64);
+      });
+
+      it("hands a CryptoKey back untouched", async () => {
+        const raw = await subtle.importKey(
+          "raw",
+          Buffer.from("secret"),
+          { name: "HMAC", hash: "SHA-256" },
+          false,
+          ["sign"],
+        );
+
+        expect(decorate(raw)).toBe(raw);
+      });
+
+      it("hands an X509Certificate back untouched", () => {
+        const raw = new X509Certificate(CERTIFICATE);
+        const certificate = decorate(raw) as X509Certificate;
+
+        expect(certificate).toBe(raw);
+        expect(raw.checkIssued(certificate)).toBe(true);
       });
     });
 
