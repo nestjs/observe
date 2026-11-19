@@ -328,7 +328,13 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       ) => {
         try {
           const result = call(thisArg, args);
-          if (result instanceof Promise) {
+          // Only a promise with the native `then` is chained or watched. A
+          // `then` the promise brought itself is the caller's to call: on a
+          // lazy promise (`p-lazy`, a postgres.js query) that call is what
+          // starts the work, and the caller may never make it. Such a
+          // promise is handed back like any other thenable, and its span
+          // ends with the call.
+          if (result instanceof Promise && hasNativeThen(result)) {
             // Closing the span is a side effect: a registry failure must
             // leave the caller with the value or rejection it would have
             // seen without the span.
@@ -355,8 +361,8 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
             // rejected where those handlers do not reach: dropped by the
             // caller, it was an unhandled rejection, and under Node's default
             // it ended a process that handled the failure. Handed back, it
-            // also keeps what it carries beyond its value (`json()` on a
-            // `got` request, `kill()` on an `execa` child, a subclass).
+            // also keeps what it carries beyond its value (`kill()` on an
+            // `execa` child, a subclass that keeps the native `then`).
             // Watching marks it handled, so a rejection nobody handles no
             // longer raises `unhandledRejection`; the span still records it.
             result.then(settled, (err) =>
@@ -668,6 +674,20 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     }
     return instance;
   };
+}
+
+/**
+ * Whether `promise.then` is the native method: no override on a subclass, no
+ * `then` of the promise's own. Calling the native one only registers the
+ * callbacks; calling anything else runs code the promise brought with it.
+ */
+function hasNativeThen(promise: Promise<unknown>): boolean {
+  try {
+    return promise.then === Promise.prototype.then;
+  } catch {
+    // A `then` getter that throws: nothing to watch it by.
+    return false;
+  }
 }
 
 /** Runs span bookkeeping whose failure must not reach the caller. */

@@ -503,6 +503,74 @@ describe("createInstanceDecorator", () => {
         expect(endedSteps[0].error).toBe(failure);
       });
 
+      describe("for a promise with a `then` of its own", () => {
+        /** In the style of `p-lazy`: the work starts on the first `then`. */
+        class LazyPromise<T> extends Promise<T> {
+          private started?: Promise<T>;
+
+          constructor(private readonly work: () => T) {
+            super((resolve) => resolve(undefined as T));
+          }
+
+          // Promise's species is this class, whose constructor takes no
+          // executor; the promises `then` derives are plain ones.
+          static override get [Symbol.species]() {
+            return Promise;
+          }
+
+          // oxlint-disable-next-line unicorn/no-thenable -- overriding `then` is the point of the test
+          override then<A = T, B = never>(
+            onFulfilled?: ((value: T) => A | PromiseLike<A>) | null,
+            onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null,
+          ): Promise<A | B> {
+            this.started ??= new Promise<T>((resolve) => resolve(this.work()));
+            return this.started.then(onFulfilled, onRejected);
+          }
+        }
+
+        it("never starts a lazy promise the caller does not", async () => {
+          let runs = 0;
+          const original = new LazyPromise(() => `run ${++runs}`);
+          const service = decorate(new PromiseService()) as PromiseService;
+
+          const returned = withTrace(() => service.withMember(original));
+          await settle();
+
+          expect(returned).toBe(original);
+          expect(runs).toBe(0);
+        });
+
+        it("ends the span with the call, as for any other thenable", () => {
+          const service = decorate(new PromiseService()) as PromiseService;
+
+          void withTrace(() => service.withMember(new LazyPromise(() => "p")));
+
+          expect(endedSteps).toEqual([{ spanId: "PromiseService#withMember" }]);
+        });
+
+        it("leaves starting it, and its outcome, to the caller", async () => {
+          let runs = 0;
+          const failure = new Error("rejected");
+          const service = decorate(new PromiseService()) as PromiseService;
+
+          await expect(
+            withTrace(() =>
+              service.withMember(new LazyPromise(() => `run ${++runs}`)),
+            ),
+          ).resolves.toBe("run 1");
+          await expect(
+            withTrace(() =>
+              service.withMember(
+                new LazyPromise<string>(() => {
+                  throw failure;
+                }),
+              ),
+            ),
+          ).rejects.toBe(failure);
+          expect(runs).toBe(1);
+        });
+      });
+
       describe.each<
         [string, (service: PromiseService, promise: Promise<string>) => unknown]
       >([
