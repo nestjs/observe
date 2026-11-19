@@ -375,6 +375,100 @@ describe("JobTraceRunner: the promise a handler returns", () => {
   });
 });
 
+/**
+ * Bull fails a job that outruns its `timeout` option and takes the next one,
+ * whether or not the handler ever finishes. The driver hands that timeout on,
+ * and the run ends with it.
+ */
+describe("JobTraceRunner: a run its driver times out", () => {
+  let registry: OperationTraceRegistry;
+  let endTrace: ReturnType<typeof vi.spyOn>;
+  let runner: JobTraceRunner<Record<string, unknown>>;
+
+  const job: JobRunDescriptor = {
+    queueName: "previews",
+    name: "download",
+    id: 1,
+    metadata: {},
+  };
+
+  /** How many traces the registry holds open. */
+  const openTraces = () =>
+    (registry as unknown as { traceSnapshots: Map<string, unknown> })
+      .traceSnapshots.size;
+  const pause = (ms: number) =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
+  beforeEach(() => {
+    const als = new AsyncLocalStorage<Map<string, unknown>>();
+    registry = new OperationTraceRegistry(als as never, false);
+    endTrace = vi.spyOn(registry, "endTrace");
+    runner = new JobTraceRunner(
+      { insertJobSnapshot: vi.fn() } as unknown as ObserveAgentSharedBuffer,
+      { traceIdKey: "traceId" } as ObserveModuleOptionsWithDefaults,
+      registry,
+      als as never,
+      { warn: vi.fn(), debug: vi.fn() } as unknown as Logger,
+    );
+  });
+
+  it.each([
+    ["a promise-style handler that never settles", false],
+    ["a callback-style handler that never calls done", true],
+  ])("ends the run of %s as failed at the timeout", async (_, callback) => {
+    void runner.run(
+      { ...job, timeout: 20 },
+      () => new Promise(() => {}),
+      callback,
+    );
+    expect(openTraces()).toBe(1);
+
+    await vi.waitFor(() => expect(endTrace).toHaveBeenCalledOnce());
+    expect(endTrace.mock.calls[0][1]).toEqual({ status: "failed" });
+    await vi.waitFor(() => expect(openTraces()).toBe(0));
+  });
+
+  it("keeps the outcome of a run that ends in time, with no timer left", async () => {
+    await runner.run({ ...job, timeout: 20 }, async () => "downloaded");
+    await pause(40);
+
+    expect(endTrace).toHaveBeenCalledOnce();
+    expect(endTrace.mock.calls[0][1]).toEqual({ status: "completed" });
+  });
+
+  it("leaves a run without a timeout open until its handler settles", async () => {
+    void runner.run(job, () => new Promise(() => {}));
+    await pause(40);
+
+    expect(endTrace).not.toHaveBeenCalled();
+    expect(openTraces()).toBe(1);
+  });
+
+  it("still marks a dropped promise handled once a late done reports its failure", async () => {
+    let report!: () => void;
+    const chained = new Promise((_, reject) => {
+      report = () => reject(new Error("socket hang up"));
+    });
+
+    void runner.run(
+      { ...job, timeout: 5 },
+      (settle) => {
+        setTimeout(() => {
+          settle("failed");
+          report();
+        }, 20);
+        return chained;
+      },
+      true,
+    );
+
+    await vi.waitFor(() => expect(endTrace).toHaveBeenCalledOnce());
+    // Vitest fails the file on a rejection nothing handled.
+    await pause(40);
+    expect(endTrace).toHaveBeenCalledOnce();
+  });
+});
+
 describe("JobTraceRunner: patchEnqueue", () => {
   const TRACE_ID_KEY = "traceId";
 

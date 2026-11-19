@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "async_hooks";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { BullObserveAgentService } from "./bull-observe-agent.service.js";
+import { JobTraceRunner } from "./job-trace-runner.js";
 
 /**
  * The Bull suites need Redis; what the agent reads off a job before handing
@@ -44,5 +45,39 @@ describe("BullObserveAgentService", () => {
       }),
     ).resolves.toBe("done");
     expect(processor).toHaveBeenCalledOnce();
+  });
+
+  /** The timeout the agent hands the runner for a job's `timeout` option. */
+  const timeoutHandedOnFor = (timeout: unknown) => {
+    const run = vi
+      .spyOn(JobTraceRunner.prototype, "run")
+      .mockImplementation(() => undefined);
+    void instrument(async () => undefined)({
+      queue: { name: "previews" },
+      name: "download",
+      id: 1,
+      opts: { timeout },
+    });
+    return run.mock.calls[0][0].timeout;
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    // Bull arms no timer for these.
+    [undefined, undefined],
+    [0, undefined],
+    [Number.NaN, undefined],
+    [Number.POSITIVE_INFINITY, undefined],
+    [100, 100],
+    // And fails the job as soon as the handler returns for these.
+    [-1, 0],
+    ["50", 0],
+    // A timer past what Node holds fires after 1 ms.
+    [2 ** 31, 1],
+  ])("ends a job with a timeout of %s as Bull does: %s", (timeout, ms) => {
+    expect(timeoutHandedOnFor(timeout)).toBe(ms);
   });
 });

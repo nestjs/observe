@@ -39,6 +39,28 @@ const ORIGINAL_SET_HANDLER = Symbol.for("nestjs.observe.bull.setHandler");
 /** Bull names an unnamed job this; reporting it would name every job the same. */
 const BULL_DEFAULT_JOB_NAME = "__default__";
 
+/** The longest delay a Node timer keeps; a longer one fires after 1 ms. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/**
+ * When Bull fails a run on its own, read off the job's `timeout` option as
+ * Bull reads it: it races the handler's promise against a timer of that many
+ * ms from the moment the handler returns, and fails the job once the timer
+ * wins. A falsy timeout and `Infinity` arm none. Any other value that is not
+ * a positive number - `-1`, `"50"` - makes that race throw, which fails the
+ * job at once, and one past what a timer can hold fires after 1 ms.
+ */
+function readBullTimeout(opts: BullJobLike["opts"]): number | undefined {
+  const timeout = opts?.timeout;
+  if (!timeout || timeout === Number.POSITIVE_INFINITY) {
+    return undefined;
+  }
+  if (typeof timeout !== "number" || timeout < 0) {
+    return 0;
+  }
+  return timeout > MAX_TIMER_DELAY_MS ? 1 : timeout;
+}
+
 /**
  * Job tracing for the original Bull, which `@nestjs/bull` wraps - the same
  * snapshots `@nestjs/bullmq` produces, from a driver a large share of Nest
@@ -149,6 +171,7 @@ export class BullObserveAgentService<Store extends Record<string, unknown>> {
       id: job.id,
       opts: job.opts,
       metadata: this.readQueueMetadata(job),
+      timeout: readBullTimeout(job.opts),
     });
     const runner = this.runner;
 

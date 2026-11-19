@@ -40,6 +40,13 @@ export interface JobRunDescriptor {
   /** The job's options as the driver read them back from Redis. */
   opts?: Record<string, unknown>;
   metadata: Partial<JobSnapshot>;
+  /**
+   * How long, in ms, the driver gives the run once its handler has returned
+   * before it fails the job itself, when it does - Bull's `timeout` option.
+   * The run is reported as failed then, whether the handler ever finishes or
+   * not.
+   */
+  timeout?: number;
 }
 
 type JobStatus = NonNullable<JobSnapshot["status"]>;
@@ -447,15 +454,27 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
       // The promise a callback-style handler returned, which its driver
       // drops - see where it is handed back, below.
       let dropped: Promise<unknown> | undefined;
+      let completed = false;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
       const settle = (status: JobStatus) => {
         if (outcome) {
           return;
         }
         outcome = status;
-        endOperation(operation);
         if (status === "failed") {
           dropped?.then(undefined, ignoreRejection);
         }
+        complete(status);
+      };
+      // Apart from `settle`, which is the handler's: the deadline ends the
+      // run, not what its handler reports later.
+      const complete = (status: JobStatus) => {
+        if (completed) {
+          return;
+        }
+        completed = true;
+        clearTimeout(deadline);
+        endOperation(operation);
         deferTraceCompletion(
           async () => {
             this.operationTraceRegistry.endTrace(registryKey, { status });
@@ -488,6 +507,15 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
           handedOn === undefined
             ? invoke(settle)
             : continueHandedOnTrace(handedOn, traceId, () => invoke(settle));
+        // Armed as the driver arms its own, once the handler has returned:
+        // Bull fails a job past its `timeout` and takes the next one, and a
+        // handler that never finishes left its trace in the registry for the
+        // life of the process, one per job, never reported. Unref'd, as it
+        // must not keep a worker alive that is done otherwise.
+        if (job.timeout !== undefined && !completed) {
+          deadline = setTimeout(() => complete("failed"), job.timeout);
+          deadline.unref?.();
+        }
         if (returnValue instanceof Promise) {
           // Handed back as the handler returned it, never as a promise
           // chained onto it: a chained promise has none of the members of the
