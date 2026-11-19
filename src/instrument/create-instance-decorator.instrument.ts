@@ -501,7 +501,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       if (isFrameworkNoise(instance)) {
         return instance;
       }
-      hasPrivateMembers = usesNativePrivateMembers(instance);
+      hasPrivateMembers = usesPrivateMembers(instance);
       slotBacked = isSlotBackedBuiltIn(instance);
       bareBuiltIn = slotBacked && isNativeFunction(instance.constructor);
       partlyTraced = extendsPartlyTracedClass(instance);
@@ -920,8 +920,26 @@ function isNativeFunction(fn: unknown): boolean {
 const privateMemberCache = new WeakMap<object, boolean>();
 
 /**
- * Whether any class in the instance's prototype chain declares native private
- * members (`#field`, `#method()`).
+ * What a compiler leaves of `#name` when the target is below ES2022: the
+ * member moves into a `WeakMap` or `WeakSet` keyed by the instance, and every
+ * access goes through a helper that checks its receiver against it. That is
+ * the same brand check, with no `#` left in the class source.
+ *
+ * Covers the helpers of tsc and tslib (`__classPrivateFieldGet`), Babel and
+ * oxc (`_classPrivateFieldGet2`, `_assertClassBrand`), SWC
+ * (`_class_private_field_get`) and esbuild (`__privateGet`). Matched anywhere
+ * in a name, since an imported helper is reached through a namespace or under
+ * a numbered alias (`tslib_1.__classPrivateFieldGet`). Not the loose-mode
+ * helpers of Babel and SWC (`_classPrivateFieldLooseBase`): loose mode keeps
+ * the member on the instance under a string key, which reads through the
+ * proxy like any other property.
+ */
+const COMPILED_PRIVATE_MEMBER =
+  /classPrivate(?:Field|Method|Getter|Setter)(?!Loose)|assertClassBrand|class_private_(?:field|method)_(?!loose)|__private(?:Get|Set|Add|Method|In|Wrapper)\b/;
+
+/**
+ * Whether any class in the instance's prototype chain declares private
+ * members (`#field`, `#method()`), native or compiled away.
  *
  * Detection reads the class source: private members can only be touched from
  * inside the lexical class body, so a class whose text contains no `#name`
@@ -929,8 +947,13 @@ const privateMemberCache = new WeakMap<object, boolean>();
  * false-positive, which merely selects the raw-instance receiver - every call
  * still works, only nested self-call spans are lost - so the cheap test is
  * safe to lean on.
+ *
+ * A compiled class is told by its helper calls, under the same trade-off:
+ * they stay in the class body, where the `#name` was. A `WeakMap` keyed by
+ * `this` that an application writes by hand leaves no such trace, and is not
+ * covered.
  */
-function usesNativePrivateMembers(instance: object): boolean {
+function usesPrivateMembers(instance: object): boolean {
   let proto: object | null = Object.getPrototypeOf(instance);
   while (proto && proto !== Object.prototype) {
     let hasPrivate = privateMemberCache.get(proto);
@@ -982,9 +1005,12 @@ function prototypeUsesPrivateMembers(proto: object): boolean {
 // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 function declaresPrivateMembers(fn: Function): boolean {
   try {
+    const source = Function.prototype.toString.call(fn);
     // `#` starting a private name is never preceded by an identifier
     // character; `obj.#x` and `#x in obj` and declarations all match.
-    return /(^|[^\w$])#[\w$]/.test(Function.prototype.toString.call(fn));
+    return (
+      /(^|[^\w$])#[\w$]/.test(source) || COMPILED_PRIVATE_MEMBER.test(source)
+    );
   } catch {
     // A function whose source is unavailable (bound functions, some
     // natives) cannot be a class body with private members.

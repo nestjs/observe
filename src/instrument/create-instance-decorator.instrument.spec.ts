@@ -1549,6 +1549,118 @@ describe("createInstanceDecorator", () => {
       expect(withTrace(() => account.audit())).toEqual("audited");
     });
 
+    describe("compiled for a target below ES2022", () => {
+      // What tsc, Babel, SWC and esbuild leave of `#owners`: the field moves
+      // into a `WeakMap` keyed by the instance, and a helper checks its
+      // receiver against it - the same brand check, with no `#` left.
+      const brandCheckedGet = (
+        receiver: object,
+        state: WeakMap<object, Map<string, string>>,
+      ) => {
+        if (!state.has(receiver)) {
+          throw new TypeError(
+            "Cannot read private member from an object whose class did not declare it",
+          );
+        }
+        return state.get(receiver)!;
+      };
+      const __classPrivateFieldGet = brandCheckedGet;
+      const _class_private_field_get = brandCheckedGet;
+      const __privateGet = brandCheckedGet;
+
+      it.each([
+        [
+          "tsc",
+          () => {
+            const owners = new WeakMap<object, Map<string, string>>();
+            return class ApiKeyStore {
+              constructor() {
+                owners.set(this, new Map([["k1", "alice"]]));
+              }
+
+              owner(key: string) {
+                return __classPrivateFieldGet(this, owners).get(key);
+              }
+            };
+          },
+        ],
+        [
+          "SWC",
+          () => {
+            const owners = new WeakMap<object, Map<string, string>>();
+            return class ApiKeyStore {
+              constructor() {
+                owners.set(this, new Map([["k1", "alice"]]));
+              }
+
+              owner(key: string) {
+                return _class_private_field_get(this, owners).get(key);
+              }
+            };
+          },
+        ],
+        [
+          "esbuild",
+          () => {
+            const owners = new WeakMap<object, Map<string, string>>();
+            return class ApiKeyStore {
+              constructor() {
+                owners.set(this, new Map([["k1", "alice"]]));
+              }
+
+              owner(key: string) {
+                return __privateGet(this, owners).get(key);
+              }
+            };
+          },
+        ],
+      ])("runs a traced method that reads one, as %s writes it", (_, make) => {
+        const ApiKeyStore = make();
+        const store = decorate(new ApiKeyStore()) as InstanceType<
+          typeof ApiKeyStore
+        >;
+
+        expect(withTrace(() => store.owner("k1"))).toEqual("alice");
+        expect(startedSteps).toEqual([
+          { className: "ApiKeyStore", methodName: "owner" },
+        ]);
+      });
+
+      it("keeps nested spans for a class compiled in loose mode", () => {
+        // Loose mode keeps the member on the instance under a unique string
+        // key, which reads through the proxy like any other.
+        const _classPrivateFieldLooseBase = (receiver: object) => receiver;
+        const ownersKey = "__private_0_owners";
+        class ApiKeyStore {
+          constructor() {
+            Object.defineProperty(this, ownersKey, {
+              value: new Map([["k1", "alice"]]),
+            });
+          }
+
+          owner(key: string) {
+            return this.lookup(key);
+          }
+
+          lookup(key: string) {
+            return (
+              _classPrivateFieldLooseBase(this) as unknown as Record<
+                string,
+                Map<string, string>
+              >
+            )[ownersKey].get(key);
+          }
+        }
+        const store = decorate(new ApiKeyStore()) as ApiKeyStore;
+
+        expect(withTrace(() => store.owner("k1"))).toEqual("alice");
+        expect(startedSteps).toEqual([
+          { className: "ApiKeyStore", methodName: "owner" },
+          { className: "ApiKeyStore", methodName: "lookup" },
+        ]);
+      });
+    });
+
     it("still records spans for methods on private-member classes", () => {
       const service = decorate(new SecretService()) as SecretService;
 
