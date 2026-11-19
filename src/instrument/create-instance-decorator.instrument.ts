@@ -10,6 +10,7 @@ import {
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { sharedAttributesOf } from "../utils/shared-attributes.util.js";
+import { rewriteStackFrames } from "../utils/error-stack.util.js";
 import { registerRawReceiver } from "./raw-receiver.js";
 
 /**
@@ -977,20 +978,18 @@ function relabelProxyFrame(
     ) {
       return;
     }
-    const stack: unknown = err.stack;
-    if (typeof stack !== "string") {
-      return;
-    }
     // `async` prefixes the type name on frames resumed from an await. Spaces
     // and tabs only after the newline, not `\s`: a newline matched there too,
     // and a message of newlines then rescanned the run after each one.
     const frame = new RegExp(
       `(\\n[ \\t]*at (?:async )?)Proxy\\.${escapeRegExp(methodName)}\\b`,
     );
-    if (!frame.test(stack)) {
-      return;
-    }
-    err.stack = stack.replace(frame, `$1${className}.${methodName}`);
+    // Not `err.stack` read and assigned back: that read would fix the
+    // error's message in its stack, whatever a caller does to the message
+    // afterwards - see `readStack`.
+    rewriteStackFrames(err, (stack) =>
+      stack.replace(frame, `$1${className}.${methodName}`),
+    );
   } catch {
     // Left as it is.
   }

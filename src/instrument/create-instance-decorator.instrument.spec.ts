@@ -271,10 +271,14 @@ describe("createInstanceDecorator", () => {
       const long = lookUp("a".repeat(2_000));
       long.message = "changed";
       expect(long.stack).toMatch(/^Error: changed\n/);
+      // Not relabelled: the stack was never looked at.
+      expect(long.stack).toContain("Proxy.find");
 
+      // Relabelled, from frames written with a stand-in for the message, so
+      // its first line still follows the message - see `readStack`.
       const short = lookUp("a");
       short.message = "changed";
-      expect(short.stack).toMatch(/^Error: No user named "a"\n/);
+      expect(short.stack).toMatch(/^Error: changed\n/);
       expect(short.stack).not.toContain("Proxy.find");
     });
 
@@ -309,6 +313,56 @@ describe("createInstanceDecorator", () => {
       });
 
       expect(caught).toBe(thrown);
+    });
+
+    it("leaves the message in the stack for a caller to change", async () => {
+      class RegisterClient {
+        async lookup(id: string): Promise<never> {
+          throw new Error(`no person with national id ${id}`);
+        }
+      }
+      class PeopleService {
+        constructor(private readonly register: RegisterClient) {}
+
+        async find(id: string) {
+          try {
+            return await this.register.lookup(id);
+          } catch (error) {
+            (error as Error).message = "no person with national id <masked>";
+            throw error;
+          }
+        }
+      }
+
+      // A registry that does not look at the error, as the real one does not
+      // for a span under another: the one above reads `stack` like a logger.
+      const decorateQuietly = createInstanceDecorator(
+        als,
+        {
+          internalStartTraceStep: () => "step",
+          internalEndTraceStep: () => undefined,
+        } as unknown as OperationTraceRegistry,
+        { traceIdKey: TRACE_ID_KEY, skipInstrumentation: () => false },
+      );
+      const register = decorateQuietly(new RegisterClient()) as RegisterClient;
+      const people = decorateQuietly(
+        new PeopleService(register),
+      ) as PeopleService;
+
+      const error = await withTrace(() =>
+        people.find("19850101-7731").catch((err: Error) => err),
+      );
+
+      // Relabelling `lookup`'s frame read the stack before `find` masked the
+      // message. V8 writes the first line at the first read, so a plain read
+      // there left the id in it for whoever logs the error.
+      expect(error.stack).not.toContain("19850101-7731");
+      expect(error.stack!.split("\n")[0]).toBe(
+        "Error: no person with national id <masked>",
+      );
+      expect(error.stack).toContain("RegisterClient.lookup");
+      expect(error.stack).toContain("PeopleService.find");
+      expect(error.stack).not.toContain("Proxy.");
     });
 
     it("keeps the original method name on the returned wrapper", () => {

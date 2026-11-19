@@ -681,6 +681,37 @@ describe("OperationTraceRegistry", () => {
       expect(root.error!.stack).toContain("at Svc.root (/app/svc.ts:1:1)");
     });
 
+    it("ships the stack without fixing the message in it", async () => {
+      startRequest("e-live");
+      const spanId = registry.internalStartTraceStep(
+        "e-live",
+        "Svc",
+        "root",
+        undefined,
+      );
+      const error = new Error("no person with national id 19850101-7731");
+      registry.internalEndTraceStep(
+        "e-live",
+        spanId,
+        "Svc",
+        "root",
+        spanId,
+        error,
+      );
+      registry.endTrace("e-live");
+
+      // What an exception filter does, after the root span has recorded the
+      // error: the stack it then logs must show the message it left.
+      error.message = "no person with national id <masked>";
+
+      expect(error.stack!.split("\n")[0]).toBe(
+        "Error: no person with national id <masked>",
+      );
+      const snapshot = await registry.pluckSnapshot("e-live");
+      const root = snapshot!.traces[0] as { error?: { stack?: string } };
+      expect(root.error!.stack).toContain("\n    at ");
+    });
+
     it("ships the error verbatim once redaction is switched off", async () => {
       registry.configureRedaction(null);
       startRequest("e-raw");

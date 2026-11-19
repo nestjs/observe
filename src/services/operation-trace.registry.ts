@@ -12,6 +12,7 @@ import {
 import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { KeyOf } from "../types/key-of.type.js";
 import { CodeFrame, collectCodeFrames } from "../utils/source-context.util.js";
+import { readStack } from "../utils/error-stack.util.js";
 import { fallbackOperationId } from "../utils/fallback-operation-id.util.js";
 import { fitToLength } from "../utils/fit-to-length.util.js";
 import { LogRedactor } from "../utils/log-redactor.js";
@@ -367,10 +368,13 @@ function toErrorText(value: unknown): string {
   }
 }
 
-/** An error's stack, when it has one that is text. */
+/**
+ * An error's stack, when it has one that is text - read without fixing the
+ * message in it, for an exception filter still to run (`readStack`).
+ */
 function stackOf(error: Error): string | undefined {
   try {
-    const stack: unknown = error.stack;
+    const stack: unknown = readStack(error);
     return typeof stack === "string" ? stack : undefined;
   } catch {
     return undefined;
