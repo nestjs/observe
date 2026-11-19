@@ -569,13 +569,14 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     let bareBuiltIn: boolean;
     let partlyTraced: boolean;
     let nodeStream: boolean;
+    let classInstance: boolean;
     try {
       // Inspected here, inside the guard, for the same reason as the checks
       // below: reading a provider's constructor can run a trap that throws.
       //
       // A frozen object is handed back as it is: a proxy has to answer a read
       // of each of its members with the member itself, so there is nothing
-      // it could trace - see `isReadOnlyOwnValue`. So is plain data, which
+      // it could trace - see `isReadOnlyDataProperty`. So is plain data, which
       // has nothing to trace and which a proxy keeps from being cloned, and
       // a key or certificate of Node's own.
       if (
@@ -591,6 +592,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       bareBuiltIn = slotBacked && isNativeFunction(instance.constructor);
       partlyTraced = extendsPartlyTracedClass(instance);
       nodeStream = isNodeStream(instance);
+      classInstance = isClassInstance(instance);
     } catch {
       // Reading the prototype ran a trap that threw (nestjs-cls proxy
       // providers do this outside a CLS context). An instance that cannot be
@@ -626,6 +628,10 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     // constructors and callable objects.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     const passedThrough = new WeakSet<Function>();
+    // And the instance's own functions, see the `get` trap.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+    const ownFunctions = new WeakSet<Function>();
+    const ownFunctionsPassThrough = classInstance && !requiresRawReceiver;
     const proxy: object = new Proxy(instance, {
       // Runs for every property read through the proxy - each `this.field`
       // and `this.dependency.method` inside a traced call - so the common
@@ -651,7 +657,8 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         // both caches, which go by the function: the same one may also sit
         // under a writable key, and an instance can be frozen after its
         // method was wrapped.
-        if (isReadOnlyOwnValue(target, prop)) {
+        const own = Reflect.getOwnPropertyDescriptor(target, prop);
+        if (isReadOnlyDataProperty(own)) {
           return attributeValue;
         }
 
@@ -662,6 +669,32 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         }
         if (passedThrough.has(attributeValue)) {
           return attributeValue;
+        }
+
+        // A function a class instance holds itself - an arrow-function field,
+        // a method its constructor bound, a callback it stored - was made with
+        // the raw instance in hand, and the class compares it by identity
+        // from code that never reads it through the proxy. mssql's
+        // `Transaction` adds `this._abort` to the pooled connection in
+        // `_begin` and removes it inside `_abort`, an arrow function whose
+        // `this` is the raw instance: wrapped, the listener stayed, and the
+        // next rollback on that connection ended the process. Such a function
+        // is handed out as it is, and gets no span of its own.
+        //
+        // Remembered apart from `passedThrough` and honoured only for a read
+        // of an own property, so the same function read under a prototype
+        // name is still a method. Not for a class whose methods run against
+        // the raw instance: those never read their functions through here,
+        // and a plain function it holds relies on the wrapper for that
+        // receiver.
+        if (own !== undefined && ownFunctionsPassThrough) {
+          if (ownFunctions.has(attributeValue)) {
+            return attributeValue;
+          }
+          if (isInstanceOwnFunction(target, prop, attributeValue)) {
+            ownFunctions.add(attributeValue);
+            return attributeValue;
+          }
         }
 
         const shouldProxy =
@@ -812,11 +845,70 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
  * A method found on the prototype has no own descriptor, so a class instance
  * keeps its spans.
  */
-function isReadOnlyOwnValue(target: object, prop: string | symbol): boolean {
-  const own = Reflect.getOwnPropertyDescriptor(target, prop);
+function isReadOnlyDataProperty(own: PropertyDescriptor | undefined): boolean {
   return (
     own !== undefined && own.configurable === false && own.writable === false
   );
+}
+
+/**
+ * Whether an instance was built by a class, or anything else that hands it a
+ * prototype of its own - as opposed to an object literal, a null-prototype
+ * object, an ES module namespace or an array, whose own functions are the
+ * methods a caller means to trace, and which have no constructor that could
+ * have kept a reference to one of them.
+ */
+function isClassInstance(instance: object): boolean {
+  const proto: unknown = Object.getPrototypeOf(instance);
+  return (
+    proto !== null && proto !== Object.prototype && !Array.isArray(instance)
+  );
+}
+
+/**
+ * Whether a function an instance holds as an own property is the instance's
+ * own, rather than a method of its class held a second time.
+ *
+ * Not when the prototype chain holds that very function, under any name
+ * (`this.build = this.render`): it is a method, and one wrapper stands in for
+ * it whichever name it is read by. Nor when the class has a method of the
+ * same name that carries metadata (`this.create = this.create.bind(this)` in
+ * a controller): Nest reads such a handler off the instance, and unwrapped, a
+ * request it served without calling anything else had no span, and was
+ * dropped for it.
+ *
+ * Read as descriptors, so no getter runs; asked once per function, since the
+ * answer is kept.
+ */
+function isInstanceOwnFunction(
+  instance: object,
+  prop: string | symbol,
+  fn: unknown,
+): boolean {
+  for (
+    let proto: object | null = Object.getPrototypeOf(instance);
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto)
+  ) {
+    const sameName = Reflect.getOwnPropertyDescriptor(proto, prop)?.value;
+    if (
+      typeof sameName === "function" &&
+      Reflect.getMetadataKeys(sameName).length > 0
+    ) {
+      return false;
+    }
+    for (const key of Reflect.ownKeys(proto)) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(proto, key);
+      if (
+        descriptor?.value === fn ||
+        descriptor?.get === fn ||
+        descriptor?.set === fn
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 /**

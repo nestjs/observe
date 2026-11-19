@@ -1122,6 +1122,170 @@ describe("createInstanceDecorator", () => {
     });
   });
 
+  describe("when a class instance holds a function of its own", () => {
+    /**
+     * Shaped like mssql's `Transaction`: `begin` adds `this.abort` to the
+     * pooled connection, and `abort` - an arrow function, so its `this` is
+     * the raw instance - takes itself off again.
+     */
+    class Transaction {
+      connection: EventEmitter | null = null;
+
+      constructor(private readonly pooled: EventEmitter) {}
+
+      readonly abort = () => {
+        this.connection!.removeListener("rollbackTransaction", this.abort);
+        this.connection = null;
+      };
+
+      begin() {
+        this.connection = this.pooled;
+        this.connection.on("rollbackTransaction", this.abort);
+      }
+    }
+
+    it("hands an arrow-function field out untouched", () => {
+      const raw = new Transaction(new EventEmitter());
+      const transaction = decorate(raw) as Transaction;
+
+      expect(withTrace(() => transaction.abort)).toBe(raw.abort);
+      expect(transaction.abort).toBe(raw.abort);
+    });
+
+    it("lets a listener added in a traced call take itself off", () => {
+      const connection = new EventEmitter();
+      const first = decorate(new Transaction(connection)) as Transaction;
+      const second = decorate(new Transaction(connection)) as Transaction;
+
+      withTrace(() => first.begin());
+      connection.emit("rollbackTransaction");
+      expect(connection.listenerCount("rollbackTransaction")).toBe(0);
+
+      // A wrapper left behind ran again here, for a transaction that holds
+      // no connection any more, and threw inside the emit.
+      withTrace(() => second.begin());
+      expect(() => connection.emit("rollbackTransaction")).not.toThrow();
+      expect(connection.listenerCount("rollbackTransaction")).toBe(0);
+    });
+
+    it("lets a traced call remove a listener the constructor bound and added", () => {
+      // amqp-connection-manager's `ChannelWrapper` does this with
+      // `_onConnect` and `_onDisconnect`.
+      class ChannelWrapper {
+        private readonly onConnect: () => void;
+
+        constructor(private readonly manager: EventEmitter) {
+          this.onConnect = this.setUp.bind(this);
+          manager.on("connect", this.onConnect);
+        }
+
+        setUp() {}
+
+        close() {
+          this.manager.removeListener("connect", this.onConnect);
+        }
+      }
+      const manager = new EventEmitter();
+      const channel = decorate(new ChannelWrapper(manager)) as ChannelWrapper;
+
+      withTrace(() => channel.close());
+
+      expect(manager.listenerCount("connect")).toBe(0);
+    });
+
+    it("still traces the methods of its class", () => {
+      const transaction = decorate(
+        new Transaction(new EventEmitter()),
+      ) as Transaction;
+
+      withTrace(() => transaction.begin());
+
+      expect(startedSteps).toEqual([
+        { className: "Transaction", methodName: "begin" },
+      ]);
+    });
+
+    it("still traces a handler its constructor bound", () => {
+      // A route handler bound in the constructor is read by Nest off the
+      // instance: unwrapped, a request it serves alone had no span, and a
+      // request with no span is dropped.
+      class OrdersController {
+        constructor() {
+          this.create = this.create.bind(this);
+        }
+
+        @common.Post()
+        create() {
+          return "created";
+        }
+      }
+      const controller = decorate(new OrdersController()) as OrdersController;
+
+      expect(withTrace(() => controller.create())).toEqual("created");
+      expect(startedSteps).toEqual([
+        { className: "OrdersController", methodName: "create" },
+      ]);
+    });
+
+    it("still traces a method the instance holds under another name", () => {
+      // The function is the prototype's, and one wrapper stands in for it
+      // under either name.
+      class ReportService {
+        readonly build: () => string;
+
+        constructor() {
+          // oxlint-disable-next-line typescript/unbound-method -- an alias, called on the instance
+          this.build = this.render;
+        }
+
+        render() {
+          return "report";
+        }
+      }
+      const service = decorate(new ReportService()) as ReportService;
+
+      withTrace(() => service.build());
+      withTrace(() => service.render());
+
+      expect(startedSteps).toEqual([
+        { className: "ReportService", methodName: "build" },
+        { className: "ReportService", methodName: "build" },
+      ]);
+    });
+
+    it("keeps wrapping one where methods run against the raw instance", () => {
+      // Such a class never reads its functions through the proxy, and a
+      // plain function it holds is handed the raw instance by the wrapper.
+      class Vault {
+        #secret = "s3cret";
+        readonly reveal: () => string;
+
+        constructor() {
+          this.reveal = function (this: Vault) {
+            return this.#secret;
+          };
+        }
+      }
+      const vault = decorate(new Vault()) as Vault;
+
+      expect(vault.reveal()).toEqual("s3cret");
+      expect(withTrace(() => vault.reveal())).toEqual("s3cret");
+      expect(startedSteps).toEqual([
+        { className: "Vault", methodName: "reveal" },
+      ]);
+    });
+
+    it("still traces the functions an object literal holds", () => {
+      const raw = { greet: (name: string) => `hello ${name}` };
+      const provider = decorate(raw) as typeof raw;
+
+      expect(withTrace(() => provider.greet("you"))).toEqual("hello you");
+      expect(startedSteps).toEqual([
+        { className: "Object", methodName: "greet" },
+      ]);
+    });
+  });
+
   describe("when the registry has no snapshot for the trace id", () => {
     class HealthService {
       check() {
