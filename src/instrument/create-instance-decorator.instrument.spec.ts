@@ -1947,6 +1947,42 @@ describe("createInstanceDecorator", () => {
       expect(endedSteps).toEqual([{ spanId: "Object#greet" }]);
     });
 
+    it("hands a frozen object back untouched", () => {
+      // A proxy has to answer a read of a read-only, non-configurable data
+      // property with the target's own value - a wrapper in its place threw
+      // "'get' on proxy: property 'stringify' is a read-only and
+      // non-configurable data property" - and every member of a frozen
+      // object is one (bson's `EJSON`, a bundled module's exports).
+      const raw = Object.freeze({
+        stringify: (value: unknown) => JSON.stringify(value),
+      });
+
+      const decorated = decorate(raw) as typeof raw;
+
+      expect(decorated).toBe(raw);
+      expect(withTrace(() => decorated.stringify({ a: 1 }))).toEqual('{"a":1}');
+    });
+
+    it("hands out a read-only, non-configurable member as it is", () => {
+      class Audit {
+        record(entry: string) {
+          return `recorded ${entry}`;
+        }
+      }
+      const raw = new Audit();
+      const format = (entry: string) => `[${entry}]`;
+      Object.defineProperty(raw, "format", { value: format });
+      const audit = decorate(raw) as Audit & { format: typeof format };
+
+      expect(withTrace(() => audit.format("a"))).toEqual("[a]");
+      expect(audit.format).toBe(format);
+      // The class's own methods still get their spans.
+      expect(withTrace(() => audit.record("a"))).toEqual("recorded a");
+      expect(startedSteps).toEqual([
+        { className: "Audit", methodName: "record" },
+      ]);
+    });
+
     it("uses the Object label when `constructor` is not a function", () => {
       const provider = decorate({
         constructor: { name: "Fake" },

@@ -504,7 +504,11 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     try {
       // Inspected here, inside the guard, for the same reason as the checks
       // below: reading a provider's constructor can run a trap that throws.
-      if (isFrameworkNoise(instance)) {
+      //
+      // A frozen object is handed back as it is: a proxy has to answer a read
+      // of each of its members with the member itself, so there is nothing
+      // it could trace - see `isReadOnlyOwnValue`.
+      if (isFrameworkNoise(instance) || Object.isFrozen(instance)) {
         return instance;
       }
       hasPrivateMembers = usesPrivateMembers(instance);
@@ -554,6 +558,15 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         }
         const attributeValue = Reflect.get(target, prop);
         if (typeof attributeValue !== "function" || prop === "constructor") {
+          return attributeValue;
+        }
+
+        // A member the instance can never change is handed out as it is and
+        // runs untraced: the engine accepts no other answer. Asked ahead of
+        // both caches, which go by the function: the same one may also sit
+        // under a writable key, and an instance can be frozen after its
+        // method was wrapped.
+        if (isReadOnlyOwnValue(target, prop)) {
           return attributeValue;
         }
 
@@ -674,6 +687,28 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     }
     return instance;
   };
+}
+
+/**
+ * Whether a property is an own data property that is neither writable nor
+ * configurable: what `Object.freeze` makes of every member, and what
+ * `Object.defineProperty(obj, key, { value })` creates by default.
+ *
+ * A proxy's `get` trap has to answer a read of such a property with the
+ * target's own value. The engine compares the two after the trap returns and
+ * throws a TypeError when they differ ("'get' on proxy: property ... is a
+ * read-only and non-configurable data property on the proxy target but the
+ * proxy did not return its actual value"), so a traced wrapper in its place
+ * failed the read itself, before anything was called.
+ *
+ * A method found on the prototype has no own descriptor, so a class instance
+ * keeps its spans.
+ */
+function isReadOnlyOwnValue(target: object, prop: string | symbol): boolean {
+  const own = Reflect.getOwnPropertyDescriptor(target, prop);
+  return (
+    own !== undefined && own.configurable === false && own.writable === false
+  );
 }
 
 /**
