@@ -1,13 +1,23 @@
-import { Logger, type FactoryProvider } from "@nestjs/common";
+import { AsyncLocalStorage } from "async_hooks";
+import {
+  Injectable,
+  Logger,
+  Module,
+  type FactoryProvider,
+} from "@nestjs/common";
 import type {
   ObserveOptions,
   ObserveOptionsFactory,
 } from "./interfaces/observe-options.interface.js";
 import { Test } from "@nestjs/testing";
 import { createObserveModule } from "./observe.module.js";
-import { OBSERVE_OPTIONS } from "./observe.constants.js";
+import {
+  OBSERVE_ASYNC_LOCAL_STORAGE,
+  OBSERVE_OPTIONS,
+} from "./observe.constants.js";
 import { DEFAULT_SPAN_COLLAPSE } from "./services/collapse-repeated-spans.util.js";
 import { OperationTraceRegistry } from "./services/operation-trace.registry.js";
+import { TracerService } from "./services/tracer.service.js";
 import { fitToLength } from "./utils/fit-to-length.util.js";
 import { LogRedactor } from "./utils/log-redactor.js";
 
@@ -599,5 +609,58 @@ describe("createObserveModule#serviceId", () => {
     await expect(
       (fromClass as FactoryProvider).useFactory(new OptionsFactory()),
     ).resolves.toMatchObject({ serviceId: SENT });
+  });
+});
+
+/**
+ * Nest's async-local-storage recipe provides an application's own store under
+ * the `AsyncLocalStorage` class. The agent's store is provided under a token
+ * of its own, so neither takes the other's place.
+ */
+describe("createObserveModule#async store token", () => {
+  const credentials = { appKey: "key", appSecret: "secret", serviceId: "svc" };
+
+  it("leaves the AsyncLocalStorage class to the application", async () => {
+    const { ObserveModule } = createObserveModule();
+    const applicationStore = new AsyncLocalStorage<{ userId: string }>();
+
+    @Injectable()
+    class CurrentUser {
+      constructor(readonly store: AsyncLocalStorage<{ userId: string }>) {}
+      userId() {
+        return this.store.getStore()?.userId;
+      }
+    }
+    @Module({
+      providers: [
+        { provide: AsyncLocalStorage, useValue: applicationStore },
+        CurrentUser,
+      ],
+      exports: [CurrentUser],
+    })
+    class UsersModule {}
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [ObserveModule.forRoot(credentials), UsersModule],
+    }).compile();
+
+    const currentUser = moduleRef.get(CurrentUser);
+    expect(currentUser.store).toBe(applicationStore);
+    expect(
+      applicationStore.run({ userId: "alice" }, () => currentUser.userId()),
+    ).toBe("alice");
+
+    const agentStore = moduleRef.get(OBSERVE_ASYNC_LOCAL_STORAGE, {
+      strict: false,
+    });
+    expect(agentStore).toBeInstanceOf(AsyncLocalStorage);
+    expect(agentStore).not.toBe(applicationStore);
+    expect(
+      (
+        moduleRef.get(TracerService, { strict: false }) as unknown as {
+          als: unknown;
+        }
+      ).als,
+    ).toBe(agentStore);
   });
 });

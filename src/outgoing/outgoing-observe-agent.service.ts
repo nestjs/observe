@@ -8,7 +8,11 @@ import {
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
-import { OBSERVE_OPTIONS, TRACE_CONTEXT_KEY } from "../observe.constants.js";
+import {
+  OBSERVE_OPTIONS,
+  TRACE_CONTEXT_KEY,
+  OBSERVE_ASYNC_LOCAL_STORAGE,
+} from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import {
   loadAsResolvedBy,
@@ -109,6 +113,7 @@ export class OutgoingObserveAgentService implements OnApplicationShutdown {
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,
     operationTraceRegistry: OperationTraceRegistry,
+    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
     /**
      * Says whether the agent reports to NestJS Observe, which W3C Trace

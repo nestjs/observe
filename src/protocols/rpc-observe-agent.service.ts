@@ -13,6 +13,7 @@ import {
   OBSERVE_OPTIONS,
   TRACE_CONTEXT_KEY,
   TRACE_REGISTRY_KEY,
+  OBSERVE_ASYNC_LOCAL_STORAGE,
 } from "../observe.constants.js";
 import { readContextAccessor } from "../utils/context-accessor.util.js";
 import { handedOnTraceContext } from "../utils/trace-context.util.js";
@@ -153,6 +154,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
   private readonly grpcServers = new WeakSet<object>();
 
   constructor(
+    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly asyncLocalStorage: AsyncLocalStorage<
       Map<KeyOf<Store>, any>
     >,

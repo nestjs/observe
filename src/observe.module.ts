@@ -26,7 +26,11 @@ import {
   ObserveOptionsFactory,
   ObserveOptions,
 } from "./interfaces/observe-options.interface.js";
-import { CALLER_METADATA_KEY, OBSERVE_OPTIONS } from "./observe.constants.js";
+import {
+  CALLER_METADATA_KEY,
+  OBSERVE_ASYNC_LOCAL_STORAGE,
+  OBSERVE_OPTIONS,
+} from "./observe.constants.js";
 import { GraphQLObserveAgentService } from "./protocols/graphql-observe-agent.service.js";
 import {
   HttpObserveAgentService,
@@ -235,7 +239,7 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         ],
       },
       {
-        provide: AsyncLocalStorage,
+        provide: OBSERVE_ASYNC_LOCAL_STORAGE,
         useValue: asyncLocalStorage,
       },
       {
@@ -291,13 +295,14 @@ export function createObserveModule<Store extends Record<string, unknown>>(
       // A no-op unless `otlp` asks for export.
       OtlpTraceExporter,
     ],
-    exports: [AsyncLocalStorage, TracerService],
+    exports: [OBSERVE_ASYNC_LOCAL_STORAGE, TracerService],
   })
   class ObserveModule {
     readonly logger = new Logger(ObserveModule.name);
 
     constructor(
       readonly httpAdapterHost: HttpAdapterHost,
+      @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
       readonly asyncLocalStorage: AsyncLocalStorage<Map<KeyOf<Store>, any>>,
       @Inject(OBSERVE_OPTIONS)
       readonly options: ObserveModuleOptionsWithDefaults,
