@@ -118,8 +118,9 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
    */
   keptWithoutSpans?: true;
   /**
-   * How many errors `captureError` has recorded in full for this operation -
-   * see `MAX_CAPTURED_ERRORS_PER_TRACE`. Absent until the first.
+   * How many errors this operation has recorded in full, through
+   * `captureError` or on a failed root span - see
+   * `MAX_CAPTURED_ERRORS_PER_TRACE`. Absent until the first.
    */
   capturedErrors?: number;
   /**
@@ -131,15 +132,20 @@ type SnapshotWithSignal = (RequestSnapshot | JobSnapshot) & {
 };
 
 /**
- * Most errors `captureError` records in full for one operation, as many as
- * repeated siblings it takes to collapse a group (`spanCollapse.threshold`).
+ * Most errors one operation records in full, as many as repeated siblings it
+ * takes to collapse a group (`spanCollapse.threshold`) - through
+ * `captureError` and on failed root spans alike, from one budget.
  *
- * Building a payload redacts the whole message and the whole stack, which
- * repeats the message, so a handler reporting each rejected row of a client's
- * list paid rows x message length on the request thread - seconds for one
- * 100 kB body - and, captured on a span per row, kept every payload until the
- * flush. Past the limit a span is still marked as failed and its tags still
- * merge; it only goes without the details.
+ * Building a payload redacts the message and the stack, which repeats the
+ * message, so a handler reporting each rejected row of a client's list paid
+ * rows x message length on the request thread - seconds for one 100 kB body -
+ * and, captured on a span per row, kept every payload until the flush. A
+ * failed root span builds one too, and a trace has as many root spans as
+ * calls made outside a live caller: from an Observable a handler returned,
+ * from the resolvers of a GraphQL document that opens with a fragment. A
+ * call per element of the client's list, each failure caught, held hundreds
+ * of megabytes for one request. Past the limit a span is still marked as
+ * failed and its tags still merge; it only goes without the details.
  */
 const MAX_CAPTURED_ERRORS_PER_TRACE = 20;
 
@@ -173,6 +179,9 @@ const MAX_ERROR_STACK_LENGTH = 8 * 1024;
  */
 const ERROR_STACK_HEAD_LENGTH = 2 * 1024;
 const ERROR_TEXT_CUT = "... [truncated by observe]";
+/** How much of a cut stack's tail is kept: what its head leaves. */
+const ERROR_STACK_TAIL_LENGTH =
+  MAX_ERROR_STACK_LENGTH - ERROR_STACK_HEAD_LENGTH - ERROR_TEXT_CUT.length;
 
 /** The first `length` characters, not ending in half a surrogate pair. */
 function headOf(text: string, length: number): string {
@@ -212,22 +221,94 @@ function fitErrorStack(stack: string | undefined): string | undefined {
   if (typeof stack !== "string" || stack.length <= MAX_ERROR_STACK_LENGTH) {
     return stack;
   }
-  const tailLength =
-    MAX_ERROR_STACK_LENGTH - ERROR_STACK_HEAD_LENGTH - ERROR_TEXT_CUT.length;
-  let tailStart = stack.length - tailLength;
-  const line = stack.indexOf("\n", tailStart);
-  if (line !== -1) {
-    tailStart = line;
-  } else {
-    const first = stack.charCodeAt(tailStart);
-    if (first >= 0xdc00 && first <= 0xdfff) {
-      tailStart += 1;
-    }
-  }
   return copyOf(
     headOf(stack, ERROR_STACK_HEAD_LENGTH) +
       ERROR_TEXT_CUT +
-      stack.slice(tailStart),
+      stack.slice(tailStartOf(stack, stack.length - ERROR_STACK_TAIL_LENGTH)),
+  );
+}
+
+/**
+ * Where the kept tail of a stack starts, at or after `from`: on a line of its
+ * own where it can, and never on the second half of a surrogate pair.
+ */
+function tailStartOf(stack: string, from: number): number {
+  const line = stack.indexOf("\n", from);
+  if (line !== -1) {
+    return line;
+  }
+  const first = stack.charCodeAt(from);
+  return first >= 0xdc00 && first <= 0xdfff ? from + 1 : from;
+}
+
+/**
+ * How much more of an error's text the redactor is shown than is recorded,
+ * on each side of a cut made before it redacts.
+ *
+ * Redacting a whole message and stack cost as much as they were long - a
+ * message quoting a 100 kB request field, and the stack that repeats it -
+ * for a payload that keeps 4 kB and 8 kB of them. So text this much longer
+ * than what is kept is cut first, and redacted cut. A cut through a secret
+ * leaves pieces no rule recognises, though, and masking shortens the text in
+ * front of the cut - a long `token=AAAA…` becomes `token=[REDACTED]` - which
+ * can bring a piece into what is kept. The piece sits on the edge of the cut,
+ * so this much of the redacted text along that edge is dropped as well. A
+ * secret longer than this that a cut splits can still leave its start
+ * behind, as with the log forwarder's `REDACTION_LOOKAHEAD`.
+ */
+const ERROR_TEXT_LOOKAHEAD = 4 * 1024;
+
+type Redact = (text: string) => string;
+
+/** An error's message, redacted and cut to the most of it that is recorded. */
+function redactErrorMessage(message: string, redact: Redact): string {
+  const shown = MAX_ERROR_MESSAGE_LENGTH + ERROR_TEXT_LOOKAHEAD;
+  if (message.length <= shown) {
+    // Cut once redacted, so no rule is handed half of what it matches.
+    return fitErrorMessage(redact(message));
+  }
+  const redacted = redact(headOf(message, shown));
+  const kept = Math.min(
+    MAX_ERROR_MESSAGE_LENGTH - ERROR_TEXT_CUT.length,
+    redacted.length - ERROR_TEXT_LOOKAHEAD,
+  );
+  return copyOf(headOf(redacted, Math.max(0, kept)) + ERROR_TEXT_CUT);
+}
+
+/**
+ * An error's stack, redacted and cut to the most of it that is recorded - as
+ * `fitErrorStack` cuts it, from a head and a tail redacted apart when the
+ * stack is long enough to cut before redacting.
+ */
+function redactErrorStack(
+  stack: string | undefined,
+  redact: Redact,
+): string | undefined {
+  if (stack === undefined) {
+    return undefined;
+  }
+  if (stack.length <= MAX_ERROR_STACK_LENGTH + 2 * ERROR_TEXT_LOOKAHEAD) {
+    return fitErrorStack(redact(stack));
+  }
+  const head = redact(
+    headOf(stack, ERROR_STACK_HEAD_LENGTH + ERROR_TEXT_LOOKAHEAD),
+  );
+  let tailFrom = stack.length - ERROR_STACK_TAIL_LENGTH - ERROR_TEXT_LOOKAHEAD;
+  const first = stack.charCodeAt(tailFrom);
+  if (first >= 0xdc00 && first <= 0xdfff) {
+    tailFrom += 1;
+  }
+  const tail = redact(stack.slice(tailFrom));
+  const keptHead = Math.min(
+    ERROR_STACK_HEAD_LENGTH,
+    head.length - ERROR_TEXT_LOOKAHEAD,
+  );
+  const keptTail = tailStartOf(
+    tail,
+    Math.max(ERROR_TEXT_LOOKAHEAD, tail.length - ERROR_STACK_TAIL_LENGTH),
+  );
+  return copyOf(
+    headOf(head, Math.max(0, keptHead)) + ERROR_TEXT_CUT + tail.slice(keptTail),
   );
 }
 
@@ -520,19 +601,13 @@ export class OperationTraceRegistry {
         ? { message: toErrorText(error.message), stack: stackOf(error) }
         : { message: toErrorText(error), stack: undefined };
     // Redacted here, at the one point every error payload passes through.
-    const redacted = this.redactor
-      ? {
-          message: this.redactor.redactMessage(raw.message),
-          stack:
-            raw.stack === undefined
-              ? undefined
-              : this.redactor.redactMessage(raw.stack),
-        }
-      : raw;
-    // Cut once redacted, so no rule is handed half of what it matches.
+    const redactor = this.redactor;
+    const redact: Redact = redactor
+      ? (text) => redactor.redactMessage(text)
+      : (text) => text;
     const payload = {
-      message: fitErrorMessage(redacted.message),
-      stack: fitErrorStack(redacted.stack),
+      message: redactErrorMessage(raw.message, redact),
+      stack: redactErrorStack(raw.stack, redact),
     };
 
     const result: {
@@ -752,6 +827,12 @@ export class OperationTraceRegistry {
       // caught and answered, and recording it as the operation's put the
       // driver's message, bound values and all, in place of what the
       // application returned.
+      //
+      // The first whose details were kept: past `MAX_CAPTURED_ERRORS_PER_TRACE`
+      // a root span is marked as failed without them, and root spans are
+      // listed in the order they started, not the order they failed. One that
+      // failed without them still says the operation did, so an outgoing
+      // call's error is not taken in its place.
       let outgoing: (typeof snapshot.traces)[number] | undefined;
       let found = false;
       for (const trace of snapshot.traces) {
@@ -759,14 +840,16 @@ export class OperationTraceRegistry {
           continue;
         }
         if (this.failedOutgoingRoots.has(trace)) {
-          outgoing ??= trace;
+          if (typeof trace.error === "object") {
+            outgoing ??= trace;
+          }
           continue;
         }
+        found = true;
         if (typeof trace.error === "object") {
           snapshot.error = trace.error;
+          break;
         }
-        found = true;
-        break;
       }
       if (
         !found &&
@@ -1057,11 +1140,18 @@ export class OperationTraceRegistry {
       }
       if (isRootSpan) {
         // A root span keeps the error's details: it may become the
-        // operation's own.
-        if (typeof error === "object") {
-          activeTrace.error = this.toErrorPayload(error);
-        } else {
+        // operation's own. Out of the budget `captureError` draws on, since
+        // a trace can have a root span per call - see
+        // `MAX_CAPTURED_ERRORS_PER_TRACE`.
+        const captured = snapshot.capturedErrors ?? 0;
+        if (typeof error !== "object") {
           activeTrace.error = true;
+        } else if (captured >= MAX_CAPTURED_ERRORS_PER_TRACE) {
+          activeTrace.error = true;
+          this.reportCapturedErrorLimit(snapshot.traceId);
+        } else {
+          snapshot.capturedErrors = captured + 1;
+          activeTrace.error = this.toErrorPayload(error);
         }
       } else {
         activeTrace.error = true;
@@ -1229,7 +1319,7 @@ export class OperationTraceRegistry {
     }
     this.hasReportedCapturedErrorLimit = true;
     this.logger.warn(
-      `Trace "${reportedTraceId}" captured more than ${MAX_CAPTURED_ERRORS_PER_TRACE} errors; the spans of later ones are marked as failed, without the error's details. Later traces past this limit are not reported.`,
+      `Trace "${reportedTraceId}" recorded more than ${MAX_CAPTURED_ERRORS_PER_TRACE} errors; the spans of later ones are marked as failed, without the error's details. Later traces past this limit are not reported.`,
     );
   }
 

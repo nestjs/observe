@@ -600,6 +600,24 @@ describe("OperationTraceRegistry", () => {
   });
 
   describe("errors", () => {
+    /** A root span per call, as calls made outside a live caller are. */
+    const failRootSpan = (traceId: string, error: Error | string) => {
+      const spanId = registry.internalStartTraceStep(
+        traceId,
+        "PriceService",
+        "find",
+        undefined,
+      );
+      registry.internalEndTraceStep(
+        traceId,
+        spanId,
+        "PriceService",
+        "find",
+        spanId,
+        error,
+      );
+    };
+
     it("attaches an error payload to the root span", async () => {
       startRequest("e1");
       const spanId = registry.internalStartTraceStep(
@@ -805,6 +823,84 @@ describe("OperationTraceRegistry", () => {
       );
     });
 
+    it("redacts no more of a long message and stack than it records, and a little past", async () => {
+      const redactor = new LogRedactor();
+      const redact = vi.spyOn(redactor, "redactMessage");
+      registry.configureRedaction(redactor);
+      startRequest("e-long-redacted");
+
+      failRootSpan(
+        "e-long-redacted",
+        new Error(`No product with sku ${"x".repeat(100_000)}`),
+      );
+      registry.endTrace("e-long-redacted", { statusCode: 404 });
+
+      const lengths = redact.mock.calls.map(([text]) => text.length);
+      expect(lengths.length).toBeGreaterThan(0);
+      expect(Math.max(...lengths)).toBeLessThanOrEqual(16 * 1024);
+      const snapshot = await registry.pluckSnapshot("e-long-redacted");
+      const recorded = snapshot!.error as { message: string; stack: string };
+      expect(recorded.message.length).toBeLessThanOrEqual(4 * 1024);
+      expect(recorded.message.startsWith("No product with sku xxx")).toBe(true);
+      expect(recorded.stack.length).toBeLessThanOrEqual(8 * 1024);
+      expect(recorded.stack).toContain("\n    at ");
+    });
+
+    describe("a secret that a cut before redacting splits", () => {
+      // Masking the long token in front shortens the text by more than is
+      // kept of it, which would bring the piece of the split secret - one no
+      // rule recognises - into what is recorded.
+      const secret = "SECRET-12345678";
+      const masked = `MASK_${"A".repeat(6_000)}`;
+      const textSplittingAt = (cut: number) => {
+        const prefix = `${masked} `;
+        const head = `${prefix}${"x".repeat(cut - prefix.length - 11)}`;
+        return `${head}${secret}${"y".repeat(50_000)}`;
+      };
+
+      beforeEach(() => {
+        registry.configureRedaction(
+          new LogRedactor({
+            useDefaultPatterns: false,
+            patterns: [/MASK_A+/, /SECRET-\d{8}/],
+          }),
+        );
+      });
+
+      it("records none of it from the message", async () => {
+        startRequest("e-split-message");
+        // Cut 8 kB in, before redacting.
+        failRootSpan("e-split-message", new Error(textSplittingAt(8 * 1024)));
+        registry.endTrace("e-split-message");
+
+        const snapshot = await registry.pluckSnapshot("e-split-message");
+        const recorded = snapshot!.error as { message: string; stack: string };
+        expect(recorded.message).not.toContain("SECRET-");
+        expect(recorded.message).not.toContain("MASK_");
+        expect(recorded.message.endsWith("... [truncated by observe]")).toBe(
+          true,
+        );
+        expect(recorded.stack).not.toContain("SECRET-");
+      });
+
+      it("records none of it from the stack", async () => {
+        startRequest("e-split-stack");
+        const error = new Error("Import failed");
+        // Cut 6 kB in, before redacting.
+        error.stack = `${textSplittingAt(6 * 1024)}\n    at ImportService.run (/app/import.service.ts:4:11)`;
+        failRootSpan("e-split-stack", error);
+        registry.endTrace("e-split-stack");
+
+        const snapshot = await registry.pluckSnapshot("e-split-stack");
+        const recorded = snapshot!.error as { stack: string };
+        expect(recorded.stack).not.toContain("SECRET-");
+        expect(recorded.stack).not.toContain("MASK_");
+        expect(recorded.stack).toContain(
+          "\n    at ImportService.run (/app/import.service.ts:4:11)",
+        );
+      });
+    });
+
     describe("an error that cannot be read as text", () => {
       it("is captured rather than thrown back at the caller", async () => {
         startRequest("e-reply");
@@ -1000,6 +1096,167 @@ describe("OperationTraceRegistry", () => {
         expect(rows[20].error).toBe(true);
         expect(rows[24].error).toBe(true);
       });
+
+      it("builds the details of at most 20 failed root spans", async () => {
+        const redact = countRedactions();
+        const warn = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "warn")
+          .mockImplementation(() => undefined);
+        startRequest("e-roots");
+
+        // A resolver selected through a fragment opens no span of its own,
+        // so each provider call it makes - one per element of the client's
+        // list, each failure caught - is a root span.
+        for (let call = 0; call < 1_000; call++) {
+          failRootSpan("e-roots", new Error(`No price ${call}`));
+        }
+        registry.endTrace("e-roots", { statusCode: 200 });
+
+        expect(redact).toHaveBeenCalledTimes(40);
+        expect(warn).toHaveBeenCalledOnce();
+        const snapshot = await registry.pluckSnapshot("e-roots");
+        const errors = snapshot!.traces.map((span) => span.error);
+        expect(errors).toHaveLength(1_000);
+        expect(
+          errors.filter((error) => typeof error === "object"),
+        ).toHaveLength(20);
+        expect(errors.slice(20).every((error) => error === true)).toBe(true);
+        expect(snapshot!.error).toMatchObject({ message: "No price 0" });
+        expect(snapshot).not.toHaveProperty("capturedErrors");
+      });
+
+      it("draws on the budget captureError spent", async () => {
+        vi.spyOn(
+          (registry as unknown as { logger: Logger }).logger,
+          "warn",
+        ).mockImplementation(() => undefined);
+        startRequest("e-shared");
+        const root = registry.internalStartTraceStep(
+          "e-shared",
+          "ImportService",
+          "import",
+          undefined,
+        );
+        for (let row = 0; row < 20; row++) {
+          registry.captureError(
+            "e-shared",
+            root,
+            new Error(`row ${row} rejected`),
+            {},
+          );
+        }
+        // The root span already holds the details of one, and keeps them.
+        registry.internalEndTraceStep(
+          "e-shared",
+          root,
+          "ImportService",
+          "import",
+          root,
+          new Error("import failed"),
+        );
+        failRootSpan("e-shared", new Error("No price"));
+        registry.endTrace("e-shared");
+
+        const snapshot = await registry.pluckSnapshot("e-shared");
+        expect(snapshot!.traces[0].error).toMatchObject({
+          message: "row 19 rejected",
+        });
+        expect(snapshot!.traces[1].error).toBe(true);
+      });
+
+      it("reports the operation without details once the budget is spent on nested spans", async () => {
+        vi.spyOn(
+          (registry as unknown as { logger: Logger }).logger,
+          "warn",
+        ).mockImplementation(() => undefined);
+        startRequest("e-spent");
+        const root = registry.internalStartTraceStep(
+          "e-spent",
+          "ImportService",
+          "import",
+          undefined,
+        );
+        for (let row = 0; row < 20; row++) {
+          const spanId = registry.internalStartTraceStep(
+            "e-spent",
+            "ImportService",
+            "importRow",
+            root,
+          );
+          registry.captureError(
+            "e-spent",
+            spanId,
+            new Error(`row ${row} rejected`),
+            {},
+          );
+          registry.internalEndTraceStep(
+            "e-spent",
+            spanId,
+            "ImportService",
+            "importRow",
+            spanId,
+          );
+        }
+        registry.internalEndTraceStep(
+          "e-spent",
+          root,
+          "ImportService",
+          "import",
+          root,
+          new Error("import failed"),
+        );
+        registry.endTrace("e-spent");
+
+        const snapshot = (await registry.pluckSnapshot(
+          "e-spent",
+        )) as RequestSnapshot;
+        expect(snapshot.traces[0].error).toBe(true);
+        // Still a failure, by the status the root span's error gives it.
+        expect(snapshot.attributes?.statusCode).toBe(500);
+        expect(snapshot).not.toHaveProperty("error");
+      });
+
+      it("reports a root span's details when the first to start failed past the limit", async () => {
+        vi.spyOn(
+          (registry as unknown as { logger: Logger }).logger,
+          "warn",
+        ).mockImplementation(() => undefined);
+        startRequest("e-late");
+        // Started first and failed last, as concurrent calls may.
+        const first = registry.internalStartTraceStep(
+          "e-late",
+          "PriceService",
+          "find",
+          undefined,
+        );
+        for (let call = 0; call < 20; call++) {
+          failRootSpan("e-late", new Error(`No price ${call}`));
+        }
+        registry.internalEndTraceStep(
+          "e-late",
+          first,
+          "PriceService",
+          "find",
+          first,
+          new Error("No price, late"),
+        );
+        registry.endTrace("e-late");
+
+        const snapshot = await registry.pluckSnapshot("e-late");
+        expect(snapshot!.traces[0].error).toBe(true);
+        expect(snapshot!.error).toMatchObject({ message: "No price 0" });
+      });
+    });
+
+    it("reports the details of a root span after one that threw a primitive", async () => {
+      startRequest("e-primitive");
+      failRootSpan("e-primitive", "just a string");
+      failRootSpan("e-primitive", new Error("No price"));
+      registry.endTrace("e-primitive");
+
+      const snapshot = await registry.pluckSnapshot("e-primitive");
+      expect(snapshot!.traces[0].error).toBe(true);
+      expect(snapshot!.error).toMatchObject({ message: "No price" });
     });
 
     it("ignores a capture against an unknown trace", () => {
