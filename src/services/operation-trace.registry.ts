@@ -1414,26 +1414,33 @@ export class OperationTraceRegistry {
         this.traceSnapshots.delete(traceId);
       };
 
-      // Ensure snapshot is complete by checking refsCounter vs refsMarkedAsComplete
-      if (snapshot.refsCounter > snapshot.refsMarkedAsComplete) {
-        this.awaitingCompletion += 1;
-        try {
-          await new Promise((resolve) =>
-            setTimeout(resolve, SNAPSHOT_COMPLETION_TIMEOUT_MS),
-          );
-        } finally {
-          this.awaitingCompletion -= 1;
-        }
+      // Cleaned up whatever happens on the way: a trace left registered once
+      // its operation has ended is never plucked again, and holds its spans
+      // and error payloads for the life of the process - a logger that
+      // throws on the warning below was enough.
+      try {
+        // Ensure snapshot is complete by checking refsCounter vs refsMarkedAsComplete
         if (snapshot.refsCounter > snapshot.refsMarkedAsComplete) {
-          // Shipped without the spans still open rather than not at all: the
-          // operation itself finished, and dropping it lost its status and
-          // error along with every span that did end. Read before cleanup,
-          // which takes the span map the warning names them from.
-          this.reportUnfinishedSpans(traceId, snapshot);
-          this.leaveOutUnfinishedSpans(snapshot);
+          this.awaitingCompletion += 1;
+          try {
+            await new Promise((resolve) =>
+              setTimeout(resolve, SNAPSHOT_COMPLETION_TIMEOUT_MS),
+            );
+          } finally {
+            this.awaitingCompletion -= 1;
+          }
+          if (snapshot.refsCounter > snapshot.refsMarkedAsComplete) {
+            // Shipped without the spans still open rather than not at all:
+            // the operation itself finished, and dropping it lost its status
+            // and error along with every span that did end. Read before
+            // cleanup, which takes the span map the warning names them from.
+            this.reportUnfinishedSpans(traceId, snapshot);
+            this.leaveOutUnfinishedSpans(snapshot);
+          }
         }
+      } finally {
+        cleanup();
       }
-      cleanup();
 
       // These are what distinguish the registry's working copy from the
       // snapshot the API receives, so removing them is the hand-off.

@@ -2657,6 +2657,24 @@ describe("OperationTraceRegistry", () => {
       expect(registry.getActiveSpan("i2", "anything")).toBeUndefined();
     }, 10_000);
 
+    it("does not leak the trace when shipping it without its open spans throws", async () => {
+      // A logger of the application's that throws on the warning.
+      vi.spyOn(
+        (registry as unknown as { logger: Logger }).logger,
+        "warn",
+      ).mockImplementation(() => {
+        throw new Error("log transport down");
+      });
+      startRequest("i-throws");
+      registry.internalStartTraceStep("i-throws", "Svc", "leaked", undefined);
+      registry.endTrace("i-throws");
+
+      await expect(registry.pluckSnapshot("i-throws")).rejects.toThrow(
+        "log transport down",
+      );
+      expect(registry.hasTrace("i-throws")).toBe(false);
+    }, 10_000);
+
     it("warns once, not per span, when a trace ships without a span that outlived it", async () => {
       const logger = (registry as unknown as { logger: Logger }).logger;
       const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
