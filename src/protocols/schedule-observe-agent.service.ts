@@ -6,10 +6,7 @@ import {
   JobSnapshot,
   ObserveModuleOptionsWithDefaults,
 } from "../interfaces/index.js";
-import {
-  OBSERVE_OPTIONS,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
-} from "../observe.constants.js";
+import { OBSERVE_OPTIONS } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
 import {
@@ -84,7 +81,6 @@ export class ScheduleObserveAgentService<
     @Inject(OBSERVE_OPTIONS)
     options: ObserveModuleOptionsWithDefaults,
     operationTraceRegistry: OperationTraceRegistry,
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     asyncLocalStorage: AsyncLocalStorage<Map<KeyOf<Store>, any>>,
   ) {
     this.runner = new JobTraceRunner(

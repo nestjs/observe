@@ -1,14 +1,4 @@
 export const OBSERVE_OPTIONS = "OBSERVE_OPTIONS";
-/**
- * The token the agent's own `AsyncLocalStorage` is provided under. Not the
- * `AsyncLocalStorage` class: an application that provides its own store
- * under the class, as the Nest recipe does, would otherwise have the agent's
- * shadow it in every module once `ObserveModule` is imported, or hand the
- * agent its store in place of the agent's own.
- */
-export const OBSERVE_ASYNC_LOCAL_STORAGE = Symbol(
-  "OBSERVE_ASYNC_LOCAL_STORAGE",
-);
 export const CALLER_METADATA_KEY = "#caller";
 
 /**

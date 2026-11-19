@@ -15,10 +15,7 @@ import { sendsToObserve } from "../agent/observe-reporting.util.js";
 import type { JobSnapshot } from "../interfaces/job-snapshot.interface.js";
 import type { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import type { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
-import {
-  OBSERVE_OPTIONS,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
-} from "../observe.constants.js";
+import { OBSERVE_OPTIONS } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { readSdkVersion } from "../utils/sdk-version.util.js";
 import {
@@ -217,7 +214,6 @@ export class OtlpTraceExporter implements OnModuleInit, OnApplicationShutdown {
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,
     private readonly operationTraceRegistry: OperationTraceRegistry,
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly asyncLocalStorage: AsyncLocalStorage<Map<any, any>>,
   ) {
     if (!options.otlp) {

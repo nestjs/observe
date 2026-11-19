@@ -20,7 +20,6 @@ import {
 import { Metadata } from "@grpc/grpc-js";
 import { firstValueFrom, map, Observable } from "rxjs";
 import request from "supertest";
-import { OBSERVE_ASYNC_LOCAL_STORAGE } from "../observe.constants.js";
 import { createObserveModule } from "../observe.module.js";
 import {
   CollectedSnapshots,
@@ -189,9 +188,8 @@ describe("ObserveModule: a trace from HTTP into a gRPC service", () => {
     // all of them from the callback that continues the first one's
     // connection attempt: every reply came back in the first caller's
     // context, and what the others chained onto it ran under its trace id.
-    const als = apiApp.get<AsyncLocalStorage<Map<string, unknown>>>(
-      OBSERVE_ASYNC_LOCAL_STORAGE,
-    );
+    const als =
+      apiApp.get<AsyncLocalStorage<Map<string, unknown>>>(AsyncLocalStorage);
     const { orders: idle } = apiApp.get(IdleChannelController);
 
     const seen = await Promise.all(

@@ -20,7 +20,6 @@ import {
   CALLER_METADATA_KEY,
   OBSERVE_OPTIONS,
   TRACE_REGISTRY_KEY,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
 } from "../observe.constants.js";
 import { liveTraceId } from "../utils/operation-state.util.js";
 
@@ -162,7 +161,6 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,
     private readonly observeAgentSharedBuffer: ObserveAgentSharedBuffer,
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly als: AsyncLocalStorage<Map<string, any>>,
   ) {
     this.redactor =

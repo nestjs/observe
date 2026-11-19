@@ -12,7 +12,6 @@ import {
   CALLER_METADATA_KEY,
   OBSERVE_OPTIONS,
   TRACE_REGISTRY_KEY,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
@@ -203,7 +202,6 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
   >();
 
   constructor(
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly asyncLocalStorage: AsyncLocalStorage<
       Map<KeyOf<Store>, any>
     >,

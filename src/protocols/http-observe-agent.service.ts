@@ -20,7 +20,6 @@ import {
   OBSERVE_OPTIONS,
   TRACE_CONTEXT_KEY,
   TRACE_REGISTRY_KEY,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
@@ -140,7 +139,6 @@ export class HttpObserveAgentService<Store extends Record<string, unknown>>
 
   constructor(
     private readonly httpAdapterHost: HttpAdapterHost,
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly asyncLocalStorage: AsyncLocalStorage<
       Map<KeyOf<Store>, any>
     >,

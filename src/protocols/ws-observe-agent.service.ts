@@ -7,10 +7,7 @@ import {
   RequestSnapshot,
   WsMessageContext,
 } from "../interfaces/index.js";
-import {
-  OBSERVE_OPTIONS,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
-} from "../observe.constants.js";
+import { OBSERVE_OPTIONS } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TraceSamplerService } from "../services/trace-sampler.service.js";
 import { KeyOf } from "../types/key-of.type.js";
@@ -106,7 +103,6 @@ export class WsObserveAgentService<Store extends Record<string, unknown>> {
     private readonly options: ObserveModuleOptionsWithDefaults,
     private readonly operationTraceRegistry: OperationTraceRegistry,
     private readonly traceSamplerService: TraceSamplerService,
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly asyncLocalStorage: AsyncLocalStorage<
       Map<KeyOf<Store>, any>
     >,

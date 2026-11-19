@@ -8,10 +8,7 @@ import {
 } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
-import {
-  OBSERVE_OPTIONS,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
-} from "../observe.constants.js";
+import { OBSERVE_OPTIONS } from "../observe.constants.js";
 import { liveTraceId } from "../utils/operation-state.util.js";
 
 @Injectable()
@@ -20,7 +17,6 @@ export class LoggerPatcherService implements OnModuleInit {
   private readonly patchedWatermark = Symbol("observe:logger_patched");
 
   constructor(
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly asyncLocalStorage: AsyncLocalStorage<any>,
     @Inject(OBSERVE_OPTIONS)
     private readonly options: ObserveModuleOptionsWithDefaults,

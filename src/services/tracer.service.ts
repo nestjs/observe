@@ -11,7 +11,6 @@ import {
   CALLER_METADATA_KEY,
   OBSERVE_OPTIONS,
   TRACE_REGISTRY_KEY,
-  OBSERVE_ASYNC_LOCAL_STORAGE,
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { liveTraceId } from "../utils/operation-state.util.js";
@@ -58,7 +57,6 @@ export class TracerService<
 
   constructor(
     private readonly operationTraceRegistry: OperationTraceRegistry,
-    @Inject(OBSERVE_ASYNC_LOCAL_STORAGE)
     private readonly als: AsyncLocalStorage<
       Map<string | symbol | TraceKey, any>
     >,
