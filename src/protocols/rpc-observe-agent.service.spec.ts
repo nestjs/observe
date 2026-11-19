@@ -828,7 +828,10 @@ describe("RpcObserveAgentService", () => {
       vi.spyOn(Logger.prototype, "error").mockImplementation(() => {});
     });
 
-    function createGrpcServer() {
+    function createGrpcServer(
+      /** Run on the server once the agent has hooked it. */
+      after?: (server: ServerGrpc) => void,
+    ) {
       const als = new AsyncLocalStorage<Map<string, any>>();
       const registry = new OperationTraceRegistry(als as never, false);
       const streamOptions: ObserveModuleOptionsWithDefaults = {
@@ -868,6 +871,11 @@ describe("RpcObserveAgentService", () => {
       );
       const server = new ServerGrpc({ package: "test", protoPath: "test" });
       agent.registerRpcHooks(server as never);
+      after?.(server);
+      const decorate = createInstanceDecorator(als, registry, {
+        traceIdKey: streamOptions.traceIdKey,
+        skipInstrumentation: () => false,
+      });
       /** The method grpc-js would run for each call of a handler. */
       const methodFor = (
         handler: (...args: any[]) => unknown,
@@ -886,7 +894,19 @@ describe("RpcObserveAgentService", () => {
           { requestStream: true, responseStream: true },
           streamType,
         );
-      return { als, registry, tracer, snapshots, methodFor };
+      /** How many traces the registry holds open. */
+      const openTraces = () =>
+        (registry as unknown as { traceSnapshots: Map<string, unknown> })
+          .traceSnapshots.size;
+      return {
+        als,
+        registry,
+        tracer,
+        snapshots,
+        methodFor,
+        decorate,
+        openTraces,
+      };
     }
 
     /** Lets grpc-js's callback for a later message run, in no store. */
@@ -977,6 +997,109 @@ describe("RpcObserveAgentService", () => {
         ["b", "b"],
         ["a", "a"],
       ]);
+    });
+
+    /** What grpc-js does to a call on a deadline or a client's cancellation. */
+    const cancel = (call: FakeCall) => {
+      call.cancelled = true;
+      call.emit("cancelled", "cancelled");
+      call.destroy();
+    };
+
+    it("drops the trace of a @GrpcStreamCall call cancelled while its handler waits for the end", async () => {
+      const { decorate, methodFor, openTraces, snapshots } = createGrpcServer();
+      const uploads = decorate({
+        async upload(call: FakeCall) {
+          await new Promise((resolve, reject) => {
+            call.on("end", resolve);
+            call.on("error", reject);
+          });
+        },
+      });
+      const call = new FakeCall();
+      void methodFor(function Upload(stream: FakeCall) {
+        return uploads.upload(stream);
+      }, GrpcMethodStreamingType.PT_STREAMING)(call);
+      await later();
+      expect(openTraces()).toBe(1);
+
+      cancel(call);
+      // A turn for the handler to settle on `cancelled` first.
+      expect(openTraces()).toBe(1);
+      await later();
+      await later();
+
+      expect(openTraces()).toBe(0);
+      expect(snapshots).toEqual([]);
+    });
+
+    it("reports a @GrpcStreamCall call whose handler settles on cancelled", async () => {
+      const { decorate, methodFor, openTraces, snapshots } = createGrpcServer();
+      const uploads = decorate({
+        async upload(call: FakeCall) {
+          await new Promise((resolve) => call.once("cancelled", resolve));
+        },
+      });
+      const call = new FakeCall();
+      void methodFor(function Upload(stream: FakeCall) {
+        return uploads.upload(stream);
+      }, GrpcMethodStreamingType.PT_STREAMING)(call);
+      await later();
+
+      cancel(call);
+      await waitFor(() => snapshots.length === 1, 2000, "the upload");
+
+      expect(snapshots[0].operationId).toBe("Upload");
+      expect(openTraces()).toBe(0);
+    });
+
+    it("drops the trace of a @GrpcStreamCall call cancelled before an application's start hook let it through", async () => {
+      let letThrough!: () => void;
+      const { decorate, methodFor, openTraces } = createGrpcServer((server) =>
+        server.setOnProcessingStartHook((_transportId, _ctx, done) => {
+          letThrough = () => void done();
+          return undefined;
+        }),
+      );
+      const uploads = decorate({
+        async upload(call: FakeCall) {
+          await new Promise((resolve) => call.on("end", resolve));
+        },
+      });
+      const call = new FakeCall();
+      void methodFor(function Upload(stream: FakeCall) {
+        return uploads.upload(stream);
+      }, GrpcMethodStreamingType.PT_STREAMING)(call);
+
+      cancel(call);
+      letThrough();
+      expect(openTraces()).toBe(1);
+      await later();
+      await later();
+
+      expect(openTraces()).toBe(0);
+    });
+
+    it("leaves a cancelled @GrpcStreamMethod call to Nest's end hook", async () => {
+      const { registry, decorate, methodFor } = createGrpcServer();
+      const abandonTrace = vi.spyOn(registry, "abandonTrace");
+      const orders = decorate({
+        track(messages: Observable<{ id: string }>) {
+          return messages;
+        },
+      });
+      const call = new FakeCall();
+      void methodFor(function Track(messages: Observable<{ id: string }>) {
+        return orders.track(messages);
+      }, GrpcMethodStreamingType.RX_STREAMING)(call);
+      await later();
+
+      cancel(call);
+      for (let turn = 0; turn < 5; turn++) {
+        await later();
+      }
+
+      expect(abandonTrace).not.toHaveBeenCalled();
     });
 
     it("leaves an event emitted from inside the call in the context it has", async () => {

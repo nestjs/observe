@@ -51,6 +51,7 @@ type Microservices = Pick<
   | "RedisContext"
   | "RmqContext"
   | "TcpContext"
+  | "GrpcMethodStreamingType"
 >;
 
 interface GrpcCall<TRequest = any, TMetadata = any> {
@@ -65,7 +66,19 @@ interface GrpcCall<TRequest = any, TMetadata = any> {
  */
 interface GrpcServerCall {
   metadata?: unknown;
+  cancelled?: boolean;
   emit: (event: string | symbol, ...args: unknown[]) => boolean;
+  once?: (event: string, listener: () => void) => unknown;
+}
+
+/** A call `rememberGrpcCalls` noted, and how its handler takes it. */
+interface RememberedGrpcCall {
+  call: GrpcServerCall;
+  /**
+   * Handed to a `@GrpcStreamCall` handler, which Nest waits on for good when
+   * the call is cancelled - see `dropTraceOnCancel`.
+   */
+  streamCall: boolean;
 }
 
 /**
@@ -119,7 +132,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
    * The gRPC calls of a request stream, by their metadata - see
    * `rememberGrpcCalls`.
    */
-  private readonly grpcCalls = new WeakMap<object, GrpcServerCall>();
+  private readonly grpcCalls = new WeakMap<object, RememberedGrpcCall>();
 
   /** The gRPC servers whose calls `rememberGrpcCalls` already notes. */
   private readonly grpcServers = new WeakSet<object>();
@@ -261,6 +274,8 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
     }
     this.grpcServers.add(target);
     const calls = this.grpcCalls;
+    const passThrough =
+      this.microservices!.GrpcMethodStreamingType.PT_STREAMING;
     server.createServiceMethod = function (
       this: unknown,
       methodHandler,
@@ -276,10 +291,11 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       if (!protoNativeHandler?.requestStream || typeof method !== "function") {
         return method;
       }
+      const streamCall = streamType === passThrough;
       return function (this: unknown, call: unknown, ...rest: unknown[]) {
         const metadata = (call as { metadata?: unknown } | null)?.metadata;
         if (typeof metadata === "object" && metadata !== null) {
-          calls.set(metadata, call as GrpcServerCall);
+          calls.set(metadata, { call: call as GrpcServerCall, streamCall });
         }
         return (method as (...args: unknown[]) => unknown).call(
           this,
@@ -288,6 +304,57 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
         );
       };
     };
+  }
+
+  /** The call `ctx` is a copy of, if `rememberGrpcCalls` noted it. */
+  private takeGrpcCall(ctx: GrpcCall): RememberedGrpcCall | undefined {
+    const metadata: unknown = ctx?.metadata;
+    if (typeof metadata !== "object" || metadata === null) {
+      return undefined;
+    }
+    const remembered = this.grpcCalls.get(metadata);
+    this.grpcCalls.delete(metadata);
+    return remembered;
+  }
+
+  /**
+   * Drops the trace of a `@GrpcStreamCall` call that is cancelled while its
+   * handler is still running, as the HTTP agent drops an aborted request's.
+   *
+   * Nest ends a call's operation when its handler settles, and for a
+   * `@GrpcStreamCall` handler it waits on that alone. On a deadline or a
+   * client's cancellation grpc-js emits `cancelled` and destroys the stream,
+   * with no `end` and no `error`, so a handler that waits for either never
+   * settles: its trace stayed in the registry for the life of the process,
+   * one per call, and was never reported. Unary and `@GrpcStreamMethod` calls
+   * are left to Nest, which ends them on `cancelled` itself.
+   *
+   * Dropped a turn after `cancelled`, not at once: a handler that settles on
+   * it is ended by Nest, from microtasks, before then, and reported as ever.
+   * One that settles later outlived its client, and the registry already
+   * lets it end its spans on a trace that is gone.
+   */
+  private dropTraceOnCancel(
+    call: GrpcServerCall,
+    operation: OperationState,
+    registryKey: string,
+  ): void {
+    const drop = () => {
+      setImmediate(() => {
+        if (operation.endedAt !== undefined) {
+          // Nest's end hook ran: ended and reported, or on its way.
+          return;
+        }
+        endOperation(operation);
+        this.operationTraceRegistry.abandonTrace(registryKey);
+      });
+    };
+    if (call.cancelled === true) {
+      // Cancelled before an application's start hook let the call through.
+      drop();
+      return;
+    }
+    call.once?.("cancelled", drop);
   }
 
   /**
@@ -308,19 +375,13 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
    * the call's key.
    */
   private emitCallEventsInStore(
-    ctx: GrpcCall,
+    call: GrpcServerCall,
     store: Map<KeyOf<Store>, any>,
     registryKey: string,
   ): void {
-    const metadata: unknown = ctx?.metadata;
-    if (typeof metadata !== "object" || metadata === null) {
+    if (typeof call.emit !== "function") {
       return;
     }
-    const call = this.grpcCalls.get(metadata);
-    if (typeof call?.emit !== "function") {
-      return;
-    }
-    this.grpcCalls.delete(metadata);
     const asyncLocalStorage = this.asyncLocalStorage;
     const emit = call.emit;
     call.emit = function (this: unknown, ...args) {
@@ -474,8 +535,14 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       const operation = openOperation(store);
       this.rememberOperation(call, operation);
       this.rememberOperation(call?.request, operation);
-      // Recorded or not: `TracerService` needs the store either way.
-      this.emitCallEventsInStore(call, store, registryKey);
+      const grpcCall = this.takeGrpcCall(call);
+      if (grpcCall) {
+        // Recorded or not: `TracerService` needs the store either way.
+        this.emitCallEventsInStore(grpcCall.call, store, registryKey);
+        if (grpcCall.streamCall) {
+          this.dropTraceOnCancel(grpcCall.call, operation, registryKey);
+        }
+      }
 
       // As for a message: the call's span goes under the caller's for `otlp`,
       // and the calls the handler makes carry its decision on. Read now, while
