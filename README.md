@@ -446,6 +446,15 @@ Several of the places the agent hooks into hold one hook each: GraphQL's `Resolv
 
 Set those after instead: on `app.getHttpAdapter()` before `listen()`, on `app.getTransportServer()`, or on the injected client from a provider.
 
+### Guards and the handler they are handed
+
+With `instrument: ObserveInstrument`, the controller and gateway methods Nest routes to are the agent's traced stand-ins for your methods, so `context.getHandler()` in a guard or interceptor returns the stand-in, not `MyController.prototype.method`. The stand-in carries the method's name and a copy of its metadata, taken when Nest registers the route. Reading that metadata through `Reflector`, as Nest's documentation does (`SetMetadata`, `Reflector.createDecorator()`), works the same with the agent as without it. Two things do not:
+
+- **Looking a handler up by the function itself**: a `WeakMap` or `Map` keyed by the decorated method, or an `===` comparison with it. The stand-in is another function, so the lookup misses.
+- **Metadata defined or changed after the route is registered**, in `onModuleInit` or at run time. The copy predates it.
+
+A guard that treats such a miss as "no restriction" lets the request through. Keep what a guard reads on the method as metadata, defined by a decorator, and read it with `Reflector`. Where that is not possible, return `true` from `skipInstrumentation` for that controller or gateway, so it is left as it is.
+
 ## Capturing failed and slow requests
 
 The inputs behind a failing request are usually the fastest way to reproduce it. The agent keeps them only for the requests worth it - never for ordinary traffic:
