@@ -108,11 +108,21 @@ export class LoggerPatcherService implements OnModuleInit {
       // it, the id lands on a line of its own - which the stdout forwarder
       // then ships as a separate, level-less entry, and the parser (which
       // reads the id off the end of the log line) never sees it.
+      //
+      // Before the first newline, not the last: a record can run to several
+      // lines - an error is its message and then its stack - and only the
+      // first carries the prefix the parser reads an id from. Put after the
+      // stack, the id was on no line that is read, and the first line ended
+      // with the error's message - whose own last words, `Trace ID: <id>`
+      // from a client's value, then named the trace the line was filed under.
       const [logLevel] = args;
       const suffix = `   Trace ID: ${this.colorize(requestId, logLevel)}`;
-      return output.endsWith("\n")
-        ? `${output.slice(0, -1)}${suffix}\n`
-        : `${output}${suffix}`;
+      const newline = output.indexOf("\n");
+      if (newline === -1) {
+        return `${output}${suffix}`;
+      }
+      const lineEnd = output[newline - 1] === "\r" ? newline - 1 : newline;
+      return `${output.slice(0, lineEnd)}${suffix}${output.slice(lineEnd)}`;
     };
 
     // Add watermark to flag that the logger has been patched

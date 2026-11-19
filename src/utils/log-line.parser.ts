@@ -27,6 +27,14 @@ export interface ParsedLogLine {
    */
   unsplit?: string;
   traceId?: string;
+  /**
+   * On a text line whose `traceId` was read off its end: that end as it was
+   * written, marker and all, which `message` no longer has. The parser cannot
+   * tell the logger's suffix from a message that happens to end the same
+   * way - in a secret, say - so whoever redacts the message needs it to see
+   * the line whole.
+   */
+  traceIdSuffix?: string;
   attributes?: Record<string, unknown>;
   /**
    * What the line was read as: a record of a JSON logger, a line carrying
@@ -185,6 +193,8 @@ function parseNestText(line: string): ParsedLogLine | null {
     level: toLogLevel(level),
     context: context || undefined,
     traceId,
+    traceIdSuffix:
+      traceId === undefined ? undefined : rest.slice(message.length),
     message,
     unsplit: bracket === undefined ? undefined : bracket + message,
     format: "nest",

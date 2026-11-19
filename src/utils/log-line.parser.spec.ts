@@ -165,6 +165,21 @@ describe("parseLogLine", () => {
       expect(parsed.message).not.toContain("Trace ID");
     });
 
+    it("hands back the ending it cut the trace id from", () => {
+      // It may be the message's own, and whoever redacts the message has to
+      // see it whole.
+      const parsed = parseLogLine(
+        "[Nest] 1  - 07/29/2026, 10:42:18 AM     LOG [Ctx] done   Trace ID: abc-123",
+      );
+
+      expect(parsed.message + parsed.traceIdSuffix).toBe(
+        "done   Trace ID: abc-123",
+      );
+      expect(parseLogLine("[Nest] 1  - x  LOG done").traceIdSuffix).toBe(
+        undefined,
+      );
+    });
+
     it.each([
       ["no space after the marker", "done Trace ID:abc-123", "done"],
       ["nothing before the marker", "Trace ID: abc-123", ""],

@@ -358,7 +358,10 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       head: ParsedLogLine;
       lines: string[];
       longest: number;
+      /** The `Trace ID:` ending redacted with the message - see below. */
+      suffix?: string;
     }> = [];
+    const storeTraceId = liveTraceId(store, this.options.traceIdKey);
     for (let index = 0; index < read; index += 1) {
       const line = lines[index];
       // Parsed whole: see `MAX_REDACTED_LENGTH`.
@@ -372,19 +375,30 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
         message.lines.push(parsed.message);
         message.longest = Math.max(message.longest, line.length);
       } else {
+        // A `Trace ID:` ending is the logger's suffix only when it names the
+        // trace the line was written in. Any other may be the message's own
+        // last words - a client's value, then a secret - and cut off before
+        // redaction it was sent as the trace id unread. So it is redacted
+        // with the message, and is a trace id only if it comes out as it
+        // went in.
+        const suffix =
+          this.redactor && parsed.traceId !== storeTraceId
+            ? parsed.traceIdSuffix
+            : undefined;
         messages.push({
           head: parsed,
           // A bracket read as the context is redacted with the message - see
           // `splitContext`.
-          lines: [parsed.unsplit ?? parsed.message],
+          lines: [(parsed.unsplit ?? parsed.message) + (suffix ?? "")],
           longest: line.length,
+          suffix,
         });
       }
     }
 
     const entries: LogEntry[] = [];
     for (const [index, message] of messages.entries()) {
-      const { head } = message;
+      let { head } = message;
       let text = message.lines.join("\n");
       let keep = text.length;
       if (index === messages.length - 1 && head.format !== "json") {
@@ -396,6 +410,14 @@ export class StdoutForwarderService implements OnModuleInit, OnModuleDestroy {
       }
       const redacted = this.redact(text, keep);
       const texts = head.format === "json" ? [redacted] : redacted.split("\n");
+      if (message.suffix !== undefined) {
+        if (texts[0].endsWith(message.suffix)) {
+          texts[0] = texts[0].slice(0, -message.suffix.length);
+        } else {
+          // Masked, or part of it: no trace id, and the ending stays text.
+          head = { ...head, traceId: undefined };
+        }
+      }
       const first = this.splitContext(head, texts[0]);
       entries.push(
         this.toLogEntry(
