@@ -119,18 +119,22 @@ export type SqlDialect = "postgresql" | "mysql";
  * where a token can start - Postgres reads `a$b$` as one name - and its tag
  * is empty, or a letter, `_` or non-ASCII character followed by any of those
  * or digits, so `$q1$` opens one and `$1` stays a placeholder. Block
- * comments nest, so `/*` is matched alone and its end found by hand.
+ * comments nest, so `/*` is matched alone and its end found by hand. A `--`
+ * comment ends at a carriage return as well as a line feed: Postgres reads
+ * either as the end of the line, and a comment run on past a lone `\r` would
+ * have the SQL after it, quotes and all, read as part of it.
  *
  * MySQL quotes strings in `"` as well as `'`, as its default sql_mode does
  * (under ANSI_QUOTES a `"` name goes too), with backslash escapes in both,
  * and `#` starts a comment. `--` does
  * only before whitespace or a control character, as MySQL reads it:
  * `credit--5` is `credit - -5`, and the rest of its line is still SQL, quotes
- * and all. Its block comments do not nest.
+ * and all. Its comments end at a line feed alone, as MySQL ends them, and
+ * its block comments do not nest.
  */
 const TOKEN: Record<SqlDialect, RegExp> = {
   postgresql:
-    /(?<nested>\/\*)|(?<comment>--[^\n]*)|(?<name>"(?:[^"]|"")*(?:"|$))|(?<![\w$])(?<escape>[eE])'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|(?<plain>'(?:[^']|'')*(?:'|$))|(?<!\w)\$(?<tag>(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?)\$[\s\S]*?(?:\$\k<tag>\$|$)/g,
+    /(?<nested>\/\*)|(?<comment>--[^\r\n]*)|(?<name>"(?:[^"]|"")*(?:"|$))|(?<![\w$])(?<escape>[eE])'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|(?<plain>'(?:[^']|'')*(?:'|$))|(?<!\w)\$(?<tag>(?:[A-Za-z_\u0080-\uffff][\w\u0080-\uffff]*)?)\$[\s\S]*?(?:\$\k<tag>\$|$)/g,
   mysql:
     // eslint-disable-next-line no-control-regex -- MySQL's rule for `--`.
     /(?<comment>\/\*[\s\S]*?(?:\*\/|$)|--(?=[\u0000-\u0020\u007f]|$)[^\n]*|#[^\n]*)|(?<name>`(?:[^`]|``)*(?:`|$))|(?<plain>'(?:[^'\\]|\\[\s\S]?|'')*(?:'|$)|"(?:[^"\\]|\\[\s\S]?|"")*(?:"|$))/g,

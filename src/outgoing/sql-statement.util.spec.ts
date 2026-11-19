@@ -257,6 +257,12 @@ describe("describeSqlStatement for Postgres", () => {
     ["SELECT $q1$a $q$ b $q11$ secret$q1$ FROM t", "SELECT ? FROM t"],
     ["SELECT $q1$secret 'value", "SELECT ?"],
     ["SELECT $1, $2 FROM t WHERE a = $3", "SELECT $1, $2 FROM t WHERE a = $3"],
+    // A line comment ends at a carriage return too, so what follows one is
+    // read as SQL and its literals go.
+    [
+      "UPDATE notes -- edited\rSET body = 'Dear Ann,\nthe code is 4927'\rWHERE k = 'wk_live_5f'",
+      "UPDATE notes SET body = ? WHERE k = ?",
+    ],
     // Before Postgres 15, a number ends where its digits do, whatever
     // follows. After it, the statement is refused - and the span recorded.
     [
@@ -342,6 +348,12 @@ describe("describeSqlStatement for MySQL", () => {
       "SELECT * --\nFROM t WHERE a = 'x\ny' AND k = 'secret-value'",
       "SELECT * FROM t WHERE a = ? AND k = ?",
     ],
+    // Only a line feed ends a MySQL comment: a carriage return does not.
+    [
+      "SELECT * FROM t -- user=secret@example.com\rAND id = 1\nWHERE a = 'secret-value'",
+      "SELECT * FROM t WHERE a = ?",
+    ],
+    ["SELECT 1 # user=secret\r'it''s'\nFROM t", "SELECT ? FROM t"],
     // A name may start with digits, also after the point of a qualified one.
     [
       "SELECT 2fa_code, t.2fa_code, `t`.2fa_code FROM t WHERE 0x1fz = 1",
