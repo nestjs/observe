@@ -98,6 +98,28 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
     ).toBe("SELECT col1 FROM table2 t0 WHERE t0.x = ?");
   });
 
+  it("replaces a number the next word follows without a space", () => {
+    expect(
+      describeSqlStatement(
+        "UPDATE t SET lat=51.501364,lng=-0.141588WHERE a=6.02e23AND b=1e-7OR c=.25AND d=1e5",
+        dialect,
+      ).statement,
+    ).toBe("UPDATE t SET lat=?,lng=?WHERE a=?AND b=?OR c=.?AND d=?");
+  });
+
+  it("replaces a number whose point has no digit after it", () => {
+    expect(
+      describeSqlStatement(
+        "INSERT INTO results VALUES (3.e15, -3.e+15, 3.E-15, 3., 3.0e15)",
+        dialect,
+      ).statement,
+    ).toBe("INSERT INTO results VALUES (?)");
+    expect(
+      describeSqlStatement("SELECT 3.e15AND t1.e15, 1.x FROM t1", dialect)
+        .statement,
+    ).toBe("SELECT ?AND t1.e15, ?x FROM t1");
+  });
+
   it("replaces hex and binary numbers", () => {
     expect(
       describeSqlStatement(
@@ -126,7 +148,9 @@ describe.each(DIALECTS)("describeSqlStatement (%s)", (dialect) => {
     [`SELECT ${comment(8173)} 987654e2`, "SELECT ?"],
     [`SELECT ${comment(8172)} 987654e+2`, "SELECT ?"],
     [`SELECT ${comment(8172)} 987654e-2`, "SELECT ?"],
-    [`SELECT ${comment(8170)} 98765.43e+2`, "SELECT ?.?"],
+    [`SELECT ${comment(8170)} 98765.43e+2`, "SELECT ?"],
+    [`SELECT ${comment(8171)} 987654e-25`, "SELECT ?"],
+    [`SELECT ${comment(8176)} 3.e+15`, "SELECT ?"],
     [
       `INSERT INTO t (a, b) VALUES ('${"z".repeat(8150)}', 'secret-value')`,
       "INSERT INTO t (a, b) VALUES (?, ?",
@@ -233,6 +257,23 @@ describe("describeSqlStatement for Postgres", () => {
     ["SELECT $q1$a $q$ b $q11$ secret$q1$ FROM t", "SELECT ? FROM t"],
     ["SELECT $q1$secret 'value", "SELECT ?"],
     ["SELECT $1, $2 FROM t WHERE a = $3", "SELECT $1, $2 FROM t WHERE a = $3"],
+    // Before Postgres 15, a number ends where its digits do, whatever
+    // follows. After it, the statement is refused - and the span recorded.
+    [
+      "SELECT * FROM t WHERE ssn=219099999AND b=-0x1fOR c LIMIT 10OFFSET 20",
+      "SELECT * FROM t WHERE ssn=?AND b=?OR c LIMIT ?OFFSET ?",
+    ],
+    // Not inside a quoted name, which may start with digits. A number on its
+    // own in one goes, as it did before.
+    [
+      `SELECT "2fa_code", "order 66" FROM "2022_sales" WHERE id=7AND "3d" AND n = "4815162342" AND d = "2024-01-15"`,
+      `SELECT "2fa_code", "order ?" FROM "2022_sales" WHERE id=?AND "3d" AND n = "?" AND d = "?-?-?"`,
+    ],
+    // A backtick quotes no name either.
+    [
+      "SELECT * FROM d WHERE a &` 42 AND b &`7",
+      "SELECT * FROM d WHERE a &` ? AND b &`?",
+    ],
   ])("%s", (sql, statement) => {
     expect(describeSqlStatement(sql, "postgresql").statement).toBe(statement);
   });
@@ -300,6 +341,20 @@ describe("describeSqlStatement for MySQL", () => {
     [
       "SELECT * --\nFROM t WHERE a = 'x\ny' AND k = 'secret-value'",
       "SELECT * FROM t WHERE a = ? AND k = ?",
+    ],
+    // A name may start with digits, also after the point of a qualified one.
+    [
+      "SELECT 2fa_code, t.2fa_code, `t`.2fa_code FROM t WHERE 0x1fz = 1",
+      "SELECT 2fa_code, t.2fa_code, `t`.2fa_code FROM t WHERE 0x1fz = ?",
+    ],
+    [
+      "SELECT `1.5x`, `order 66` FROM `2022_sales` WHERE id=7.0AND `3d` AND n = `4815162342`",
+      "SELECT `?.5x`, `order ?` FROM `2022_sales` WHERE id=?AND `3d` AND n = `?`",
+    ],
+    // Digits run into a word are a name to MySQL, and are kept as one.
+    [
+      "SELECT * FROM t WHERE a=219099999AND b=1",
+      "SELECT * FROM t WHERE a=219099999AND b=?",
     ],
   ])("%s", (sql, statement) => {
     expect(describeSqlStatement(sql, "mysql").statement).toBe(statement);

@@ -41,8 +41,12 @@ function describeMssqlStatement(
   // first keeps comment markers inside strings and identifiers inert.
   // Double quotes follow connection options; SQL SET overrides are not tracked.
   // Binary literals may continue across lines after a backslash.
+  // No name starts with a digit, and T-SQL needs no space after a number:
+  // `42ORDER BY` is a number and a keyword, so the word that follows does not
+  // decide whether it is one. A digit after `#` is part of a name, `#2fa`,
+  // and `-0x1F` is a minus and a binary literal, not `-0` and a word.
   const tokenPattern =
-    /(?<comment>--[^\r\n]*)|\[(?:[^\]]|\]\])*(?:\]|$)|(?<quoted>"(?:[^"]|"")*(?:"|$))|(?<literal>N?'(?:[^']|'')*(?:'|$)|(?<![\w@])\$\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)|\b0x[\da-f]*(?:\\(?:\r\n|\r|\n)[\da-f]*)*|(?<![\w$@])-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?![\w]))|[^]/giy;
+    /(?<comment>--[^\r\n]*)|\[(?:[^\]]|\]\])*(?:\]|$)|(?<quoted>"(?:[^"]|"")*(?:"|$))|(?<literal>N?'(?:[^']|'')*(?:'|$)|(?<![\w@])\$\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)|\b0x[\da-f]*(?:\\(?:\r\n|\r|\n)[\da-f]*)*|(?<![\w$@#])-?(?!0x)(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)|[^]/giy;
   for (let index = 0; index < input.length; ) {
     if (input.startsWith("/*", index)) {
       let depth = 1;
@@ -79,10 +83,11 @@ function describeMssqlStatement(
     // Anchored at the run's start. Unanchored, the engine tried every position
     // inside each run of word characters and backtracked the run each time:
     // quadratic, 0.1 s of a blocked event loop for one 8 KB name. The sign is
-    // a number cut between its exponent's sign and digits, `987654e+`, which
-    // the tokenizer could not read as a number and left as text.
+    // a number cut between its exponent's sign and digits, `987654e+`: the
+    // tokenizer read its digits as a number and left `e+` as text, so the `?`
+    // of the digits goes with the word.
     text = text.replace(
-      /(^|[^\p{L}\p{M}\p{N}_$@#])[\p{L}\p{M}\p{N}_$@#]+[+-]?$/u,
+      /(^|[^\p{L}\p{M}\p{N}_$@#])\??[\p{L}\p{M}\p{N}_$@#]+[+-]?$/u,
       "$1?",
     );
   }

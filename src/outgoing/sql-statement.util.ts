@@ -137,6 +137,35 @@ const TOKEN: Record<SqlDialect, RegExp> = {
 };
 
 /**
+ * A number that is not part of an identifier or a `$1` placeholder: hex,
+ * binary and octal too, digits grouped with `_` (Postgres 16), and a point
+ * with no digit after it, `3.e15`, which is one number to both dialects.
+ *
+ * The server needs no space after a number, so the word that follows does
+ * not decide whether it is one: `-0.141588WHERE`, and `219099999AND` before
+ * Postgres 15, are a number and a keyword. No Postgres name starts with a
+ * digit. A MySQL name can, but only digits without a point or an exponent:
+ * `2fa_code` is a name, `1.5AND`, `.5AND` and `1e5OR` are not, and a point
+ * after a name is no decimal point, `t.2fa_code`. An integer run into a word
+ * is a name to MySQL, `219099999AND`, and is kept as one.
+ *
+ * Quoted names are matched first, so `"2fa_code"` and `"2022_sales"` stay as
+ * they are. Inside one, a number standing on its own goes as it always has -
+ * `"order 66"` is `"order ?"`, and `"4815162342"`, more likely a value quoted
+ * the wrong way than a column, is `"?"`.
+ */
+const NUMBER: Record<SqlDialect, RegExp> = {
+  postgresql:
+    /(?<name>"(?:[^"]|"")*")|(?<![\w$])-?(?:0x[\da-f_]+|0b[01_]+|0o[0-7_]+|\d[\d_]*(?:\.[\d_]*)?(?:e[+-]?\d[\d_]*)?)/gi,
+  mysql:
+    /(?<name>`(?:[^`]|``)*`)|(?<![\w$])(?:(?:0x[\da-f_]+|0b[01_]+|0o[0-7_]+)(?!\w)|-?\d[\d_]*(?:\.[\d_]*(?:e[+-]?\d[\d_]*)?|e[+-]?\d[\d_]*|(?!\w))|(?<=(?<![\w$`])\.)\d[\d_]*)/gi,
+};
+
+/** A number within a quoted name: one no word character runs on from. */
+const NUMBER_IN_NAME =
+  /(?<![\w$])(?:0x[\da-f_]+|0b[01_]+|0o[0-7_]+|-?\d[\d_]*(?:\.[\d_]*)?(?:e[+-]?\d[\d_]*)?)(?!\w)/gi;
+
+/**
  * An odd run of backslashes before the quote a string opened with. Whether
  * that quote ends the string is a session setting the statement does not
  * show: Postgres's standard_conforming_strings, MySQL's NO_BACKSLASH_ESCAPES.
@@ -203,19 +232,17 @@ export function describeSqlStatement(
   dialect: SqlDialect,
 ): SqlStatementDescription {
   const input = sql.slice(0, MAX_STATEMENT_LENGTH * 4);
-  let sanitized = stripLiteralsAndComments(input, dialect)
-    // A number that is not part of an identifier or a `$1` placeholder: hex,
-    // binary and octal too, and digits grouped with `_` (Postgres 16).
-    .replace(
-      /(?<![\w$])(?:0x[\da-f_]+|0b[01_]+|0o[0-7_]+|-?\d[\d_]*(?:\.[\d_]+)?(?:e[+-]?\d[\d_]*)?)(?![\w])/gi,
-      "?",
-    );
+  let sanitized = stripLiteralsAndComments(input, dialect).replace(
+    NUMBER[dialect],
+    (_number, name?: string) => name?.replace(NUMBER_IN_NAME, "?") ?? "?",
+  );
   if (sql.length > input.length) {
-    // The bound may have cut a number short - `987654e+` is no longer one -
-    // so whatever word it cut goes too. Anchored at the run's start, which
+    // The bound may have cut a number short - `987654e+` is no longer one,
+    // and its digits are a `?` with `e+` after it - so whatever word it cut
+    // goes too, with the `?` before it. Anchored at the run's start, which
     // keeps it linear on a run 8 KB long.
     sanitized = sanitized.replace(
-      /(^|[^\p{L}\p{M}\p{N}_$])[\p{L}\p{M}\p{N}_$]+[+-]?$/u,
+      /(^|[^\p{L}\p{M}\p{N}_$])\??[\p{L}\p{M}\p{N}_$]+[+-]?$/u,
       "$1?",
     );
   }

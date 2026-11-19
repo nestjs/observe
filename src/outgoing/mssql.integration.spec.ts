@@ -508,6 +508,24 @@ describe("MSSQL statement sanitization", () => {
     ["SELECT 0x0123\\\r\nDEAD\\\rBEEF FROM t", "SELECT ? FROM t"],
     ["SELECT 1--private\rFROM orders", "SELECT ? FROM orders"],
     ["SELECT .5, $ -12.5, 0XCAFE, n'private'", "SELECT ?, ?, ?, ?"],
+    // T-SQL ends a number where its digits do, whatever follows.
+    [
+      "SELECT id FROM t WHERE ssn = 536229014ORDER BY id OFFSET 1.5e3ROWS",
+      "SELECT id FROM t WHERE ssn = ?ORDER BY id OFFSET ?ROWS",
+    ],
+    [
+      "UPDATE t SET pin = 4821WHERE amount > 1250.75AND x = 3.e15AND y = 1e5OR id = 7",
+      "UPDATE t SET pin = ?WHERE amount > ?AND x = ?AND y = ?OR id = ?",
+    ],
+    [
+      "SELECT [2fa], col1 FROM #2fa_codes WHERE a = -0x1F AND b = -.5AND c = @1",
+      "SELECT [2fa], col1 FROM #2fa_codes WHERE a = -? AND b = ?AND c = @1",
+    ],
+    // The number no longer hides the EXEC from argument redaction.
+    [
+      "SELECT 5EXEC dbo.Authenticate PrivateToken123",
+      "SELECT ?EXEC dbo.Authenticate ?",
+    ],
   ])("redacts %s", async (sql, expected) => {
     const h = harness();
     await h.run(() => new h.Request().query(sql));
@@ -818,7 +836,7 @@ describe("MSSQL statement sanitization", () => {
   it.each([
     [`SELECT /*${"x".repeat(8172)}*/ 987654e+2`, "SELECT ?"],
     [`SELECT /*${"x".repeat(8172)}*/ 987654e-2`, "SELECT ?"],
-    [`SELECT /*${"x".repeat(8170)}*/ 98765.43e+2`, "SELECT ?.?"],
+    [`SELECT /*${"x".repeat(8170)}*/ 98765.43e+2`, "SELECT ?"],
   ])(
     "redacts a number cut off after its exponent sign: %#",
     async (sql, statement) => {
