@@ -5,7 +5,9 @@ import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
 import { Cluster, Redis } from "ioredis";
 import { Db, MongoClient } from "mongodb";
+import { CALLER_METADATA_KEY } from "../observe.constants.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
+import { TracerService } from "../services/tracer.service.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
 
 const TRACE_ID_KEY = "traceId";
@@ -612,6 +614,32 @@ describe("createInstanceDecorator", () => {
       expect(startedSteps).toEqual([
         { className: "UserService", methodName: "findAll" },
       ]);
+    });
+
+    it("scopes the caller to the call, and not the attributes set in it", () => {
+      // The call runs in a copy of its caller's store, made so it can name
+      // its span as the caller. What a guard sets there with `setAttribute`
+      // is for the handler that runs after it.
+      const tracer = new TracerService(
+        {} as never,
+        als as never,
+        {} as never,
+        { traceIdKey: TRACE_ID_KEY } as never,
+      );
+      class TenantGuard {
+        canActivate() {
+          tracer.setAttribute("tenantId", "acme");
+          return als.getStore()!.get(CALLER_METADATA_KEY);
+        }
+      }
+      const guard = decorate(new TenantGuard()) as TenantGuard;
+
+      withTrace(() => {
+        expect(guard.canActivate()).toBe("step-1");
+
+        expect(als.getStore()!.has(CALLER_METADATA_KEY)).toBe(false);
+        expect(tracer.getAttribute("tenantId")).toBe("acme");
+      });
     });
 
     it("never instruments Nest's Reflector", () => {

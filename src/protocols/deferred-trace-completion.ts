@@ -1,4 +1,5 @@
 import type { Logger } from "@nestjs/common";
+import { SHARED_ATTRIBUTES_KEY } from "../utils/shared-attributes.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 
 const reportedCallbacks = new WeakSet<Function>();
@@ -118,8 +119,16 @@ export function setAttributesSafely<TArgs extends unknown[]>(
   if (!attributes) {
     return;
   }
+  // Over what `TracerService.setAttribute` set earlier in the operation as
+  // well, where it set anything: `getAttribute` reads that first, and the
+  // later write is the one it should return - GraphQL's, in a request whose
+  // middleware set the same key.
+  const shared = store.get(SHARED_ATTRIBUTES_KEY) as
+    | Map<unknown, unknown>
+    | undefined;
   for (const [key, value] of Object.entries(attributes)) {
     store.set(key, value);
+    shared?.set(key, value);
   }
 }
 

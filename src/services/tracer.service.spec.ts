@@ -8,6 +8,7 @@ import {
   CALLER_METADATA_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
+import { setAttributesSafely } from "../protocols/deferred-trace-completion.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { TracerService } from "./tracer.service.js";
 import {
@@ -234,6 +235,81 @@ describe("TracerService", () => {
         expectTypeOf(typedTracer.getAttribute("userId")).toEqualTypeOf<
           number | undefined
         >();
+      });
+    });
+
+    // A span runs in a copy of its caller's store. What a guard, a service or
+    // a span's callback sets is for the rest of the operation, as it is in
+    // one that is not recorded and makes no copy.
+    it("keeps an attribute set inside a span once the span has ended", async () => {
+      await inTrace("t1", async () => {
+        await tracer.createSpan("resolve tenant", () => {
+          tracer.setAttribute("tenantId", "acme");
+        });
+
+        expect(tracer.getAttribute("tenantId")).toBe("acme");
+      });
+    });
+
+    it("keeps it when the operation is not recorded", async () => {
+      await als.run(new Map([[TRACE_ID_KEY, "sampled-out"]]), async () => {
+        await tracer.createSpan("resolve tenant", () => {
+          tracer.setAttribute("tenantId", "acme");
+        });
+
+        expect(tracer.getAttribute("tenantId")).toBe("acme");
+      });
+    });
+
+    it("shows a span an attribute set after the span began", async () => {
+      await inTrace("t1", async () => {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        const read = tracer.createSpan("read later", async () => {
+          await released;
+          return tracer.getAttribute("tenantId");
+        });
+
+        tracer.setAttribute("tenantId", "acme");
+        release();
+
+        expect(await read).toBe("acme");
+      });
+    });
+
+    it("reads what the store holds until an attribute is set over it", async () => {
+      await inTrace("t1", async () => {
+        // Where the `setAttributes` options write, before any span.
+        als.getStore()!.set("plan", "free");
+        expect(tracer.getAttribute("plan")).toBe("free");
+        expect(tracer.getAttribute(TRACE_ID_KEY)).toBe("t1");
+
+        await tracer.createSpan("upgrade", () => {
+          tracer.setAttribute("plan", undefined);
+        });
+
+        expect(tracer.getAttribute("plan")).toBeUndefined();
+      });
+    });
+
+    it("returns a `setAttributes` option's value written after the attribute", async () => {
+      await inTrace("t1", async () => {
+        tracer.setAttribute("tenantId", "acme");
+
+        // As `graphql.setAttributes` runs: once middleware has, and in
+        // whatever span the operation starts in.
+        await tracer.createSpan("execute", () => {
+          setAttributesSafely(
+            () => ({ tenantId: "globex" }),
+            [],
+            null,
+            als.getStore()!,
+            new Logger(),
+            "graphql",
+          );
+        });
+
+        expect(tracer.getAttribute("tenantId")).toBe("globex");
       });
     });
 

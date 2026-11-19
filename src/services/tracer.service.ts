@@ -14,6 +14,10 @@ import {
 } from "../observe.constants.js";
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { liveTraceId } from "../utils/operation-state.util.js";
+import {
+  SHARED_ATTRIBUTES_KEY,
+  sharedAttributesOf,
+} from "../utils/shared-attributes.util.js";
 
 /**
  * Longest operation id the collector stores, counted by code point as it
@@ -497,7 +501,14 @@ export class TracerService<
    * @param value The attribute value.
    */
   setAttribute<P extends Path<Store>>(key: P, value: PathValue<Store, P>) {
-    this.als.getStore()?.set(key, value);
+    const store = this.als.getStore();
+    if (!store) {
+      return;
+    }
+    store.set(key, value);
+    // The store may be a span's own copy, gone once the span returns. The
+    // operation's attribute map is not - see `SHARED_ATTRIBUTES_KEY`.
+    sharedAttributesOf(store).set(key, value);
   }
 
   /**
@@ -508,7 +519,14 @@ export class TracerService<
    * outside any operation the agent traces.
    */
   getAttribute<P extends Path<Store>>(key: P): PathValue<Store, P> | undefined {
-    return this.als.getStore()?.get(key);
+    const store = this.als.getStore();
+    // What `setAttribute` wrote anywhere in the operation first, then what
+    // the store itself holds: the `setAttributes` options' attributes and
+    // the trace id.
+    const attributes = store?.get(SHARED_ATTRIBUTES_KEY) as
+      | Map<unknown, any>
+      | undefined;
+    return attributes?.has(key) ? attributes.get(key) : store?.get(key);
   }
 
   /**

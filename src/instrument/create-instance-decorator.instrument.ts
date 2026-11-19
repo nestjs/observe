@@ -7,6 +7,7 @@ import {
   CALLER_METADATA_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
+import { sharedAttributesOf } from "../utils/shared-attributes.util.js";
 
 /**
  * Stand-in "class name" for instrumented standalone functions. Unlike methods,
@@ -399,7 +400,10 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
 
         // Everything the caller's context holds, with this span as the caller
         // of whatever it calls. A copy, so the caller's context still names
-        // the caller once this call returns.
+        // the caller once this call returns. Only the caller is the span's
+        // own: the attribute map is made before the copy, so both hold the
+        // same one, and an attribute set in the call is there after it.
+        sharedAttributesOf(store!);
         const spanStore = new Map(store);
         spanStore.set(CALLER_METADATA_KEY, newStepId);
         return als.run(
