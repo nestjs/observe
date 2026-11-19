@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "async_hooks";
 import { subscribe, unsubscribe } from "diagnostics_channel";
 import { LogRedactor } from "../utils/log-redactor.js";
 import { openTelemetryWritesTraceparent } from "../utils/opentelemetry.util.js";
@@ -122,6 +123,14 @@ export function subscribeOutgoingHttp(
    * `traceparent` has to be written, for the span `start` opens later.
    */
   const presetSpanIds = new WeakMap<object, string>();
+  /**
+   * The async context a `node:http` request was created in, for `start` to
+   * open its span in - see `http.client.request.start`.
+   */
+  const createdIn = new WeakMap<
+    object,
+    ReturnType<typeof AsyncLocalStorage.snapshot>
+  >();
   const subscriptions: Array<[string, (message: unknown) => void]> = [];
   const on = <T>(channel: string, handler: (message: T) => void) => {
     const guarded = (message: unknown) => {
@@ -245,6 +254,9 @@ export function subscribeOutgoingHttp(
   on<{ request: NodeClientRequest }>(
     "http.client.request.created",
     ({ request }) => {
+      // Taken for every request, in a trace or not: whichever context
+      // `start` fires in is no more this request's when it has none.
+      createdIn.set(request, AsyncLocalStorage.snapshot());
       const { url } = describeNodeRequest(request);
       const trace = currentTrace();
       if (!trace || options.ignore?.(url) || !shouldPropagate(url)) {
@@ -269,26 +281,41 @@ export function subscribeOutgoingHttp(
       }
     },
   );
+  // `start` fires once the request is ended, which is not always in the call
+  // that made it: a body piped in ends it from the source's `end` event, in
+  // the context of whoever opened the source's socket - another request's,
+  // for a pooled connection an earlier one opened. So the span opens in the
+  // context the request was created in, where `created` fired; on runtimes
+  // without that event, where `start` fired.
   on<{ request: NodeClientRequest }>(
     "http.client.request.start",
     ({ request }) => {
-      const { host, url, method } = describeNodeRequest(request);
-      const presetSpanId = presetSpanIds.get(request);
-      presetSpanIds.delete(request);
-      if (!open(request, method, url, host, presetSpanId)) {
-        return;
+      const runInCreated = createdIn.get(request);
+      createdIn.delete(request);
+      const begin = () => {
+        const { host, url, method } = describeNodeRequest(request);
+        const presetSpanId = presetSpanIds.get(request);
+        presetSpanIds.delete(request);
+        if (!open(request, method, url, host, presetSpanId)) {
+          return;
+        }
+        // `close` always fires, with or without a response. An `error`
+        // listener would tell more, but adding one changes what an otherwise
+        // unhandled request error does to the process.
+        request.once?.("close", () =>
+          close(
+            request,
+            request.res
+              ? undefined
+              : new Error("Request closed with no response"),
+          ),
+        );
+      };
+      if (runInCreated) {
+        runInCreated(begin);
+      } else {
+        begin();
       }
-      // `close` always fires, with or without a response. An `error` listener
-      // would tell more, but adding one changes what an otherwise unhandled
-      // request error does to the process.
-      request.once?.("close", () =>
-        close(
-          request,
-          request.res
-            ? undefined
-            : new Error("Request closed with no response"),
-        ),
-      );
     },
   );
   on<{ request: NodeClientRequest; error: unknown }>(
