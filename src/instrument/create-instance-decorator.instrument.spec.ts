@@ -1251,6 +1251,50 @@ describe("createInstanceDecorator", () => {
       ]);
     });
 
+    it("takes a subclass named after the pipe it extends for the application's", async () => {
+      // `import { ValidationPipe as NestValidationPipe }` and a subclass of
+      // the old name: it inherits the marker method, so it was taken for
+      // Nest's own and its `toValidate` handed out unwrapped - to run on the
+      // proxy, and throw on the private field it reads.
+      class ValidationPipeOfTheApp extends ValidationPipe {
+        readonly #exempt = new Set(["query"]);
+
+        protected override toValidate(metadata: { type: string }) {
+          return (
+            !this.#exempt.has(metadata.type) &&
+            super.toValidate(metadata as never)
+          );
+        }
+      }
+      Object.defineProperty(ValidationPipeOfTheApp, "name", {
+        value: "ValidationPipe",
+      });
+      const pipe = decorate(
+        new ValidationPipeOfTheApp({
+          validatorPackage: { validate: () => [] },
+          transformerPackage: {
+            plainToInstance: (_type: unknown, value: unknown) => value,
+            classToPlain: (value: unknown) => value,
+          } as never,
+        }),
+      ) as ValidationPipe;
+
+      await expect(
+        withTrace(() =>
+          pipe.transform({ total: 1 }, {
+            type: "body",
+            metatype: CreateOrderDto,
+          } as never),
+        ),
+      ).resolves.toMatchObject({ total: 1 });
+      // What it overrides is its own, and traced; what it inherits from
+      // Nest's is not.
+      expect(steps()).toEqual([
+        "ValidationPipe.toValidate",
+        "ValidationPipe.validate",
+      ]);
+    });
+
     it("traces everything on a pipe an application wrote, whatever its name", () => {
       // The pipe Nest's documentation has readers write, by the same name.
       class WrittenByHand {

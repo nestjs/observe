@@ -156,15 +156,30 @@ const PARTLY_TRACED_CLASSES = new Map<
   ],
 ]);
 
-/** The methods a prototype's class keeps traced, if it is one of those. */
+/**
+ * The methods a prototype's class keeps traced, if it is one of those.
+ *
+ * The marker has to be the class's own, and new with it. A subclass an
+ * application names after the class it extends (`import { ValidationPipe as
+ * NestValidationPipe }`) inherits the marker, or overrides it, and is still
+ * the application's: taken for the library's, its methods were handed out
+ * unwrapped, and one that reads a private member (`this.#x`) threw on the
+ * proxy it then ran against.
+ */
 function partlyTracedMethodsOf(proto: object): ReadonlySet<string> | null {
   const candidate = proto as Record<string, unknown>;
   const entry = PARTLY_TRACED_CLASSES.get(
     (candidate.constructor as { name?: string } | undefined)?.name ?? "",
   );
-  return entry !== undefined && typeof candidate[entry.marker] === "function"
-    ? entry.traced
-    : null;
+  if (
+    entry === undefined ||
+    !Object.hasOwn(proto, entry.marker) ||
+    typeof candidate[entry.marker] !== "function"
+  ) {
+    return null;
+  }
+  const parent: object | null = Object.getPrototypeOf(proto);
+  return parent === null || !(entry.marker in parent) ? entry.traced : null;
 }
 
 /** Whether an instance is one of those classes, or extends one. */
