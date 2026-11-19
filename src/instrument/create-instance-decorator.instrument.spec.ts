@@ -12,6 +12,7 @@ import {
   subtle,
   X509Certificate,
 } from "node:crypto";
+import { PassThrough } from "node:stream";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { TracerService } from "../services/tracer.service.js";
 import { createInstanceDecorator } from "./create-instance-decorator.instrument.js";
@@ -1921,6 +1922,86 @@ describe("createInstanceDecorator", () => {
       // point is traced, nested self-calls are the documented trade-off.
       expect(startedSteps).toEqual([
         { className: "TenantCache", methodName: "lookup" },
+      ]);
+    });
+  });
+
+  describe("when decorating a Node stream", () => {
+    it("completes an async iteration started inside a trace", async () => {
+      // Whatever feeds a stream holds the stream itself and emits on it, and
+      // Node's async iterator tells its "readable" listener from its own
+      // caller by comparing `this` with the stream it was made on. Made on
+      // the proxy, it never woke up: `for await` over an injected request
+      // body hung.
+      const body = new PassThrough();
+      const stream = decorate(body) as PassThrough;
+
+      const read = withTrace(async () => {
+        let text = "";
+        for await (const chunk of stream) {
+          text += String(chunk);
+        }
+        return text;
+      });
+      body.write("a");
+      body.end("b");
+
+      await expect(read).resolves.toEqual("ab");
+    });
+
+    it("ends the iteration with the error the stream is destroyed with", async () => {
+      // A client closing its socket mid-upload. The same iterator threw
+      // "callback is not a function" from the stream's own "error" event
+      // instead - outside any call, so it ended the process.
+      const body = new PassThrough();
+      const stream = decorate(body) as PassThrough;
+
+      const read = withTrace(async () => {
+        for await (const chunk of stream) {
+          void chunk;
+        }
+      });
+      body.write("a");
+      await new Promise((resolve) => setImmediate(resolve));
+      body.destroy(new Error("aborted"));
+
+      await expect(read).rejects.toThrow("aborted");
+    });
+
+    it("treats a copy of the stream classes the same", () => {
+      // `readable-stream` 4 extends nothing of Node's; the state it keeps
+      // gives it away.
+      class Readable2 extends EventEmitter {
+        readonly _readableState = { flowing: null };
+
+        receiver() {
+          return this;
+        }
+      }
+      const raw = new Readable2();
+      const stream = decorate(raw) as Readable2;
+
+      expect(withTrace(() => stream.receiver())).toBe(raw);
+    });
+
+    it("still records spans for user methods on a stream subclass", async () => {
+      class Upload extends PassThrough {
+        async size() {
+          let size = 0;
+          for await (const chunk of this) {
+            size += (chunk as Buffer).length;
+          }
+          return size;
+        }
+      }
+      const upload = decorate(new Upload()) as Upload;
+      upload.end("abc");
+
+      await expect(withTrace(() => upload.size())).resolves.toEqual(3);
+      // Like private-member classes, calls run against the raw instance -
+      // only the entry point is traced.
+      expect(startedSteps).toEqual([
+        { className: "Upload", methodName: "size" },
       ]);
     });
   });

@@ -1,6 +1,7 @@
 import { Reflector } from "@nestjs/core";
 import { AsyncLocalStorage } from "async_hooks";
 import { X509Certificate } from "node:crypto";
+import { Stream } from "node:stream";
 import { types } from "node:util";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { KeyOf } from "../types/key-of.type.js";
@@ -567,6 +568,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
     let slotBacked: boolean;
     let bareBuiltIn: boolean;
     let partlyTraced: boolean;
+    let nodeStream: boolean;
     try {
       // Inspected here, inside the guard, for the same reason as the checks
       // below: reading a provider's constructor can run a trap that throws.
@@ -588,6 +590,7 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       slotBacked = isSlotBackedBuiltIn(instance);
       bareBuiltIn = slotBacked && isNativeFunction(instance.constructor);
       partlyTraced = extendsPartlyTracedClass(instance);
+      nodeStream = isNodeStream(instance);
     } catch {
       // Reading the prototype ran a trap that threw (nestjs-cls proxy
       // providers do this outside a CLS context). An instance that cannot be
@@ -606,7 +609,16 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
 
     // Slot-backed subclasses share the private-member trade-off: methods run
     // against the raw instance so the natives they inherit keep working.
-    const requiresRawReceiver = hasPrivateMembers || slotBacked;
+    //
+    // So does a Node stream, for what it is fed by. The HTTP parser, zlib, a
+    // socket's handle or the generator behind `Readable.from` holds the raw
+    // stream and emits on it, and Node tells a stream's listeners apart by
+    // identity: the async iterator's "readable" listener compares its `this`
+    // with the stream the iterator was made on. Made on the proxy by a traced
+    // call, it never woke up, so `for await` over an injected request body
+    // hung - and threw "callback is not a function" outside any request,
+    // ending the process, once the client closed its socket.
+    const requiresRawReceiver = hasPrivateMembers || slotBacked || nodeStream;
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     const methodRefsCache = new WeakMap<object, Function>();
@@ -1045,6 +1057,32 @@ function isSlotBackedBuiltIn(instance: object): boolean {
     proto = Object.getPrototypeOf(proto);
   }
   return false;
+}
+
+/**
+ * Whether an instance is a Node stream: a `Readable`, `Writable` or anything
+ * built on them (an `IncomingMessage`, a socket, a zlib or file stream), and
+ * the legacy `Stream` under an `OutgoingMessage`.
+ *
+ * Matched by shape as well as by class: `readable-stream` is the same code
+ * published to npm, its current major no longer extends Node's `Stream`, and
+ * its async iterator makes the same identity check. The state object is what
+ * every copy's methods reach for first.
+ */
+function isNodeStream(instance: object): boolean {
+  if (instance instanceof Stream) {
+    return true;
+  }
+  const candidate = instance as {
+    _readableState?: unknown;
+    _writableState?: unknown;
+  };
+  return (
+    (typeof candidate._readableState === "object" &&
+      candidate._readableState !== null) ||
+    (typeof candidate._writableState === "object" &&
+      candidate._writableState !== null)
+  );
 }
 
 /**
