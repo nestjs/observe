@@ -555,6 +555,85 @@ describe("JobTraceRunner: patchEnqueue", () => {
 
     expect(add).toHaveBeenCalledOnce();
   });
+
+  /** A queue whose `add` and `addBulk` hand on what they are given. */
+  const patchedQueue = () => {
+    const add = vi.fn();
+    const addBulk = vi.fn();
+    class Queue {
+      add(...args: unknown[]) {
+        return add(...args);
+      }
+      addBulk(jobs: unknown[]) {
+        return addBulk(jobs);
+      }
+    }
+    runner.patchEnqueue(Queue.prototype as never, () => 2);
+    return { queue: new Queue(), add, addBulk };
+  };
+
+  it("keeps a bulk entry's name and data readable by name when its class keeps them", () => {
+    class RefundLine {
+      constructor(private readonly line: { sku: string }) {}
+      get name() {
+        return "refund-line";
+      }
+      get data() {
+        return { orderId: "1042", ...this.line };
+      }
+    }
+    const { queue, addBulk } = patchedQueue();
+
+    inTrace(() => queue.addBulk([new RefundLine({ sku: "LAMP" })]));
+
+    const [entry] = addBulk.mock.calls[0][0] as Record<string, any>[];
+    // Read by name, as BullMQ reads them.
+    expect(entry.name).toBe("refund-line");
+    expect(entry.data).toEqual({ orderId: "1042", sku: "LAMP" });
+    expect(entry.opts).toEqual({ observeTraceId: "trace-1" });
+    // And left behind by a spread, as Bull's own spread leaves them.
+    expect(Object.keys(entry).sort()).toEqual(["line", "opts"]);
+  });
+
+  it.each(["add", "addBulk"] as const)(
+    "keeps the job id the options inherit readable by name, through %s",
+    (method) => {
+      class PaymentOptions {
+        readonly attempts = 3;
+        get jobId() {
+          return "pay-invoice-77";
+        }
+      }
+      const { queue, add, addBulk } = patchedQueue();
+
+      inTrace(() =>
+        method === "add"
+          ? queue.add("pay-invoice", {}, new PaymentOptions())
+          : queue.addBulk([
+              { name: "pay-invoice", data: {}, opts: new PaymentOptions() },
+            ]),
+      );
+
+      const opts = (
+        method === "add"
+          ? add.mock.calls[0][2]
+          : (addBulk.mock.calls[0][0] as { opts: unknown }[])[0].opts
+      ) as Record<string, unknown>;
+      expect(opts.jobId).toBe("pay-invoice-77");
+      expect(opts).toEqual({ attempts: 3, observeTraceId: "trace-1" });
+    },
+  );
+
+  it("hands the driver what is no job as it was given, for it to refuse", () => {
+    const { queue, addBulk } = patchedQueue();
+    const job = { name: "daily-sales", data: {} };
+
+    inTrace(() => queue.addBulk([job, null, undefined, "weekly"]));
+
+    const [stamped, ...rest] = addBulk.mock.calls[0][0] as unknown[];
+    expect(stamped).toEqual({ ...job, opts: { observeTraceId: "trace-1" } });
+    expect(rest).toEqual([null, undefined, "weekly"]);
+  });
 });
 
 /**

@@ -118,6 +118,12 @@ interface QueuePrototypeLike {
 const ORIGINAL_ADD = Symbol.for("nestjs.observe.queue.add");
 const ORIGINAL_ADD_BULK = Symbol.for("nestjs.observe.queue.addBulk");
 
+/** What Bull and BullMQ read by name off an entry handed to `addBulk`. */
+const BULK_ENTRY_KEYS_READ_BY_NAME = ["name", "data"];
+
+/** What they read by name off a job's options; the rest they spread. */
+const JOB_OPTION_KEYS_READ_BY_NAME = ["jobId", "telemetry"];
+
 /** Where a run records which job it is running, for a layer nested inside it. */
 const ACTIVE_JOB_KEY = Symbol("nestjs.observe.activeJob");
 
@@ -146,6 +152,46 @@ function parkOriginal(
     prototype[key] = prototype[method];
   }
   return prototype[key];
+}
+
+/**
+ * Lets a driver read off `copy` what it would have read off `source`, the
+ * object the caller passed and the copy stands in for.
+ *
+ * A spread copies own enumerable properties, and the drivers read a few -
+ * `keys` - by name instead, which reaches what the caller keeps elsewhere
+ * too: an accessor on the prototype of a job class, an options class or an
+ * ODM document. A job whose `data` was a getter ran with `{}`, and options
+ * whose `jobId` was one enqueued the job again on every call instead of
+ * finding it. Each such key the spread left behind is read through to
+ * `source`, as the driver would have read it, and kept off the copy's own
+ * enumerable properties, so a spread the driver takes of the copy leaves it
+ * behind as a spread of `source` would have.
+ */
+function readableByName<T extends object>(
+  copy: T,
+  source: object,
+  keys: readonly string[],
+): T {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(copy, key) || !(key in source)) {
+      continue;
+    }
+    Object.defineProperty(copy, key, {
+      get: () => (source as Record<string, unknown>)[key],
+      set(this: object, value: unknown) {
+        Object.defineProperty(this, key, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      },
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return copy;
 }
 
 function isSameJob(outer: unknown, job: ActiveJob): boolean {
@@ -213,8 +259,19 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
         return originalAddBulk.call(
           this,
           jobs.map((job) => {
-            const stamped = stamp(job?.opts);
-            return stamped ? { ...job, opts: stamped } : job;
+            // What is no job is the driver's to refuse, as it does without
+            // the agent: stamped, a null entry became an empty job.
+            if (typeof job !== "object" || job === null) {
+              return job;
+            }
+            const stamped = stamp(job.opts);
+            return stamped
+              ? readableByName(
+                  { ...job, opts: stamped },
+                  job,
+                  BULK_ENTRY_KEYS_READ_BY_NAME,
+                )
+              : job;
           }),
         );
       };
@@ -249,10 +306,11 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
     if (current["repeat"] || current[JOB_TRACE_OPTION_KEY] !== undefined) {
       return undefined;
     }
-    const stamped: Record<string, unknown> = {
-      ...current,
-      [JOB_TRACE_OPTION_KEY]: traceId,
-    };
+    const stamped: Record<string, unknown> = readableByName(
+      { ...current, [JOB_TRACE_OPTION_KEY]: traceId },
+      current,
+      JOB_OPTION_KEYS_READ_BY_NAME,
+    );
     if (
       this.openTelemetryInteropOn() &&
       current[JOB_TRACE_CONTEXT_OPTION_KEY] === undefined
