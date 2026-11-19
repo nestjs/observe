@@ -82,6 +82,12 @@ class OrdersResolver {
     return names.length;
   }
 
+  /** Excluded by `graphql.ignore` below, and reaches a provider all the same. */
+  @Query(() => Int)
+  internalQuote(@Args("id", { type: () => Int }) id: number): number {
+    return this.pricing.quote(id);
+  }
+
   /** A schema name that differs from the method name, asserted on below. */
   @Query(() => [Order], { name: "latestOrders" })
   findLatest(): Order[] {
@@ -100,7 +106,11 @@ class OrdersResolver {
 
 @Module({
   imports: [
-    ObserveModule.forRoot(testObserveOptions()),
+    ObserveModule.forRoot(
+      testObserveOptions({
+        graphql: { ignore: (info) => info.fieldName === "internalQuote" },
+      }),
+    ),
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
       autoSchemaFile: true,
@@ -163,6 +173,23 @@ describe.each<Platform>(onPlatforms(["express", "node"]))(
     });
 
     beforeEach(() => collected.clear());
+
+    it("records nothing of an ignored operation, provider calls included", async () => {
+      // The HTTP agent opened a trace for this before the operation was
+      // known. A provider span in it kept the trace alive, and shipped it as
+      // `/graphql`.
+      const response = await gql("{ internalQuote(id: 4) }").expect(200);
+      expect(response.body.data.internalQuote).toBe(40);
+
+      // Snapshots are buffered in the order their responses end, so once
+      // this one is in, the one above is too if it was ever going to be.
+      await gql("{ orders { id } }").expect(200);
+      await waitForSnapshot(
+        collected,
+        (snapshot) => snapshot.operationId === "Query.orders",
+      );
+      expect(collected.items).toHaveLength(1);
+    });
 
     it("collects a snapshot for a GraphQL query", async () => {
       const response = await gql("{ orders { id name } }").expect(200);
