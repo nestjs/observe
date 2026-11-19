@@ -187,10 +187,11 @@ function isBase64Char(code: number): boolean {
  * name, as util.inspect writes one - otherwise it is an arrow function. Must
  * not start inside a name,
  * so each name is tried once, from its first character; a bracket is not part
- * of the name's own run, so `[token=x]` is a name after a bracket.
+ * of the name's own run, so `[token=x]` is a name after a bracket. The `--`
+ * of a command's option is not part of it either: `--password=x`.
  */
 const KEY_CANDIDATE =
-  /(?<![\w$.-])((?:\\?["'])?)([A-Za-z_$][\w$.-]*(?:\[[\w$.-]*\])*)((?:\\?["'])?)[ \t]*(:=|=>|:|=(?!=))[ \t]*/g;
+  /(?:(?<![\w$.-])|(?<=(?<![\w$.-])--))((?:\\?["'])?)([A-Za-z_$][\w$.-]*(?:\[[\w$.-]*\])*)((?:\\?["'])?)[ \t]*(:=|=>|:|=(?!=))[ \t]*/g;
 
 /**
  * What every name the shared matcher calls sensitive contains, written
@@ -245,7 +246,11 @@ const SCHEME_WORD = /^(?:bearer|basic|token)$/i;
  * side of a `:` or `=` is mostly identifiers: `const token = await sign(user)`
  * assigns no secret, and masking `await` would shred every frame that mentions
  * a credential by name. In source a secret is a literal, so only a quoted
- * value is masked there.
+ * value is masked there - in code. Inside a string, a template literal or a
+ * comment the text is text again, and a pair there is read as a message's
+ * is: `"...?base=USD&token=9f8e..."`, a connection string's `Password=x;`,
+ * `--password=x` in a shell command, a commented-out `DB_PASSWORD=x`. See
+ * `sourceTextReader` for how a frame is read for them.
  */
 function keyValueRule(
   isSensitiveKey: SensitiveKeyMatcher,
@@ -267,6 +272,7 @@ function keyValueRule(
         return text;
       }
       const candidate = new RegExp(KEY_CANDIDATE.source, "g");
+      const textAt = literalValuesOnly ? sourceTextReader(text) : undefined;
       let output = "";
       let copiedTo = 0;
       let match: RegExpExecArray | null;
@@ -294,6 +300,31 @@ function keyValueRule(
           continue;
         }
         const header = HEADER_KEY.test(key.toLowerCase().replace(/[-_]/g, ""));
+        // In source, where the name sits: in code, or in text.
+        const within = textAt?.(match.index + match[1].length);
+        // A quoted value - `\"x\"` included - is read as in code: a quote
+        // there may also be where the string ends (`"a&token=" + t`), but
+        // a frame that starts inside a template literal reads its closing
+        // backtick as an opening one, and a secret quoted after it would be
+        // missed.
+        const first = text[valueStart];
+        if (
+          within !== undefined &&
+          within !== "code" &&
+          first !== '"' &&
+          first !== "'" &&
+          first !== "`" &&
+          !(first === "\\" && /["']/.test(text[valueStart + 1] ?? ""))
+        ) {
+          const end = readBareInText(text, valueStart, header);
+          if (end !== -1) {
+            output += text.slice(copiedTo, valueStart);
+            output += mask(text.slice(valueStart, end));
+            copiedTo = end;
+            candidate.lastIndex = end;
+          }
+          continue;
+        }
         const valueEnd = readValue(text, valueStart, literalValuesOnly, header);
         if (valueEnd === -1) {
           continue;
@@ -306,6 +337,105 @@ function keyValueRule(
       return copiedTo === 0 ? text : output + text.slice(copiedTo);
     },
   };
+}
+
+/**
+ * What a character of source sits in: code, a string or template literal
+ * (named by its quote), or a comment.
+ */
+type SourceSpan = "code" | '"' | "'" | "`" | "comment";
+
+/**
+ * Reads a frame of source once, front to back, and tells what each position
+ * asked about sits in. Positions must be asked about in order - as the scan
+ * finds its names - so however many are asked, every character is read once.
+ *
+ * A comment is recognised before a quote, so `// don't` opens no string. A
+ * `'` or `"` string ends at its line, as JavaScript's do, so a quote it
+ * misreads - one in a regular expression, an apostrophe in JSX - is text for
+ * the rest of that line only. A template literal's `${...}` is code again,
+ * through the brace that closes it. A frame cut out of the middle of a file
+ * may start inside a template literal or a comment. That start is read as
+ * code, as every frame was before; a template literal's closing backtick
+ * then opens one, and the code up to the next backtick is read as text,
+ * where a bare value after a credential's name is masked although it is
+ * code.
+ */
+function sourceTextReader(text: string): (at: number) => SourceSpan {
+  let span: SourceSpan = "code";
+  let blockComment = false;
+  // One count of open braces per `${` the code is inside.
+  const expressions: number[] = [];
+  let read = 0;
+  return (at) => {
+    while (read < at) {
+      const char = text[read];
+      const next = text[read + 1];
+      if (span === "code") {
+        if (char === "/" && (next === "/" || next === "*")) {
+          span = "comment";
+          blockComment = next === "*";
+          read += 2;
+          continue;
+        }
+        if (char === '"' || char === "'" || char === "`") {
+          span = char;
+        } else if (char === "{" && expressions.length > 0) {
+          expressions[expressions.length - 1]++;
+        } else if (char === "}" && expressions.length > 0) {
+          if (expressions[expressions.length - 1] === 0) {
+            expressions.pop();
+            span = "`";
+          } else {
+            expressions[expressions.length - 1]--;
+          }
+        }
+      } else if (span === "comment") {
+        if (blockComment ? char === "*" && next === "/" : char === "\n") {
+          span = "code";
+          read += blockComment ? 2 : 1;
+          continue;
+        }
+      } else if (char === "\\") {
+        read += 2;
+        continue;
+      } else if (char === span || (char === "\n" && span !== "`")) {
+        span = "code";
+      } else if (span === "`" && char === "$" && next === "{") {
+        span = "code";
+        expressions.push(0);
+        read += 2;
+        continue;
+      }
+      read += 1;
+    }
+    return span;
+  };
+}
+
+/**
+ * Where a value without quotes ends inside a string or comment of source, or
+ * -1 when there is none: where a message's would, and also at a backtick, a
+ * `${`, or the `*\/` closing a comment - the text's own end.
+ */
+function readBareInText(text: string, at: number, header: boolean): number {
+  const stop = header ? HEADER_VALUE_END : BARE_VALUE_END;
+  let end = at;
+  while (end < text.length) {
+    const char = text[end];
+    if (
+      stop.test(char) ||
+      char === "\n" ||
+      char === "`" ||
+      (char === "$" && text[end + 1] === "{") ||
+      (char === "*" && text[end + 1] === "/")
+    ) {
+      break;
+    }
+    end++;
+  }
+  // Nothing, or the next pair's key.
+  return end === at || text[end - 1] === ":" ? -1 : end;
 }
 
 /**

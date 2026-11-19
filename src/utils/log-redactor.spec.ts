@@ -225,6 +225,16 @@ describe("LogRedactor", () => {
       },
     );
 
+    it("masks a command's option named as a credential", () => {
+      expect(
+        redactor.redactMessage(
+          "Command failed: mysqldump --user=backup --password=Nightly-77 orders",
+        ),
+      ).toBe(
+        "Command failed: mysqldump --user=backup --password=[REDACTED] orders",
+      );
+    });
+
     it.each([
       "exit code=42 state=open",
       "code: 42, state: 'open'",
@@ -763,6 +773,133 @@ describe("LogRedactor", () => {
       ];
 
       expect(redactor.redactSource(lines)).toEqual(lines);
+    });
+
+    it.each([
+      [
+        'const feed = "https://rates.internal/latest?base=USD&token=9f8e7d6c5b4a";',
+        'const feed = "https://rates.internal/latest?base=USD&token=[REDACTED]";',
+      ],
+      [
+        'const dsn = "Server=db.internal;User Id=app;Password=0rders-Pr0d;Encrypt=true";',
+        'const dsn = "Server=db.internal;User Id=app;Password=[REDACTED];Encrypt=true";',
+      ],
+      [
+        "execSync('mysqldump --user=backup --password=Nightly-Dump-77 orders');",
+        "execSync('mysqldump --user=backup --password=[REDACTED] orders');",
+      ],
+      [
+        "const url = `${base}/v1?api_key=sk_live_abc123&page=${page}`;",
+        "const url = `${base}/v1?api_key=[REDACTED]&page=${page}`;",
+      ],
+      [
+        "const u = `/places?key=AIzaSy_abc${suffix}`;",
+        "const u = `/places?key=[REDACTED]${suffix}`;",
+      ],
+      [
+        "// DB_PASSWORD=hunter2 until the vault is wired up",
+        "// DB_PASSWORD=[REDACTED] until the vault is wired up",
+      ],
+      [
+        "/* fallback: secret=hunter2*/ connect();",
+        "/* fallback: secret=[REDACTED]*/ connect();",
+      ],
+      [
+        'const header = "Authorization: Basic dTpw";',
+        'const header = "Authorization: [REDACTED]";',
+      ],
+      // JSON inside a string: the value is quoted, with escaped quotes.
+      [
+        String.raw`const body = "{\"password\":\"hunter2\"}";`,
+        String.raw`const body = "{\"password\":[REDACTED]}";`,
+      ],
+      [
+        String.raw`const body = '{\'token\': \'9f8e7d6c\'}';`,
+        String.raw`const body = '{\'token\': [REDACTED]}';`,
+      ],
+    ])(
+      "masks a pair inside a string or comment as a message's: %s",
+      (line, expected) => {
+        // The same text in the error's message is masked by the free-text
+        // rule; the frame quoting the line must not send it as written.
+        expect(redactor.redactSource([line])).toEqual([expected]);
+      },
+    );
+
+    it.each([
+      'const header = "Authorization: " + credentials;',
+      "this.logger.debug('password=' + mask(password));",
+      "const url = `/login?token=${token}`;",
+      "/* don't */ const token = await sign(user);",
+      "const msg = `ok ${ { a: 1 }.a }`; const token = await sign(user);",
+      "const s = 'it' + \"s\"; if (password !== confirmation) {",
+    ])("leaves %s as it was", (line) => {
+      // Code, or where a string ends: no value to mask.
+      expect(redactor.redactSource([line])).toEqual([line]);
+    });
+
+    it("reads a string that is not closed on its line as ending there", () => {
+      const lines = [
+        "const re = /'/;",
+        "const token = await sign(user);",
+        'const dsn = "Password=hunter2;";',
+      ];
+
+      expect(redactor.redactSource(lines)).toEqual([
+        "const re = /'/;",
+        "const token = await sign(user);",
+        'const dsn = "Password=[REDACTED];";',
+      ]);
+    });
+
+    it("reads a template literal and a block comment across lines", () => {
+      const lines = [
+        "const config = `",
+        "  token=9f8e7d6c5b4a",
+        "`;",
+        "/*",
+        " * password=hunter2",
+        " */",
+        "const token = await sign(user);",
+      ];
+
+      expect(redactor.redactSource(lines)).toEqual([
+        "const config = `",
+        "  token=[REDACTED]",
+        "`;",
+        "/*",
+        " * password=[REDACTED]",
+        " */",
+        "const token = await sign(user);",
+      ]);
+    });
+
+    it("masks a quoted secret after a frame starts inside a template literal", () => {
+      // The frame's first lines are the end of a query, so its closing
+      // backtick reads as an opening one - and a quote there may be a
+      // string's end as well as a value's start. It is taken for a value.
+      const lines = [
+        "    WHERE id = $1",
+        "  `;",
+        "  const apiKey = `sk_live_abcdef`;",
+      ];
+
+      expect(redactor.redactSource(lines)).toEqual([
+        "    WHERE id = $1",
+        "  `;",
+        "  const apiKey = [REDACTED];",
+      ]);
+    });
+
+    it("reads a frame of quotes and comments in linear time", () => {
+      const startedAt = performance.now();
+
+      redactor.redactSource(['"' + String.raw`\"token=a`.repeat(30_000)]);
+      redactor.redactSource(["`${".repeat(30_000) + "token=a"]);
+      redactor.redactSource(["/* token=a ".repeat(30_000)]);
+      redactor.redactSource(['"token=a&'.repeat(30_000)]);
+
+      expect(performance.now() - startedAt).toBeLessThan(500);
     });
 
     it("keeps the line count when a match spans lines", () => {
