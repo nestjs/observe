@@ -30,6 +30,7 @@ import {
   testObserveOptions,
   waitForSnapshot,
 } from "../testing/observe-harness.js";
+import { nestAtLeast } from "../testing/nest-version.js";
 
 const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -229,12 +230,18 @@ describe("ObserveModule: GraphQL resolvers with private members", () => {
     expect(response.body.errors[0].extensions.code).toBe("FORBIDDEN");
   });
 
-  it("keeps the guards of a resolver registered under another token", async () => {
-    // Handed the instance behind the proxy, Nest found no module for this
-    // resolver and ran the query with its guard left out.
-    const response = await gql("{ ledgerSize }");
+  // Nest finds the module of a resolver registered under another token, and
+  // so its guards, only from 12.2.0 (nestjs/nest d1a5e0dd31); before that it
+  // ran such a resolver without them, with the agent or without it.
+  it.runIf(nestAtLeast("12.2.0"))(
+    "keeps the guards of a resolver registered under another token",
+    async () => {
+      // Handed the instance behind the proxy, Nest found no module for this
+      // resolver and ran the query with its guard left out.
+      const response = await gql("{ ledgerSize }");
 
-    expect(response.body.data).toBeNull();
-    expect(response.body.errors[0].extensions.code).toBe("FORBIDDEN");
-  });
+      expect(response.body.data).toBeNull();
+      expect(response.body.errors[0].extensions.code).toBe("FORBIDDEN");
+    },
+  );
 });
