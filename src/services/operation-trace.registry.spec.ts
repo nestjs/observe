@@ -6,6 +6,7 @@ import {
   NotFoundException,
 } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
+import { fileURLToPath } from "url";
 import { RequestSnapshot } from "../interfaces/request-snapshot.interface.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
 import { LogRedactor } from "../utils/log-redactor.js";
@@ -703,6 +704,47 @@ describe("OperationTraceRegistry", () => {
       const root = snapshot!.traces[0] as { error?: { message: string } };
 
       expect(root.error!.message).toBe("password=hunter2");
+    });
+
+    describe("code frames", () => {
+      beforeEach(() => {
+        registry = new OperationTraceRegistry(als as never, true);
+      });
+
+      const codeFramesOf = async (traceId: string, error: Error) => {
+        startRequest(traceId);
+        failRootSpan(traceId, error);
+        registry.endTrace(traceId);
+        const snapshot = await registry.pluckSnapshot(traceId);
+        return (
+          snapshot!.traces[0].error as { codeFrames?: { file: string }[] }
+        ).codeFrames;
+      };
+
+      it("are read off a stack that opens with the error's own name", async () => {
+        // `NotFoundException: No such order`: the name is as much a part of
+        // the header the frames are found by as the message is.
+        const frames = await codeFramesOf(
+          "e-frames",
+          new NotFoundException("No such order"),
+        );
+
+        expect(frames?.[0].file).toContain("operation-trace.registry.spec");
+      });
+
+      it("are not read off a stack another error wrote", async () => {
+        // A wrapper - `GraphQLError` with an `originalError` - whose message
+        // ends the first line of the stack it took over, written from a
+        // message that quoted the request.
+        const cause = new Error(
+          `No order with id Lookup failed\n    at run (${fileURLToPath(import.meta.url)}:1:1)`,
+        );
+        const error = new Error("Lookup failed");
+        error.name = "GraphQLError";
+        error.stack = cause.stack;
+
+        expect(await codeFramesOf("e-taken-over", error)).toBeUndefined();
+      });
     });
 
     it("marks a nested span as failed without repeating the payload", async () => {

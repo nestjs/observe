@@ -150,44 +150,37 @@ function isReadableSourcePath(
  * `"\n    at f (/app/dist/config.js:1:1)"` - a request parameter interpolated
  * into a validation or driver error is enough - reads as a frame, and sits
  * above the real ones. So the boundary is taken from the error itself: the
- * message has to be found on the stack's first line and run to the end of a
- * line, and only the unbroken run of frame lines directly after it counts.
- * That run also ends before anything appended later (`Caused by: ...`), which
- * is one more message.
+ * stack has to open with exactly the header its name, code and message make,
+ * and only the unbroken run of frame lines directly after it counts. That run
+ * also ends before anything appended later (`Caused by: ...`), which is one
+ * more message.
  *
- * Fails closed. An error whose message was reassigned after construction no
- * longer matches its own stack and gets no code frames, which costs a nicety;
- * guessing the boundary instead is what the paragraph above is about.
+ * The whole header, not the message wherever it ends the first line: a first
+ * line written from some other message can end with this one, and the lines
+ * after it are then that message's - a `GraphQLError` carries the stack of
+ * the error it wraps, whose message may quote the request and end with the
+ * wrapper's own.
+ *
+ * Fails closed. An error whose message was reassigned after its stack was
+ * written, or that took over another error's stack, no longer matches it and
+ * gets no code frames, which costs a nicety; guessing the boundary instead is
+ * what the paragraphs above are about.
  *
  * With `message` undefined the whole string is treated as frames - only for a
  * stack the caller wrote itself.
  */
-function frameLines(stack: string, message: string | undefined): string[] {
+function frameLines(
+  stack: string,
+  message: string | undefined,
+  name = "Error",
+  code?: string,
+): string[] {
   if (message === undefined) {
     return stack.split("\n", MAX_FRAME_LINES);
   }
 
-  let headerEnd: number;
-  if (message === "") {
-    headerEnd = stack.indexOf("\n");
-  } else {
-    // A match that starts on the first line and runs to the end of a line
-    // has one possible place: the message's first line has to end where the
-    // stack's first line does. That steps over a match inside the name -
-    // `UnauthorizedException: Unauthorized` - and it is computed rather than
-    // searched for. Neither string is bounded here, nor certain to be what
-    // V8 wrote - a driver can copy both off a server's reply - and visiting
-    // every match on a first line that repeats the message was quadratic.
-    const stackLineEnd = stack.indexOf("\n");
-    const messageLineEnd = message.indexOf("\n");
-    const at =
-      stackLineEnd - (messageLineEnd === -1 ? message.length : messageLineEnd);
-    headerEnd =
-      at >= 0 && at < stackLineEnd && stack.startsWith(message, at)
-        ? at + message.length
-        : -1;
-  }
-  if (headerEnd === -1 || stack[headerEnd] !== "\n") {
+  const headerEnd = headerEndOf(stack, message, name, code);
+  if (headerEnd === -1) {
     return [];
   }
 
@@ -199,6 +192,49 @@ function frameLines(stack: string, message: string | undefined): string[] {
     lines.push(line);
   }
   return lines;
+}
+
+/**
+ * Where the header a stack opens with ends, when it is the one V8 writes for
+ * an error of this name, code and message - at the line break after it - or
+ * -1. V8 writes what `Error.prototype.toString` returns: `name: message`, or
+ * either alone when the other is empty. Node's own errors put their code in
+ * it too, `TypeError [ERR_INVALID_ARG_TYPE]: ...`, and `source-map-support`
+ * writes `name: ` for an empty message as well.
+ *
+ * Compared in place rather than built and compared: neither the message nor
+ * the stack is bounded here.
+ */
+function headerEndOf(
+  stack: string,
+  message: string,
+  name: string,
+  code: string | undefined,
+): number {
+  const endsAt = (at: number) => (stack[at] === "\n" ? at : -1);
+  if (message === "" && stack.startsWith(name)) {
+    const end = endsAt(name.length);
+    if (end !== -1) {
+      return end;
+    }
+  }
+  if (name === "" && stack.startsWith(message)) {
+    const end = endsAt(message.length);
+    if (end !== -1) {
+      return end;
+    }
+  }
+  const prefixes =
+    code === undefined ? [`${name}: `] : [`${name}: `, `${name} [${code}]: `];
+  for (const prefix of prefixes) {
+    if (stack.startsWith(prefix) && stack.startsWith(message, prefix.length)) {
+      const end = endsAt(prefix.length + message.length);
+      if (end !== -1) {
+        return end;
+      }
+    }
+  }
+  return -1;
 }
 
 /**
@@ -277,11 +313,16 @@ function toFilePath(file: string): string | undefined {
 
 function parseFrames(
   stack: string,
-  message: string | undefined,
+  header: { message?: string; name?: string; code?: string },
 ): ParsedFrame[] {
   const frames: ParsedFrame[] = [];
 
-  for (const raw of frameLines(stack, message)) {
+  for (const raw of frameLines(
+    stack,
+    header.message,
+    header.name,
+    header.code,
+  )) {
     const parsed = parseFrameLine(raw);
     if (!parsed) {
       continue;
@@ -383,6 +424,12 @@ export function collectCodeFrames(
      */
     message?: string;
     /**
+     * The error's `name`, and its `code` when it has one that is text: with
+     * the message, the header the stack opens with. `Error` when absent.
+     */
+    name?: string;
+    code?: string;
+    /**
      * Redacts the source before a frame is cut from it - see
      * `redactedSource`.
      */
@@ -415,7 +462,7 @@ export function collectCodeFrames(
   const maxFrames = options.maxFrames ?? 5;
 
   try {
-    const frames = parseFrames(stack, options.message).slice(0, maxFrames);
+    const frames = parseFrames(stack, options).slice(0, maxFrames);
     const codeFrames: CodeFrame[] = [];
 
     for (const frame of frames) {

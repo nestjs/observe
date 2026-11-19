@@ -156,8 +156,12 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
   });
 
   const forged = () => `x\n    at f (${secret}:1:1)`;
-  const collect = (error: Error) =>
-    collectCodeFrames(error.stack, { message: error.message });
+  const collect = (error: Error & { code?: unknown }) =>
+    collectCodeFrames(error.stack, {
+      message: error.message,
+      name: error.name,
+      code: typeof error.code === "string" ? error.code : undefined,
+    });
   const files = (frames: ReturnType<typeof collectCodeFrames>) =>
     (frames ?? []).map((frame) => basename(frame.file));
 
@@ -287,13 +291,67 @@ describe("collectCodeFrames on a stack with an untrusted message", () => {
     // `MongoServerError` copies both off the server's reply - so neither has
     // to be what V8 wrote. Visiting every match on the first line, each with a
     // scan back to its start, was quadratic: ~4s for this input.
-    const stack = `${"a".repeat(75_000)}\n    at run (${secret}:1:1)`;
+    const repeated = "a".repeat(75_000);
+    const stack = `Error: ${repeated}\n    at run (${secret}:1:1)`;
     const startedAt = performance.now();
 
+    // A first line that only ends with the message is not its header.
     const frames = collectCodeFrames(stack, { message: "a" });
 
     expect(performance.now() - startedAt).toBeLessThan(250);
-    expect(files(frames)).toEqual(["secrets.js"]);
+    expect(frames).toBeUndefined();
+    expect(files(collectCodeFrames(stack, { message: repeated }))).toEqual([
+      "secrets.js",
+    ]);
+  });
+
+  it("reads nothing when a stale first line ends with the new message", () => {
+    const error = new Error(
+      `No order with id Lookup failed\n    at f (${secret}:1:1)`,
+    );
+    void error.stack;
+    error.message = "Lookup failed";
+
+    expect(collect(error)).toBeUndefined();
+  });
+
+  it("reads nothing off a stack taken over from another error", () => {
+    // What `new GraphQLError(message, { originalError })` does: the wrapper
+    // has a name and message of its own, and the stack of the error it wraps,
+    // whose message quoted the request and ends with the wrapper's.
+    const cause = new Error(
+      `No order with id Lookup failed\n    at f (${secret}:1:1)`,
+    );
+    const error = new Error("Lookup failed");
+    error.name = "GraphQLError";
+    error.stack = cause.stack;
+
+    expect(collect(error)).toBeUndefined();
+  });
+
+  it("reads the frames of a Node error, whose header carries its code", () => {
+    // `RangeError [ERR_OUT_OF_RANGE]: The value of "size" is out of range. ...`
+    let error!: Error;
+    try {
+      Buffer.alloc(-1);
+    } catch (thrown) {
+      error = thrown as Error;
+    }
+
+    expect(files(collect(error))).toContain("source-context.util.spec.ts");
+  });
+
+  it("reads the frames of an error named after it was made", () => {
+    class LookupError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "LookupError";
+      }
+    }
+
+    expect(files(collect(new LookupError("No order")))).toContain(
+      "source-context.util.spec.ts",
+    );
   });
 
   it("reads a file once, however its frame spells it", () => {

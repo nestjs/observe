@@ -376,6 +376,28 @@ function stackOf(error: Error): string | undefined {
   }
 }
 
+/**
+ * An error's `name` and `code`, when they can be read and are text - what,
+ * with its message, opens its stack (see `collectCodeFrames`). A driver
+ * error copies a server reply's fields onto itself, so either may be
+ * anything, or a getter that throws.
+ */
+function stackHeaderOf(error: unknown): { name?: string; code?: string } {
+  const header: { name?: string; code?: string } = {};
+  try {
+    const { name, code } = error as { name?: unknown; code?: unknown };
+    if (typeof name === "string") {
+      header.name = name;
+    }
+    if (typeof code === "string") {
+      header.code = code;
+    }
+  } catch {
+    // Read as far as it could be; the stack is then unlikely to match.
+  }
+  return header;
+}
+
 /** The name of a thrown value's class, when it can be read. */
 function classNameOf(error: unknown): string | undefined {
   try {
@@ -625,14 +647,16 @@ export class OperationTraceRegistry {
 
     if (this.sourceContext !== false) {
       const settings = this.sourceContext === true ? {} : this.sourceContext;
-      // Read off the raw stack with the raw message: the message is what marks
-      // where the frames start, and it only matches the stack it came from.
-      // Nothing of either is shipped from here - just the file positions.
-      // Source is as likely to hold a literal secret as a message is, and
-      // goes to the same place.
+      // Read off the raw stack with the raw message, and the error's name and
+      // code: together they are the header that marks where the frames
+      // start, and it only matches the stack it was written into. Nothing of
+      // them is shipped from here - just the file positions. Source is as
+      // likely to hold a literal secret as a message is, and goes to the
+      // same place.
       const codeFrames = collectCodeFrames(raw.stack, {
         ...settings,
         message: raw.message,
+        ...stackHeaderOf(error),
         redactor: this.redactor ?? undefined,
       });
       if (codeFrames) {
