@@ -1947,6 +1947,39 @@ describe("createInstanceDecorator", () => {
       expect(endedSteps).toEqual([{ spanId: "Object#greet" }]);
     });
 
+    it("hands plain data back untouched", () => {
+      // The structured clone algorithm refuses any proxy, whatever its
+      // target: `structuredClone`, `postMessage` and `workerData` threw
+      // "could not be cloned" on an injected options object.
+      const options = { format: "csv", columns: ["id", "total"] };
+      const columns = ["id", "total"];
+      const record = Object.assign(Object.create(null) as object, {
+        format: "csv",
+      });
+
+      expect(decorate(options)).toBe(options);
+      expect(decorate(columns)).toBe(columns);
+      expect(decorate(record)).toBe(record);
+      expect(structuredClone(decorate(options))).toEqual(options);
+    });
+
+    it("still traces a proxy provider that reads as data", () => {
+      // nestjs-cls hands out a proxy that reads as `{}` until a request
+      // resolves it; what it then forwards to is the provider.
+      const service = { greet: (name: string) => `hello ${name}` };
+      const resolved = new Proxy({} as typeof service, {
+        get: (_target, prop) => Reflect.get(service, prop),
+      });
+
+      const decorated = decorate(resolved) as typeof service;
+
+      expect(decorated).not.toBe(resolved);
+      expect(withTrace(() => decorated.greet("you"))).toEqual("hello you");
+      expect(startedSteps).toEqual([
+        { className: "Object", methodName: "greet" },
+      ]);
+    });
+
     it("hands a frozen object back untouched", () => {
       // A proxy has to answer a read of a read-only, non-configurable data
       // property with the target's own value - a wrapper in its place threw

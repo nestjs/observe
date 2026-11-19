@@ -109,6 +109,50 @@ function isMongoDriverHandle(instance: object): boolean {
 }
 
 /**
+ * Whether an instance is data and nothing else: an object literal, a
+ * null-prototype record or an array with no function and no accessor among
+ * its own members - the options object or list behind a `useValue`, or what a
+ * `useFactory` returns.
+ *
+ * It has no method of its own to trace, and a proxy around it breaks what the
+ * value itself supports: the structured clone algorithm consults no trap and
+ * refuses a proxy whatever its target is, so `structuredClone`, `postMessage`,
+ * `workerData` and `v8.serialize` all threw on an injected options object.
+ * What it inherits from `Object` or `Array` (`columns.map`) is no longer
+ * traced either.
+ *
+ * Members are read as descriptors, so no getter runs here; an accessor may
+ * hand out a function, and so counts as one. A proxy is never data: it
+ * answers these questions with its traps - a nestjs-cls proxy provider reads
+ * as `{}` until a request resolves it - and could not be cloned to begin with.
+ */
+function isPlainData(instance: object): boolean {
+  if (types.isProxy(instance)) {
+    return false;
+  }
+  const proto: unknown = Object.getPrototypeOf(instance);
+  if (
+    proto !== null &&
+    proto !== Object.prototype &&
+    proto !== Array.prototype
+  ) {
+    return false;
+  }
+  for (const key of Reflect.ownKeys(instance)) {
+    const own = Reflect.getOwnPropertyDescriptor(instance, key);
+    if (
+      own === undefined ||
+      own.get !== undefined ||
+      own.set !== undefined ||
+      typeof own.value === "function"
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Library classes traced only in part, each with a method only it has, which
  * tells it from an application's own class of the same name - `ValidationPipe`
  * is what Nest's documentation calls the pipe it has readers write themselves,
@@ -507,8 +551,13 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
       //
       // A frozen object is handed back as it is: a proxy has to answer a read
       // of each of its members with the member itself, so there is nothing
-      // it could trace - see `isReadOnlyOwnValue`.
-      if (isFrameworkNoise(instance) || Object.isFrozen(instance)) {
+      // it could trace - see `isReadOnlyOwnValue`. So is plain data, which
+      // has nothing to trace and which a proxy keeps from being cloned.
+      if (
+        isFrameworkNoise(instance) ||
+        Object.isFrozen(instance) ||
+        isPlainData(instance)
+      ) {
         return instance;
       }
       hasPrivateMembers = usesPrivateMembers(instance);
