@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
+  accessSync,
+  constants,
   existsSync,
   lstatSync,
   readFileSync,
@@ -130,13 +132,55 @@ export function writeEnvFile(cwd: string, appKey: string, appSecret: string) {
  *
  * An ignore rule does not apply to a file in the index, so the secret written
  * into a tracked `.env` would be in the next `git commit -a` whatever
- * `.gitignore` says. Git is asked with its arguments fixed, from Node's own
- * directory and pointed at the project with `-C`, and with the two settings
- * a project's own `.git/config` could use to run a program turned off:
- * `core.fsmonitor`, which `ls-files` would start, and the discovery of a bare
- * repository that only sits in the checkout.
+ * `.gitignore` says. Git is asked as `askGit` asks it, with nothing of the
+ * project's that could run a program.
  */
 export function trackedEnvFile(cwd: string): string | undefined {
+  const env = envFileOf(cwd);
+  if (!env) {
+    return undefined;
+  }
+  const status = askGit(dirname(env.path), [
+    "--literal-pathspecs",
+    "ls-files",
+    "--error-unmatch",
+    "--",
+    basename(env.path),
+  ]);
+  return status === 0 ? relative(env.root, env.path) || ".env" : undefined;
+}
+
+/**
+ * Whether git ignores the file the key pair is written into - `.env`, or
+ * what it links to: true or false as git answers, undefined when there is
+ * no repository or no git to ask.
+ *
+ * Asked of git itself, after `ensureEnvIgnored`, rather than read off
+ * `.gitignore`: git decides with every ignore file there is, and a rule
+ * `ensureEnvIgnored` saw does not ignore a file `.env` links to under
+ * another name. Asked the way `trackedEnvFile` asks.
+ */
+export function envFileIgnored(cwd: string): boolean | undefined {
+  const env = envFileOf(cwd);
+  if (!env) {
+    return undefined;
+  }
+  // `check-ignore` takes no `--literal-pathspecs`; a name after `./` is a
+  // name, whatever it starts with.
+  const status = askGit(dirname(env.path), [
+    "check-ignore",
+    "-q",
+    "--",
+    `./${basename(env.path)}`,
+  ]);
+  return status === 0 ? true : status === 1 ? false : undefined;
+}
+
+/**
+ * The project's real directory, and the real path of its `.env` - what it
+ * links to, or where it would be created.
+ */
+function envFileOf(cwd: string): { root: string; path: string } | undefined {
   let root: string;
   try {
     root = realpathSync(cwd);
@@ -149,24 +193,67 @@ export function trackedEnvFile(cwd: string): string | undefined {
   } catch {
     // Not there yet, though it may still be in the index.
   }
-  const { status } = spawnSync(
+  return { root, path };
+}
+
+/**
+ * Runs git with `args` in `dir` and returns its exit status, null when it
+ * could not run. Its arguments are fixed, it starts from Node's own
+ * directory and is pointed at the project with `-C`, and the two settings
+ * a project's own `.git/config` could use to run a program are turned off:
+ * `core.fsmonitor`, which reading the index starts, and the discovery of
+ * a bare repository that only sits in the checkout.
+ */
+function askGit(dir: string, args: string[]): number | null {
+  return spawnSync(
     "git",
     [
       "-c",
       "core.fsmonitor=false",
       "-c",
       "safe.bareRepository=explicit",
-      "--literal-pathspecs",
       "-C",
-      dirname(path),
-      "ls-files",
-      "--error-unmatch",
-      "--",
-      basename(path),
+      dir,
+      ...args,
     ],
     { cwd: dirname(process.execPath), stdio: "ignore", timeout: 10_000 },
-  );
-  return status === 0 ? relative(root, path) || ".env" : undefined;
+  ).status;
+}
+
+/**
+ * Why `ensureEnvIgnored` could not add `.env` to `<cwd>/.gitignore`, or
+ * undefined when it can: the file is there, a regular file that can be read
+ * and written, or it is not and the directory can take it. Asked before a
+ * code is, so no pair is issued for a project it could not be kept out of
+ * git in.
+ *
+ * A link is refused even when it stays in the project: git reads no
+ * `.gitignore` that is a symbolic link (2.32 and later), so a rule written
+ * through it would keep nothing out of git, however it read.
+ */
+export function gitignoreProblem(cwd: string): string | undefined {
+  const path = join(cwd, ".gitignore");
+  const stats = lstatSync(path, { throwIfNoEntry: false });
+  if (stats === undefined) {
+    try {
+      accessSync(cwd, constants.W_OK);
+      return undefined;
+    } catch {
+      return `There is no .gitignore in ${cwd} and the directory cannot be written to, so link could not keep .env out of git.`;
+    }
+  }
+  if (stats.isSymbolicLink()) {
+    return ".gitignore is a symbolic link, and git does not read one, so a rule in it would not keep .env out of git. Put the file itself in its place and link again.";
+  }
+  if (!stats.isFile()) {
+    return ".gitignore is not a file, so link could not keep .env out of git.";
+  }
+  try {
+    accessSync(path, constants.R_OK | constants.W_OK);
+    return undefined;
+  } catch {
+    return ".gitignore cannot be read and written, so link could not keep .env out of git.";
+  }
 }
 
 /**

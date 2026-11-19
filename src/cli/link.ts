@@ -8,6 +8,8 @@ import {
 import {
   addEnvFileToStartScripts,
   ensureEnvIgnored,
+  envFileIgnored,
+  gitignoreProblem,
   isEnvFileValue,
   isProjectFile,
   LINK_FILES,
@@ -122,6 +124,11 @@ export async function link(
     );
     return 1;
   }
+  const gitignore = gitignoreProblem(options.cwd);
+  if (gitignore) {
+    deps.log(`${gitignore} Nothing was written.`);
+    return 1;
+  }
   const manager = detectPackageManager(options.cwd);
 
   let started: StartedLink;
@@ -170,8 +177,28 @@ export async function link(
     return 1;
   }
 
+  // `.env` is kept out of git before the secret is in it: written first, a
+  // .gitignore that then could not be updated left the secret in a file
+  // the next `git add .` takes.
+  let ignoredNow: boolean;
+  try {
+    ignoredNow = ensureEnvIgnored(options.cwd);
+  } catch (err) {
+    deps.log(
+      `Could not add .env to .gitignore (${describe(err)}), so the key pair was not written: it would not stay out of git. Fix .gitignore and link again.`,
+    );
+    return 1;
+  }
+  // Git has the last word on what it ignores: a rule elsewhere can take
+  // .env back, and a .env that links to another file is not what keeps
+  // that file out. Without a repository or git there is no one to ask.
+  if (envFileIgnored(options.cwd) === false) {
+    deps.log(
+      `git does not ignore .env, or the file it leads to,${ignoredNow ? " even with the rule link added to .gitignore," : ""} so the key pair was not written: it would be in your next commit. git check-ignore -v .env shows the rule git goes by; link again once git ignores it.`,
+    );
+    return 1;
+  }
   writeEnvFile(options.cwd, credentials.appKey, credentials.appSecret);
-  const ignoredNow = ensureEnvIgnored(options.cwd);
   const scripts = addEnvFileToStartScripts(options.cwd);
 
   deps.log("");

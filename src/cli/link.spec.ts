@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -14,7 +15,11 @@ import { dirname, join } from "node:path";
 import * as ts from "typescript";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { link, LinkDependencies } from "./link.js";
-import { ensureEnvIgnored, writeEnvFile } from "./project-files.js";
+import {
+  ensureEnvIgnored,
+  envFileIgnored,
+  writeEnvFile,
+} from "./project-files.js";
 
 const STARTED = {
   deviceCode: "device-code",
@@ -408,6 +413,96 @@ describe("npx @nestjs/observe link", () => {
       expect(await run(h)).toBe(0);
       expect(read(".env")).toContain("OBSERVE_APP_SECRET=");
     });
+
+    // The rule keeps the link out of git, not the file it leads to, which
+    // is where the pair would go.
+    it("writes no pair into a file .env leads to that git does not ignore", async () => {
+      write("config/local.env", "PORT=3000\n");
+      symlinkSync("config/local.env", join(cwd, ".env"));
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(1);
+
+      expect(h.lines.join("\n")).toContain("git does not ignore .env");
+      expect(h.lines.join("\n")).toContain("the key pair was not written");
+      expect(read("config/local.env")).toBe("PORT=3000\n");
+    });
+
+    // Git reads no .gitignore that is a link, wherever it leads: the rule
+    // link would add to it, or the one it has, keeps nothing out of git.
+    it("hears from git that a linked .gitignore ignores nothing", () => {
+      write("config/app.gitignore", "node_modules\n.env\n");
+      rmSync(join(cwd, ".gitignore"));
+      symlinkSync("config/app.gitignore", join(cwd, ".gitignore"));
+
+      expect(ensureEnvIgnored(cwd)).toBe(false);
+      expect(envFileIgnored(cwd)).toBe(false);
+
+      rmSync(join(cwd, ".gitignore"));
+      writeFileSync(join(cwd, ".gitignore"), ".env\n");
+      expect(envFileIgnored(cwd)).toBe(true);
+    });
+  });
+
+  // Checked before a code is asked for, so no pair is issued for a project
+  // its .gitignore cannot keep .env out of git in.
+  it.each([
+    [
+      "a directory",
+      () => mkdirSync(join(cwd, ".gitignore")),
+      ".gitignore is not a file",
+    ],
+    [
+      "a link that stays in the project",
+      () => {
+        write("config/app.gitignore", "node_modules\n.env\n");
+        symlinkSync("config/app.gitignore", join(cwd, ".gitignore"));
+      },
+      ".gitignore is a symbolic link, and git does not read one",
+    ],
+    // Root writes to a read-only file all the same.
+    ...(process.getuid?.() === 0
+      ? []
+      : [
+          [
+            "read-only",
+            () => {
+              writeFileSync(join(cwd, ".gitignore"), "node_modules\n");
+              chmodSync(join(cwd, ".gitignore"), 0o444);
+            },
+            ".gitignore cannot be read and written",
+          ] as [string, () => void, string],
+        ]),
+  ])(
+    "turns the project away, before asking for a code, when .gitignore is %s",
+    async (_name, prepare, said) => {
+      rmSync(join(cwd, ".gitignore"));
+      prepare();
+      const h = harness([{ status: 200, body: LINKED }]);
+
+      expect(await run(h)).toBe(1);
+
+      expect(h.requests).toEqual([]);
+      expect(h.lines.join("\n")).toContain(said);
+      expect(h.lines.join("\n")).toContain("Nothing was written.");
+      expect(existsSync(join(cwd, ".env"))).toBe(false);
+    },
+  );
+
+  // .gitignore is updated before the pair is written: the other way round,
+  // a failure to update it left the secret in a .env git would take.
+  it("writes no pair when .gitignore cannot be updated once it is approved", async () => {
+    writeFileSync(join(cwd, ".gitignore"), "node_modules\n");
+    const h = harness([{ status: 200, body: LINKED }]);
+    h.deps.sleep = async () => {
+      rmSync(join(cwd, ".gitignore"));
+      mkdirSync(join(cwd, ".gitignore"));
+    };
+
+    expect(await run(h)).toBe(1);
+
+    expect(h.lines.join("\n")).toContain("Could not add .env to .gitignore");
+    expect(existsSync(join(cwd, ".env"))).toBe(false);
   });
 
   // Git's reading of .gitignore: the last rule that matches decides, a `!`
