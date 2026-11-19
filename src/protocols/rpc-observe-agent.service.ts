@@ -59,6 +59,26 @@ interface GrpcCall<TRequest = any, TMetadata = any> {
   operationId: string;
 }
 
+/**
+ * A gRPC call as grpc-js hands it to the server's method: the request stream
+ * itself, whose events the agent runs in the call's store.
+ */
+interface GrpcServerCall {
+  metadata?: unknown;
+  emit: (event: string | symbol, ...args: unknown[]) => boolean;
+}
+
+/**
+ * `ServerGrpc.createServiceMethod`, which builds the method grpc-js calls for
+ * each call of a service - the same three parameters in every Nest release
+ * the agent supports.
+ */
+type CreateServiceMethod = (
+  methodHandler: unknown,
+  protoNativeHandler: { requestStream?: boolean } | undefined,
+  streamType: unknown,
+) => unknown;
+
 type ProcessingStartHook = (
   transportId: Transport | symbol,
   ctx: unknown,
@@ -94,6 +114,15 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
 
   /** The operation each context was started for - see `rememberOperation`. */
   private readonly operations = new WeakMap<object, OperationState>();
+
+  /**
+   * The gRPC calls of a request stream, by their metadata - see
+   * `rememberGrpcCalls`.
+   */
+  private readonly grpcCalls = new WeakMap<object, GrpcServerCall>();
+
+  /** The gRPC servers whose calls `rememberGrpcCalls` already notes. */
+  private readonly grpcServers = new WeakSet<object>();
 
   constructor(
     private readonly asyncLocalStorage: AsyncLocalStorage<
@@ -198,6 +227,112 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       },
       composeEndHook,
     );
+
+    if (
+      (target as { transportId?: unknown }).transportId ===
+      this.microservices!.Transport.GRPC
+    ) {
+      this.rememberGrpcCalls(target);
+    }
+  }
+
+  /**
+   * Notes each call of a gRPC request stream by its metadata, for
+   * `startGrpcRequestTracing` to find the call itself by.
+   *
+   * The start hook is handed a copy of the call, its fields spread onto a new
+   * object (`{ ...call }`), and a copy emits nothing: the messages of the
+   * request stream are emitted on the call. The copy shares the call's
+   * `metadata`, so the call is kept by that, from the method grpc-js runs for
+   * it - the only place the call itself passes before the hook. That method
+   * is built by `createServiceMethod`, wrapped here on this server alone as
+   * Nest calls it once per method when the server starts to listen, after
+   * this hook was set. Unary and server-streaming calls are left alone: they
+   * have no later messages to run anywhere. A server without the method keeps
+   * its calls' events where grpc-js emits them.
+   */
+  private rememberGrpcCalls(target: Server): void {
+    const server = target as unknown as {
+      createServiceMethod?: CreateServiceMethod;
+    };
+    const original = server.createServiceMethod;
+    if (typeof original !== "function" || this.grpcServers.has(target)) {
+      return;
+    }
+    this.grpcServers.add(target);
+    const calls = this.grpcCalls;
+    server.createServiceMethod = function (
+      this: unknown,
+      methodHandler,
+      protoNativeHandler,
+      streamType,
+    ) {
+      const method = original.call(
+        this,
+        methodHandler,
+        protoNativeHandler,
+        streamType,
+      );
+      if (!protoNativeHandler?.requestStream || typeof method !== "function") {
+        return method;
+      }
+      return function (this: unknown, call: unknown, ...rest: unknown[]) {
+        const metadata = (call as { metadata?: unknown } | null)?.metadata;
+        if (typeof metadata === "object" && metadata !== null) {
+          calls.set(metadata, call as GrpcServerCall);
+        }
+        return (method as (...args: unknown[]) => unknown).call(
+          this,
+          call,
+          ...rest,
+        );
+      };
+    };
+  }
+
+  /**
+   * Runs the events of a gRPC request stream in the call's store.
+   *
+   * A listener runs in the async context of whatever emits its event. The
+   * messages already queued when the handler subscribes are emitted from
+   * within `done`, inside the store; every later one from grpc-js's callback
+   * on the HTTP/2 stream, which belongs to the connection and has no store.
+   * So the second message of an ordinary stream was handled outside its call:
+   * no spans, no trace id on its log lines, and `TracerService.createSpan()`
+   * threw - a status 2 for a `@GrpcStreamMethod` handler, and for a
+   * `@GrpcStreamCall` handler's `data` listener an uncaught rejection that
+   * ended the process.
+   *
+   * An event emitted from within the call - a span of it writing to the
+   * stream - keeps the context it is emitted in, the span's, which carries
+   * the call's key.
+   */
+  private emitCallEventsInStore(
+    ctx: GrpcCall,
+    store: Map<KeyOf<Store>, any>,
+    registryKey: string,
+  ): void {
+    const metadata: unknown = ctx?.metadata;
+    if (typeof metadata !== "object" || metadata === null) {
+      return;
+    }
+    const call = this.grpcCalls.get(metadata);
+    if (typeof call?.emit !== "function") {
+      return;
+    }
+    this.grpcCalls.delete(metadata);
+    const asyncLocalStorage = this.asyncLocalStorage;
+    const emit = call.emit;
+    call.emit = function (this: unknown, ...args) {
+      if (
+        asyncLocalStorage.getStore()?.get(TRACE_REGISTRY_KEY) === registryKey
+      ) {
+        return Reflect.apply(emit, this, args);
+      }
+      return asyncLocalStorage.run(store, () =>
+        Reflect.apply(emit, this, args),
+      );
+    };
   }
 
   /**
@@ -339,6 +474,8 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       const operation = openOperation(store);
       this.rememberOperation(call, operation);
       this.rememberOperation(call?.request, operation);
+      // Recorded or not: `TracerService` needs the store either way.
+      this.emitCallEventsInStore(call, store, registryKey);
 
       // As for a message: the call's span goes under the caller's for `otlp`,
       // and the calls the handler makes carry its decision on. Read now, while

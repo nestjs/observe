@@ -1,6 +1,9 @@
 import { Logger } from "@nestjs/common";
+import { Metadata } from "@grpc/grpc-js";
 import {
+  GrpcMethodStreamingType,
   Server,
+  ServerGrpc,
   ServerKafka,
   ServerTCP,
   TcpContext,
@@ -10,6 +13,8 @@ import { context as otelContext, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { AsyncLocalStorage } from "async_hooks";
 import { createRequire } from "node:module";
+import { Duplex } from "node:stream";
+import { concatMap, Observable } from "rxjs";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { createInstanceDecorator } from "../instrument/create-instance-decorator.instrument.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
@@ -787,7 +792,228 @@ describe("RpcObserveAgentService", () => {
       },
     );
   });
+
+  /**
+   * A gRPC request stream's messages are emitted on the call, which Nest's
+   * start hook is handed only a copy of, and every message after those queued
+   * when the handler subscribes comes from grpc-js's connection callback, in
+   * no store. Run through Nest's own `ServerGrpc`, with a stream standing in
+   * for grpc-js's call.
+   */
+  describe("gRPC request streams", () => {
+    class FakeCall extends Duplex {
+      readonly metadata = new Metadata();
+      cancelled = false;
+      readonly written: unknown[] = [];
+
+      constructor() {
+        super({ objectMode: true });
+      }
+
+      override _read(): void {}
+
+      override _write(
+        chunk: unknown,
+        _encoding: string,
+        callback: () => void,
+      ): void {
+        this.written.push(chunk);
+        callback();
+      }
+    }
+
+    beforeEach(() => {
+      // No provider is instrumented here, which the registry says aloud for
+      // every call that ends.
+      vi.spyOn(Logger.prototype, "error").mockImplementation(() => {});
+    });
+
+    function createGrpcServer() {
+      const als = new AsyncLocalStorage<Map<string, any>>();
+      const registry = new OperationTraceRegistry(als as never, false);
+      const streamOptions: ObserveModuleOptionsWithDefaults = {
+        serviceId: "grpc-stream-test",
+        traceIdKey: "correlationId",
+        traceIdGenerator: () => "call-trace",
+        attachTraceIdToLogs: false,
+        skipInstrumentation: () => false,
+        sourceContext: false,
+        enabled: true,
+        grpc: {
+          setAttributes: (call) => ({
+            caller: String(
+              (call as { metadata: Metadata }).metadata.get("caller")[0],
+            ),
+          }),
+        },
+      };
+      const snapshots: RequestSnapshot[] = [];
+      const buffer = {
+        insertRequestSnapshot: (snapshot: RequestSnapshot) =>
+          snapshots.push(snapshot),
+      } as unknown as ObserveAgentSharedBuffer;
+      const agent = new RpcObserveAgentService(
+        als,
+        streamOptions,
+        {} as never,
+        registry,
+        buffer,
+        new TraceSamplerService(streamOptions),
+      );
+      const tracer = new TracerService(
+        registry,
+        als as never,
+        buffer,
+        streamOptions,
+      );
+      const server = new ServerGrpc({ package: "test", protoPath: "test" });
+      agent.registerRpcHooks(server as never);
+      /** The method grpc-js would run for each call of a handler. */
+      const methodFor = (
+        handler: (...args: any[]) => unknown,
+        streamType: GrpcMethodStreamingType,
+      ) =>
+        (
+          server as unknown as {
+            createServiceMethod: (
+              handler: unknown,
+              proto: { requestStream: boolean; responseStream: boolean },
+              streamType: GrpcMethodStreamingType,
+            ) => (call: unknown, callback?: unknown) => Promise<unknown>;
+          }
+        ).createServiceMethod(
+          handler,
+          { requestStream: true, responseStream: true },
+          streamType,
+        );
+      return { als, registry, tracer, snapshots, methodFor };
+    }
+
+    /** Lets grpc-js's callback for a later message run, in no store. */
+    const later = () => new Promise((resolve) => setImmediate(resolve));
+
+    it("handles each later message of a @GrpcStreamCall handler in the call's store", async () => {
+      const { als, tracer, methodFor } = createGrpcServer();
+      const seen: unknown[] = [];
+      const call = new FakeCall();
+      const method = methodFor(function TrackOnCall(stream: FakeCall) {
+        stream.on("data", (message: { id: string }) => {
+          // Throws outside a store, and nothing would catch it here.
+          void tracer.createSpan(`message ${message.id}`, () => {
+            seen.push([message.id, tracer.currentTraceId()]);
+          });
+        });
+      }, GrpcMethodStreamingType.PT_STREAMING);
+
+      await method(call);
+      for (const id of ["1", "2", "3"]) {
+        await later();
+        expect(als.getStore()).toBeUndefined();
+        call.push({ id });
+      }
+      await later();
+
+      expect(seen).toEqual([
+        ["1", "call-trace"],
+        ["2", "call-trace"],
+        ["3", "call-trace"],
+      ]);
+    });
+
+    it("handles each later message of a @GrpcStreamMethod handler in the call's store", async () => {
+      const { tracer, methodFor } = createGrpcServer();
+      const call = new FakeCall();
+      const method = methodFor(function Track(
+        messages: Observable<{ id: string }>,
+      ) {
+        // A rejected span fails the call with status 2.
+        return messages.pipe(
+          concatMap((message) =>
+            tracer.createSpan(`message ${message.id}`, () => ({
+              id: message.id,
+              traceId: tracer.currentTraceId(),
+            })),
+          ),
+        );
+      }, GrpcMethodStreamingType.RX_STREAMING);
+
+      void method(call);
+      for (const id of ["1", "2", "3"]) {
+        await later();
+        call.push({ id });
+      }
+      await waitFor(() => call.written.length === 3, 2000, "three answers");
+
+      expect(call.written).toEqual([
+        { id: "1", traceId: "call-trace" },
+        { id: "2", traceId: "call-trace" },
+        { id: "3", traceId: "call-trace" },
+      ]);
+    });
+
+    it("keeps two open streams in their own calls", async () => {
+      const { tracer, methodFor } = createGrpcServer();
+      const seen: unknown[] = [];
+      const method = methodFor(function TrackOnCall(stream: FakeCall) {
+        stream.on("data", (message: { from: string }) => {
+          seen.push([message.from, tracer.getAttribute("caller" as never)]);
+        });
+      }, GrpcMethodStreamingType.PT_STREAMING);
+      const calls = ["a", "b"].map((caller) => {
+        const call = new FakeCall();
+        call.metadata.set("caller", caller);
+        return call;
+      });
+
+      for (const call of calls) {
+        await method(call);
+      }
+      await later();
+      calls[1].push({ from: "b" });
+      calls[0].push({ from: "a" });
+      await later();
+
+      expect(seen).toEqual([
+        ["b", "b"],
+        ["a", "a"],
+      ]);
+    });
+
+    it("leaves an event emitted from inside the call in the context it has", async () => {
+      const { als, methodFor } = createGrpcServer();
+      const seen: unknown[] = [];
+      const call = new FakeCall();
+      const method = methodFor(function TrackOnCall(stream: FakeCall) {
+        stream.on("mark", () => seen.push(als.getStore()?.get("inner")));
+      }, GrpcMethodStreamingType.PT_STREAMING);
+
+      await method(call);
+      // A context of the call's own - a span's store - with something its
+      // own store does not hold.
+      const store = new Map([
+        [TRACE_REGISTRY_KEY, registryKeyOf(call, als)],
+        ["inner", "span"],
+      ]);
+      als.run(store as never, () => call.emit("mark"));
+      call.emit("mark");
+
+      expect(seen).toEqual(["span", undefined]);
+    });
+  });
 });
+
+/** The registry key the call's events run under. */
+function registryKeyOf(
+  call: { emit: (event: string) => boolean; once: Function },
+  als: AsyncLocalStorage<Map<string, any>>,
+): unknown {
+  let key: unknown;
+  call.once("probe", () => {
+    key = als.getStore()?.get(TRACE_REGISTRY_KEY);
+  });
+  call.emit("probe");
+  return key;
+}
 
 function isInstalled(name: string): boolean {
   try {
