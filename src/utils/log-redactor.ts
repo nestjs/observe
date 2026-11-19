@@ -1,6 +1,6 @@
 import { RedactionOptions } from "../interfaces/observe-options.interface.js";
 import { stripAnsi } from "./log-line.parser.js";
-import { toGlobalRegExp } from "./redact-url-query.js";
+import { isUrlOnlySensitiveKey, toGlobalRegExp } from "./redact-url-query.js";
 import {
   createSensitiveKeyMatcher,
   SensitiveKeyMatcher,
@@ -200,6 +200,14 @@ const KEY_CANDIDATE =
 const KEY_STEMS = /pass|pwd|secret|token|auth|cred|key|sig|jwt|cookie|session/i;
 
 /**
+ * A parameter of a query string or fragment quoted in the text, named as only
+ * a URL makes sensitive - `?key=`, `&sig=`, `?code=...&state=...` (see
+ * `isUrlOnlySensitiveKey`). Tested first for the same reason as `KEY_STEMS`,
+ * which `code` and `state` are not in.
+ */
+const URL_ONLY_KEY_HINT = /[?&#](?:code|state|sig|key)=/i;
+
+/**
  * Names whose value is a whole header: a scheme and a credential
  * (`Authorization: ApiKey sk_...`), or every cookie of a `Cookie` line.
  */
@@ -228,7 +236,10 @@ const SCHEME_WORD = /^(?:bearer|basic|token)$/i;
  *
  * The name is held to the same matcher as an attribute's key - the
  * deployment's `redaction.keys` included - so free text and structured data
- * cannot drift apart.
+ * cannot drift apart. A name that is a parameter of a quoted URL - written
+ * straight after its `?`, `&` or `#`, and straight before its `=` - is held
+ * to what a recorded URL is, too: `?key=`, `&sig=`, `?code=` and `&state=`
+ * are masked there and nowhere else, so `code=42 state=open` in prose stays.
  *
  * `literalValuesOnly` is the variant for source code, where the text either
  * side of a `:` or `=` is mostly identifiers: `const token = await sign(user)`
@@ -248,7 +259,11 @@ function keyValueRule(
   return {
     scan: (text, mask) => {
       // Most lines name no credential at all; they are passed over whole.
-      if (!checkEveryKey && !KEY_STEMS.test(text)) {
+      if (
+        !checkEveryKey &&
+        !KEY_STEMS.test(text) &&
+        !URL_ONLY_KEY_HINT.test(text)
+      ) {
         return text;
       }
       const candidate = new RegExp(KEY_CANDIDATE.source, "g");
@@ -257,7 +272,13 @@ function keyValueRule(
       let match: RegExpExecArray | null;
       while ((match = candidate.exec(text))) {
         const key = match[2];
-        if ((match[4] === "=>" && !match[3]) || !isSensitive(key)) {
+        if (
+          (match[4] === "=>" && !match[3]) ||
+          !(
+            isSensitive(key) ||
+            (isUrlOnlySensitiveKey(key) && isQueryParameter(text, match))
+          )
+        ) {
           continue;
         }
         const valueStart = match.index + match[0].length;
@@ -285,6 +306,20 @@ function keyValueRule(
       return copiedTo === 0 ? text : output + text.slice(copiedTo);
     },
   };
+}
+
+/**
+ * Whether a `KEY_CANDIDATE` match is a parameter of a quoted URL: right
+ * after its `?`, `&` or `#`, right before a bare `=`. `a&&state=1` is code.
+ */
+function isQueryParameter(text: string, match: RegExpExecArray): boolean {
+  const before = text[match.index - 1];
+  return (
+    (before === "?" ||
+      before === "#" ||
+      (before === "&" && text[match.index - 2] !== "&")) &&
+    match[0] === `${match[2]}=`
+  );
 }
 
 /** Where the value starting at `at` ends, or -1 when there is none to mask. */

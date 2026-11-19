@@ -14,6 +14,15 @@ import {
  */
 const URL_ONLY_SENSITIVE_KEYS = new Set(["code", "state", "sig", "key"]);
 
+/**
+ * Whether a key is one of those only a URL makes sensitive. For a caller
+ * reading a URL somewhere this module does not - a query string quoted in
+ * an error message - which tests the shared list itself.
+ */
+export function isUrlOnlySensitiveKey(key: string): boolean {
+  return URL_ONLY_SENSITIVE_KEYS.has(normaliseKey(key));
+}
+
 export const REDACTED = "[REDACTED]";
 
 /** `REDACTED` as a URL carries it. */
@@ -82,7 +91,7 @@ export function redactUrlQuery(
     ? (key) => redactor.isSensitiveKey(key)
     : isSensitiveKeyByDefault;
   const isSensitive: KeyTest = (key) =>
-    URL_ONLY_SENSITIVE_KEYS.has(normaliseKey(key)) || isSharedSensitive(key);
+    isUrlOnlySensitiveKey(key) || isSharedSensitive(key);
 
   const redacted = redactUrl(url, isSensitive, isSharedSensitive, 0);
   return obfuscate ? redacted.replaceAll(obfuscate, REDACTED) : redacted;

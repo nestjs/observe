@@ -61,9 +61,11 @@ describe("captureRequest", () => {
       redactor,
     );
 
+    // Masked by key in the URL, then read again as text, which masks a
+    // query's `code` and `state` too - so the mask the URL rules wrote is
+    // written over, as a `token`'s already was.
     expect(captured?.headers).toEqual({
-      "x-forwarded-uri":
-        "/oauth/callback?code=%5BREDACTED%5D&state=%5BREDACTED%5D",
+      "x-forwarded-uri": "/oauth/callback?code=[REDACTED]&state=[REDACTED]",
       "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
       accept: "text/html;q=0.9,*/*;q=0.8",
     });

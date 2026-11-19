@@ -203,6 +203,38 @@ describe("LogRedactor", () => {
       }
     });
 
+    it.each([
+      [
+        "GET https://maps.example/places/search?q=pizza&key=AIzaSy_FAKE_0123456789abc failed with 403",
+        "GET https://maps.example/places/search?q=pizza&key=[REDACTED] failed with 403",
+      ],
+      [
+        "fetch https://cdn.example/f.pdf?sv=2024&sig=Zm9vYmFy%3D&se=2026 failed",
+        "fetch https://cdn.example/f.pdf?sv=2024&sig=[REDACTED]&se=2026 failed",
+      ],
+      // Neither `code` nor `state` contains a stem of the shared list.
+      [
+        "OAuth callback /cb?code=4/0AY0e-g7abc&state=xyz123 rejected",
+        "OAuth callback /cb?code=[REDACTED]&state=[REDACTED] rejected",
+      ],
+      ["/cb#state=xyz123&code=abc", "/cb#state=[REDACTED]&code=[REDACTED]"],
+    ])(
+      "masks what only a URL makes sensitive in a quoted query: %s",
+      (line, expected) => {
+        expect(redactor.redactMessage(line)).toBe(expected);
+      },
+    );
+
+    it.each([
+      "exit code=42 state=open",
+      "code: 42, state: 'open'",
+      "if (a&&state=1) return",
+      "sort key=name",
+      "?code = 42",
+    ])("leaves %s, which is no query string, alone", (line) => {
+      expect(redactor.redactMessage(line)).toBe(line);
+    });
+
     it("masks a value behind colour codes", () => {
       expect(
         redactor.redactMessage(
