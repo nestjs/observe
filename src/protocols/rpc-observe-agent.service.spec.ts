@@ -581,6 +581,61 @@ describe("RpcObserveAgentService", () => {
       );
     });
 
+    it("runs the handler of a custom transporter that names no transport, traced as custom", async () => {
+      // `transportId` is optional on `Server` and `CustomTransportStrategy`,
+      // and Nest hands the hooks what the server has.
+      const startTrace = vi.fn();
+      const sampledAs: unknown[] = [];
+      const agent = new RpcObserveAgentService(
+        new AsyncLocalStorage<Map<string, any>>(),
+        {
+          traceIdKey: "traceId",
+          traceIdGenerator: () => "trace-id",
+          rpc: {},
+        } as never,
+        {
+          getRpcTargetRegistry: () => ({
+            subscribe: () => ({ unsubscribe: vi.fn() }),
+          }),
+        } as never,
+        { startTrace, hasTrace: () => false } as never,
+        {} as never,
+        {
+          shouldCapture: (_protocol: string, ctx: { transport: unknown }) => {
+            sampledAs.push(ctx.transport);
+            return true;
+          },
+        } as never,
+      );
+      let endHook!: (transportId: undefined, ctx: unknown) => void;
+      let startHook!: (
+        transportId: undefined,
+        ctx: unknown,
+        done: () => Promise<unknown>,
+      ) => unknown;
+      agent.registerRpcHooks({
+        setOnProcessingStartHook: (hook: typeof startHook) => {
+          startHook = hook;
+        },
+        setOnProcessingEndHook: (hook: typeof endHook) => {
+          endHook = hook;
+        },
+      } as never);
+      const ctx = { getPattern: () => "orders.paid" };
+
+      await expect(
+        Promise.resolve(startHook(undefined, ctx, async () => "handled")),
+      ).resolves.toBe("handled");
+      expect(() => endHook(undefined, ctx)).not.toThrow();
+
+      expect(sampledAs).toEqual(["Symbol(custom)"]);
+      expect(startTrace).toHaveBeenCalledOnce();
+      expect(startTrace.mock.calls[0][1]).toMatchObject({
+        protocol: "custom",
+        operationId: "orders.paid",
+      });
+    });
+
     /**
      * With `openTelemetry` on, a TCP or Redis message carries W3C trace
      * context in its metadata beside the trace id, and its handler runs in it

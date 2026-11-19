@@ -92,15 +92,30 @@ type CreateServiceMethod = (
   streamType: unknown,
 ) => unknown;
 
+/**
+ * What Nest hands the processing hooks as the transport: a `Transport`
+ * member, the symbol a custom transporter registers under, or nothing at all
+ * for a custom transporter that sets no `transportId`, which is optional on
+ * `Server` and on `CustomTransportStrategy`.
+ */
+type ProcessingTransportId = Transport | symbol | undefined;
+
 type ProcessingStartHook = (
-  transportId: Transport | symbol,
+  transportId: ProcessingTransportId,
   ctx: unknown,
   done: () => Promise<any>,
 ) => unknown;
 type ProcessingEndHook = (
-  transportId: Transport | symbol,
+  transportId: ProcessingTransportId,
   ctx: unknown,
 ) => void;
+
+/**
+ * Stands in for the transport of a custom transporter that names none, so it
+ * is traced as one named by a symbol without a description is: as `custom`.
+ * Its message used to fail before its handler ran, on `transportId.toString()`.
+ */
+const UNNAMED_TRANSPORT = Symbol("custom");
 
 @Injectable()
 export class RpcObserveAgentService<Store extends Record<string, unknown>>
@@ -220,7 +235,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
           );
         }
         return this.startRpcRequestTracing(
-          transportId,
+          transportId ?? UNNAMED_TRANSPORT,
           ctx as BaseRpcContext,
           done,
           target,
@@ -234,7 +249,7 @@ export class RpcObserveAgentService<Store extends Record<string, unknown>>
       "setOnProcessingEndHook",
       (transportId, ctx) => {
         this.endRpcRequestTracing(
-          transportId,
+          transportId ?? UNNAMED_TRANSPORT,
           ctx as BaseRpcContext | GrpcCall,
         );
       },
