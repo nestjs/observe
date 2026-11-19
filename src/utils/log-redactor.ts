@@ -469,6 +469,30 @@ function buildDefaultRules(
     // Card numbers before any key: a key's bare value stops at a space, so
     // `token: 4000 0566 5566 5556` would lose only its first group.
     { scan: scanCardNumbers },
+    // The password in a URL: `postgres://app:hunter2@db/orders`, a git remote
+    // `https://deploy:ghp_...@host/repo.git` that a failed `execFile` quotes.
+    // No key stands in front of it, so the key=value rule never sees it. The
+    // scheme, the user and everything from the `@` on are kept.
+    //
+    // The password runs to the last `@` before a `/`, as a URL parser reads
+    // it, so one with an `@`, `#` or `?` it never escaped - the URL that does
+    // not parse, and is quoted in the error for it - is masked whole. It
+    // stops at a `/`, a quote or a space, which keeps `host:4873/@scope/pkg`
+    // and `"http://host:3000","email":"a@b.c"` as they were, and a port
+    // followed by a query (`host:3000?email=a@b.c`) is a port. Anchored on
+    // `://`, and a password stops at the `/` of the next one, so a line is
+    // read a bounded number of times however many it holds.
+    //
+    // In source a `${...}` in that place is an expression, not a secret.
+    {
+      pattern: new RegExp(
+        String.raw`(:\/\/[^\s:@/?#"'\x60]*:)(?!\d{1,5}[?#,])` +
+          (literalValuesOnly ? String.raw`(?!\$\{)` : "") +
+          String.raw`[^\s/"'\x60]+(?=@)`,
+        "g",
+      ),
+      replace: (replacement, prefix) => `${prefix}${replacement}`,
+    },
     // Authorization schemes: `Bearer eyJ...`, `Basic dXNlcjpwYXNz`.
     //
     // Must precede the key=value rule. That rule's value stops at whitespace, so

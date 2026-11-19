@@ -301,6 +301,82 @@ describe("LogRedactor", () => {
     });
   });
 
+  describe("URL credentials", () => {
+    it.each([
+      [
+        "connect failed: postgres://app:hunter2@db:5432/orders",
+        "connect failed: postgres://app:[REDACTED]@db:5432/orders",
+      ],
+      ["redis://:hunter2@cache:6379", "redis://:[REDACTED]@cache:6379"],
+      [
+        "mongodb+srv://root:hunter2@cluster0.example.net/test?retryWrites=true",
+        "mongodb+srv://root:[REDACTED]@cluster0.example.net/test?retryWrites=true",
+      ],
+      // What `child_process` says of a failed command.
+      [
+        "Command failed: git ls-remote https://deploy:Zk4vTq9LmW2xJr8n@127.0.0.1:9/acme/orders.git",
+        "Command failed: git ls-remote https://deploy:[REDACTED]@127.0.0.1:9/acme/orders.git",
+      ],
+      [
+        "primary amqp://app:hunter2@mq-1:5672 replica amqp://app:hunter3@mq-2:5672",
+        "primary amqp://app:[REDACTED]@mq-1:5672 replica amqp://app:[REDACTED]@mq-2:5672",
+      ],
+    ])("masks the password in %s", (line, expected) => {
+      expect(redactor.redactMessage(line)).toBe(expected);
+    });
+
+    it.each([
+      "https://svc:hunt@er2@api.example.com/v1",
+      "Failed to parse URL from https://svc:hunt#er2@api.example.com/v1",
+      "Invalid URL: ws://svc:hunt?er2@api.example.com/v1",
+    ])("masks a password with a character it never escaped: %s", (line) => {
+      // The URL that does not parse is the one an error quotes, and it does
+      // not parse because of what is in its password.
+      const output = redactor.redactMessage(line);
+
+      expect(output).not.toContain("hunt");
+      expect(output).not.toContain("er2");
+      expect(output).toContain("://svc:[REDACTED]@api.example.com/v1");
+    });
+
+    it.each([
+      "GET http://localhost:4873/@nestjs/observe 404",
+      "https://deploy@git.example.com:8443/acme/orders.git",
+      "git+ssh://git@github.com:nestjs/observe.git",
+      "https://api.example.com:8443/users?email=kamil@example.com",
+      "http://localhost:3000?email=kamil@example.com",
+      "    at handler (file:///app/node_modules/@nestjs/core/router.js:12:3)",
+      '{"origin":"http://localhost:3000","email":"kamil@example.com"}',
+      "listening on http://[::1]:3000 (kamil@example.com)",
+    ])("leaves %s as it was", (line) => {
+      // A port, a scoped package or an address further on is no password.
+      expect(redactor.redactMessage(line)).toBe(line);
+    });
+
+    it("masks the password of a URL written as a literal in source", () => {
+      expect(
+        redactor.redactSource([
+          'const url = "postgres://app:hunter2@db/orders";',
+          "const built = `postgres://${user}:${pass}@${host}/orders`;",
+        ]),
+      ).toEqual([
+        'const url = "postgres://app:[REDACTED]@db/orders";',
+        "const built = `postgres://${user}:${pass}@${host}/orders`;",
+      ]);
+    });
+
+    it("reads a run of URL-like text in linear time", () => {
+      const startedAt = performance.now();
+
+      redactor.redactMessage("://a:".repeat(65_536) + "b".repeat(65_536));
+      redactor.redactMessage("a://b:c".repeat(65_536));
+      redactor.redactMessage("://a:" + "b@".repeat(65_536) + " ");
+      redactor.redactMessage("://" + "a".repeat(131_072));
+
+      expect(performance.now() - startedAt).toBeLessThan(500);
+    });
+  });
+
   describe("bare tokens", () => {
     it("masks a JWT outside any header", () => {
       const jwt =

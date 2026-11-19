@@ -50,7 +50,8 @@ export interface RedactionOptions {
 
   /**
    * Whether to apply the built-in patterns - bearer tokens, JWTs, AWS key ids,
-   * PEM private keys, `key=value` secrets and Luhn-valid card numbers.
+   * PEM private keys, `key=value` secrets, the password in a URL
+   * (`scheme://user:password@host`) and Luhn-valid card numbers.
    *
    * Disable only if you are replacing them wholesale with `patterns`; there is
    * no supported configuration in which forwarding logs unredacted is a good

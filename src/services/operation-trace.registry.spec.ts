@@ -654,7 +654,7 @@ describe("OperationTraceRegistry", () => {
         undefined,
       );
       const error = new Error(
-        "connect failed: postgres://app:password=hunter2@db/orders",
+        "connect failed: postgres://app:hunter2@db/orders",
       );
       error.stack = `Error: ${error.message}\n    at Svc.root (/app/svc.ts:1:1)\n    at token=eyJhbGciOi.eyJzdWIiOi.sig`;
       registry.internalEndTraceStep(
@@ -673,7 +673,7 @@ describe("OperationTraceRegistry", () => {
       };
 
       expect(root.error!.message).toBe(
-        "connect failed: postgres://app:password=[REDACTED]",
+        "connect failed: postgres://app:[REDACTED]@db/orders",
       );
       expect(root.error!.stack).not.toContain("hunter2");
       expect(root.error!.stack).not.toContain("eyJhbGciOi");
