@@ -64,6 +64,9 @@ export class TracerService<
   /**
    * Creates a new trace span with the given name and executes the provided callback within that span.
    * The callback can be synchronous or asynchronous.
+   * Outside any operation the agent traces, the callback still runs, with a
+   * detached delegate whose tags go nowhere, as in an operation that is not
+   * recorded.
    */
   async createSpan(
     name: string,
@@ -71,9 +74,13 @@ export class TracerService<
   ) {
     const store = this.als.getStore();
     if (!store) {
-      throw new Error(
-        'AsyncLocalStorage is not initialized. Ensure that you are using the "createSpan" method within an async context.',
-      );
+      // No operation of the agent's is in flight: a transport it has no hook
+      // on - a GraphQL operation sent over the subscriptions socket -, a
+      // lifecycle hook, a timer armed at bootstrap, or an agent switched off.
+      // Which of these a handler runs in is often the client's choice, and
+      // there being nowhere to record the span is no reason for the work in
+      // it not to happen.
+      return callback(new TraceSpanDelegate("", name, {}));
     }
     const traceId = this.requireTraceId(store, "createSpan");
     const callerId = store.get(CALLER_METADATA_KEY) as string | undefined;
@@ -87,18 +94,17 @@ export class TracerService<
 
   /**
    * Retrieves the active span for the current request.
-   * This method should be called within an async context where the AsyncLocalStorage is active.
-   * If the operation is traced but no span is active, an error is thrown. An
-   * operation that is not being recorded (ignored or sampled out) gets a
-   * detached delegate whose tags go nowhere, as `createSpan` does.
+   * Where there is none - the operation is not being recorded (ignored or
+   * sampled out), nothing opened a span around the caller, or the call is
+   * outside any operation the agent traces - the delegate is a detached one
+   * whose tags go nowhere, as `createSpan`'s is then.
    * @returns {Promise<TraceSpanDelegate>} A promise that resolves to the active span delegate.
    */
   async activeSpan(): Promise<TraceSpanDelegate> {
     const store = this.als.getStore();
     if (!store) {
-      throw new Error(
-        'AsyncLocalStorage is not initialized. Ensure that you are using the "activeSpan" method within an async context.',
-      );
+      // Outside any operation: see `createSpan`.
+      return new TraceSpanDelegate("", undefined, {});
     }
     const traceId = this.requireTraceId(store, "activeSpan");
     const callerId = store.get(CALLER_METADATA_KEY) as string | undefined;
@@ -106,17 +112,16 @@ export class TracerService<
       traceId,
       callerId,
     );
-    if (!activeOngoingEvent && !this.operationTraceRegistry.hasTrace(traceId)) {
-      // The store carries the id for log correlation, but no trace was opened
-      // under it: `http.ignore`, `jobs.ignore`, or the sampler said no. Which
-      // operations get recorded is configuration; a handler tagging its span
-      // must not start failing because someone changed it.
-      return new TraceSpanDelegate("", undefined, {});
-    }
     if (!activeOngoingEvent) {
-      throw new Error(
-        `No active span found for traceId: ${this.reportedTraceId(store, traceId)}. Ensure that a span is created before calling "activeSpan".`,
-      );
+      // Either the store carries the id for log correlation and no trace was
+      // opened under it - `http.ignore`, `jobs.ignore`, or the sampler said
+      // no - or one was, and nothing opened a span around the caller: the
+      // resolvers of a GraphQL document the agent cannot label, one that
+      // opens with a fragment or is sent as a persisted-query hash alone.
+      // Which operations get recorded is configuration, and how a document
+      // is spelled is the client's choice; a handler tagging its span must
+      // not start failing over either.
+      return new TraceSpanDelegate("", undefined, {});
     }
 
     let tags = activeOngoingEvent.tags;
@@ -417,7 +422,7 @@ export class TracerService<
   /**
    * The id of the trace currently in flight, or `null` outside one.
    *
-   * Unlike `getAttribute`/`activeSpan`, this does not throw when there is no
+   * Like the rest of this service, this does not throw when there is no
    * active store - reading the trace id to forward it downstream (an outgoing
    * HTTP header, gRPC metadata, a queued job payload) is exactly the kind of
    * call that may legitimately happen outside a traced context, and a thrown
@@ -486,43 +491,30 @@ export class TracerService<
   /**
    * Sets an attribute on the current trace.
    * For example, you can use this to add metadata to the current request trace for later use and retrieval.
-   * This method should be called within an async context where the AsyncLocalStorage is active.
+   * Does nothing outside any operation the agent traces, where there is no
+   * request context to keep the attribute in.
    * @param key The attribute key.
    * @param value The attribute value.
    */
   setAttribute<P extends Path<Store>>(key: P, value: PathValue<Store, P>) {
-    const store = this.als.getStore();
-    if (!store) {
-      throw new Error(
-        'AsyncLocalStorage is not initialized. Ensure that you are using the "setAttribute" method within an async context.',
-      );
-    }
-
-    store.set(key, value);
+    this.als.getStore()?.set(key, value);
   }
 
   /**
    * Retrieves an attribute from the current trace (request context).
    * This allows you to access metadata that was set earlier in the request lifecycle.
-   * This method should be called within an async context where the AsyncLocalStorage is active.
    * @param key The attribute key.
-   * @returns The attribute value or undefined if not found.
+   * @returns The attribute value, or undefined if not found or when called
+   * outside any operation the agent traces.
    */
   getAttribute<P extends Path<Store>>(key: P): PathValue<Store, P> | undefined {
-    const store = this.als.getStore();
-    if (!store) {
-      throw new Error(
-        'AsyncLocalStorage is not initialized. Ensure that you are using the "getAttribute" method within an async context.',
-      );
-    }
-
-    return store.get(key);
+    return this.als.getStore()?.get(key);
   }
 
   /**
-   * Reads the trace id the request was opened under. Its absence means the call
-   * is outside any traced operation, which is the same mistake as calling these
-   * methods with no async context at all - and is reported the same way.
+   * Reads the trace id the request was opened under. A store that carries none
+   * is reported as a mistake. No store at all is not one - it is code running
+   * outside any operation - and never gets here.
    */
   private requireTraceId(
     store: Map<string | symbol, unknown>,

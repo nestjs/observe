@@ -22,9 +22,10 @@ import {
  * Two things matter beyond the obvious. Metrics are registry-backed: calling
  * `counter("orders")` twice must hand back the *same* counter, or every call
  * site accumulates its own total and the reported figure is whichever one
- * flushed last. Trace methods also depend on the async store: methods that
- * require a context fail clearly, while optional accessors, naming and error
- * reporting are safe outside a recorded operation.
+ * flushed last. Trace methods also depend on the async store, and none of them
+ * fails for want of one, or of a span in it: whether a handler runs inside an
+ * operation the agent traces, and with a span around it, can be down to the
+ * transport a client reached it through and how it spelled its request.
  */
 describe("TracerService", () => {
   const TRACE_ID_KEY = "traceId";
@@ -141,12 +142,27 @@ describe("TracerService", () => {
       expect(root.children?.[0].tags).toMatchObject({ orderId: "o-1" });
     });
 
-    it("fails clearly when called outside any async context", async () => {
-      // Without this the trace id would be `undefined` and the span would be
-      // filed against a trace that does not exist.
-      await expect(tracer.createSpan("orphan", () => "x")).rejects.toThrow(
-        /AsyncLocalStorage is not initialized/,
-      );
+    it("still runs the callback outside any async context", async () => {
+      // A resolver reached over a transport the agent has no hook on - GraphQL
+      // over the subscriptions socket - has no store. The span has nowhere to
+      // go; the work inside it must happen all the same.
+      const startManualSpan = vi.spyOn(registry, "createManualSpan");
+
+      const result = await tracer.createSpan("orphan", (span) => {
+        span.setTag("orderId", "o-1");
+        return span.name;
+      });
+
+      expect(result).toBe("orphan");
+      expect(startManualSpan).not.toHaveBeenCalled();
+    });
+
+    it("passes on what the callback throws outside any async context", async () => {
+      await expect(
+        tracer.createSpan("orphan", () => {
+          throw new Error("card declined");
+        }),
+      ).rejects.toThrow("card declined");
     });
   });
 
@@ -219,6 +235,13 @@ describe("TracerService", () => {
           number | undefined
         >();
       });
+    });
+
+    it("sets nothing and reads nothing outside any async context", () => {
+      // As for a request context that holds no such attribute: there is
+      // none to hold it.
+      expect(() => tracer.setAttribute("userId", "42")).not.toThrow();
+      expect(tracer.getAttribute("userId")).toBeUndefined();
     });
   });
 
@@ -406,46 +429,30 @@ describe("TracerService", () => {
       });
     });
 
-    it("fails clearly when the trace is open but no span is active", async () => {
-      registry.startTrace("a3", {
-        operationId: "GET /orders",
-        protocol: "http",
-        attributes: { method: "GET", originalUrl: "/orders" },
-        tags: {},
-      });
-
-      await expect(
-        als.run(new Map([[TRACE_ID_KEY, "a3"]]), () => tracer.activeSpan()),
-      ).rejects.toThrow(/No active span found/);
-    });
-
-    it("names the trace id, not the registry key, when no span is active", async () => {
-      // Kept under a key of its own, as every HTTP, RPC and queued execution
-      // is. The key appears nowhere a reader could look it up.
+    it("hands back a detached delegate when the trace is open but no span is active", async () => {
+      // The resolvers of a GraphQL document the agent could not label - one
+      // that opens with a fragment: the transport's trace is there, and no
+      // span in it is the caller's. How the document is spelled is the
+      // client's choice.
       registry.startTrace(
-        "registry-key-a4",
+        "registry-key-a3",
         {
           operationId: "GET /orders",
           protocol: "http",
           attributes: { method: "GET", originalUrl: "/orders" },
           tags: {},
         },
-        "public-a4",
+        "public-a3",
       );
       const store = new Map<string, unknown>([
-        [TRACE_ID_KEY, "public-a4"],
-        [TRACE_REGISTRY_KEY, "registry-key-a4"],
+        [TRACE_ID_KEY, "public-a3"],
+        [TRACE_REGISTRY_KEY, "registry-key-a3"],
       ]);
 
-      const failure = await als
-        .run(store, () => tracer.activeSpan())
-        .then(
-          () => undefined,
-          (error: unknown) => error as Error,
-        );
+      const span = await als.run(store, () => tracer.activeSpan());
 
-      expect(failure?.message).toContain("traceId: public-a4.");
-      expect(failure?.message).not.toContain("registry-key-a4");
+      expect(span.id).toBe("");
+      expect(() => span.setTag("tenant", "acme")).not.toThrow();
     });
 
     it("hands back a detached delegate when the operation is not recorded", async () => {
@@ -459,10 +466,11 @@ describe("TracerService", () => {
       expect(registry.hasTrace("unrecorded")).toBe(false);
     });
 
-    it("fails clearly outside any async context", async () => {
-      await expect(tracer.activeSpan()).rejects.toThrow(
-        /AsyncLocalStorage is not initialized/,
-      );
+    it("hands back a detached delegate outside any async context", async () => {
+      const span = await tracer.activeSpan();
+
+      expect(span.id).toBe("");
+      expect(() => span.setTag("tenant", "acme")).not.toThrow();
     });
   });
 
