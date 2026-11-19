@@ -358,6 +358,24 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
       operationName,
     });
 
+    const store = this.asyncLocalStorage.getStore();
+    // The registry key, where the transport in front gave the request one
+    // of its own; the trace id otherwise, which is then the key as well.
+    const traceId =
+      store?.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
+      store?.get(this.options.traceIdKey);
+
+    if (traceId) {
+      // Ahead of `ignore`, as every other transport does: what a resolver
+      // reads back with `TracerService.getAttribute` must not depend on
+      // whether the operation is recorded. `ignore` is asked about the
+      // document's first root field, which the client picks, and the
+      // resolvers of the fields behind it run all the same. With no
+      // transport in front there is no store yet; `startAsOperation` opens
+      // one and sets them there.
+      this.applyAttributes(info, ctx.context);
+    }
+
     if (
       shouldIgnoreSafely(
         this.options.graphql?.ignore,
@@ -367,6 +385,21 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
         "graphql",
       )
     ) {
+      if (traceId && !this.operationTraceRegistry.hasOperationId(traceId)) {
+        // Not opening the operation's span is not enough where a transport
+        // in front opened a trace for the request, which it did before the
+        // operation was known. Left open, it went on recording every
+        // provider, guard and outbound call the operation made, failures
+        // with their stacks and headers included, and shipped them as
+        // `/graphql`. Dropped, the request goes on as one `http.ignore`
+        // excluded: its store keeps the key, and nothing is registered
+        // under it. Only while nothing has named the trace, though: a
+        // route handler that runs the operation in-process, or a batch an
+        // operation that is recorded leads, keeps its trace. The trace is
+        // the request's, so a batch an ignored operation leads is not
+        // recorded at all.
+        this.operationTraceRegistry.abandonTrace(traceId);
+      }
       return undefined;
     }
 
@@ -381,13 +414,6 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     const attributes: RequestSnapshot["attributes"] = {
       originalUrl: parsed.sanitizedDocument,
     };
-
-    const store = this.asyncLocalStorage.getStore();
-    // The registry key, where the transport in front gave the request one
-    // of its own; the trace id otherwise, which is then the key as well.
-    const traceId =
-      store?.get(TRACE_REGISTRY_KEY as KeyOf<Store>) ??
-      store?.get(this.options.traceIdKey);
 
     if (traceId) {
       return this.startWithinRequest(
@@ -472,7 +498,6 @@ export class GraphQLObserveAgentService<Store extends Record<string, unknown>>
     info: GraphQLResolveInfoLike,
     ctx: GqlRequestStartContext,
   ): OperationState | undefined {
-    this.applyAttributes(info, ctx.context);
     this.operationTraceRegistry.addGraphQLMetadataToTrace(traceId, {
       operationId,
       tags: this.options.graphql?.tags,

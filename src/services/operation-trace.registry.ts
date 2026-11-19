@@ -689,6 +689,18 @@ export class OperationTraceRegistry {
     );
   }
 
+  /**
+   * Whether the trace's operation has been named yet - by the route the
+   * request was routed to, or by a GraphQL operation that labelled it. False
+   * for a trace that is not open.
+   */
+  hasOperationId(traceId: TraceId): boolean {
+    const snapshot = this.traceSnapshots.get(traceId) as
+      | Partial<RequestSnapshot>
+      | undefined;
+    return snapshot?.operationId != null;
+  }
+
   startTrace(
     traceId: TraceId,
     data:

@@ -1,5 +1,7 @@
 import { ResolverDecoratorHost } from "@nestjs/graphql";
 import { AsyncLocalStorage } from "async_hooks";
+import { TRACE_REGISTRY_KEY } from "../observe.constants.js";
+import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { GraphQLObserveAgentService } from "./graphql-observe-agent.service.js";
 
 const QUERY = "query Titles { titles }";
@@ -241,5 +243,106 @@ describe("GraphQLObserveAgentService: the request hooks it shares with the appli
     expect(first.registry.internalStartTraceStep).not.toHaveBeenCalled();
     expect(second.registry.internalStartTraceStep).toHaveBeenCalledOnce();
     expect(host.getOnRequestStartHook()).toBe(application);
+  });
+});
+
+/**
+ * Against a real registry: operations inside a request the HTTP agent
+ * already traces, under the registry key the HTTP agent gave it.
+ */
+function createTracingAgent(graphql: Record<string, unknown> = {}) {
+  const als = new AsyncLocalStorage<Map<string, any>>();
+  const registry = new OperationTraceRegistry(als as never, false);
+  const agent = new GraphQLObserveAgentService(
+    als,
+    { traceIdKey: "traceId", graphql } as never,
+    registry,
+    {} as never,
+    { shouldCapture: () => true } as never,
+    { get: () => undefined } as never,
+    { getProviders: () => [] } as never,
+    { getAllMethodNames: () => [] } as never,
+  );
+  /** A request the HTTP agent opened a trace for, with nothing named yet. */
+  const openRequest = (key: string) => {
+    registry.startTrace(
+      key,
+      {
+        protocol: "http",
+        tags: {},
+        attributes: { method: "POST", originalUrl: "/graphql" },
+      },
+      `public-${key}`,
+    );
+    return new Map<string, unknown>([
+      ["traceId", `public-${key}`],
+      [TRACE_REGISTRY_KEY, key],
+    ]);
+  };
+  const start = (store: Map<string, unknown>, query: string) =>
+    als.run(store, () => agent.onRequestStart({ query }));
+  const end = (store: Map<string, unknown>, state: unknown) =>
+    als.run(store, () => agent.onRequestEnd({ state }));
+  return { als, agent, registry, openRequest, start, end };
+}
+
+describe("GraphQLObserveAgentService: graphql.ignore", () => {
+  const ignoreHealth = {
+    ignore: (info: { fieldName: string }) => info.fieldName === "health",
+  };
+
+  it("sets the attributes of an ignored operation all the same", () => {
+    // `ignore` is asked about the field that leads the document, and the
+    // resolvers of the fields behind it run whether or not it matches. What
+    // they read must not depend on the order a client wrote the fields in.
+    const { openRequest, start } = createTracingAgent({
+      ...ignoreHealth,
+      setAttributes: (info: { fieldName: string }) => ({
+        tenant: `led by ${info.fieldName}`,
+      }),
+    });
+    const ignored = openRequest("r1");
+    const recorded = openRequest("r2");
+
+    expect(start(ignored, "{ health tenant }")).toBeUndefined();
+    start(recorded, "{ tenant health }");
+
+    expect(ignored.get("tenant")).toBe("led by health");
+    expect(recorded.get("tenant")).toBe("led by tenant");
+  });
+
+  it("drops the request's trace, so nothing the operation reaches is recorded", () => {
+    const { registry, openRequest, start } = createTracingAgent(ignoreHealth);
+    const store = openRequest("r1");
+
+    expect(start(store, "{ health }")).toBeUndefined();
+
+    expect(registry.hasTrace("r1")).toBe(false);
+    // As on a request `http.ignore` excluded: a provider called now opens
+    // no span.
+    expect(
+      registry.internalStartTraceStep(
+        "r1",
+        "HealthService",
+        "check",
+        undefined,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("keeps a trace something named before the ignored operation started", () => {
+    const { registry, openRequest, start } = createTracingAgent(ignoreHealth);
+    // A route handler that runs the operation in-process.
+    const routed = openRequest("r1");
+    registry.addRouteMetadataToTrace("r1", "GET" as never, "/status");
+    // A batch a recorded operation leads.
+    const batched = openRequest("r2");
+    start(batched, "{ orders }");
+
+    expect(start(routed, "{ health }")).toBeUndefined();
+    expect(start(batched, "{ health }")).toBeUndefined();
+
+    expect(registry.hasTrace("r1")).toBe(true);
+    expect(registry.hasTrace("r2")).toBe(true);
   });
 });
