@@ -455,6 +455,16 @@ With `instrument: ObserveInstrument`, the controller and gateway methods Nest ro
 
 A guard that treats such a miss as "no restriction" lets the request through. Keep what a guard reads on the method as metadata, defined by a decorator, and read it with `Reflector`. Where that is not possible, return `true` from `skipInstrumentation` for that controller or gateway, so it is left as it is.
 
+### Scheduled jobs in a process with more than one application
+
+`@nestjs/schedule` hands every `@Cron`, `@Interval` and `@Timeout` handler in the process through one shared method, and the agent patches it once: the first application in the process to construct its `ObserveModule` traces the scheduled handlers of every application there. This matters only when one process starts more than one application, or starts one again after `app.close()` - two applications side by side, a bootstrap that runs twice, a test file that does either. A later application's scheduled handlers then run under the first application's agent:
+
+- Its `jobs` options (`ignore`, `tags`, `setAttributes`) are not used for them; the first application's are.
+- With a `createObserveModule()` call of its own, the handlers run in the first agent's async context, while the `TracerService` injected into them reads the later application's. So `createSpan()` runs its callback untraced, `activeSpan()` hands back a span that records nothing, `setAttribute()` does nothing, `getAttribute()` returns `undefined` and `captureError()` records nothing. Their runs are not reported.
+- Sharing one `createObserveModule()`, the `observe.ts` above, the handlers work, but their runs are reported through the first application's agent, under its `serviceId`, and not at all once that application has closed.
+
+Keep scheduled jobs in one application per process, and construct that application first.
+
 ## Capturing failed and slow requests
 
 The inputs behind a failing request are usually the fastest way to reproduce it. The agent keeps them only for the requests worth it - never for ordinary traffic:
