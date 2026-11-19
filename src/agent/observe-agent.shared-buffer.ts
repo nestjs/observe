@@ -1089,6 +1089,11 @@ export class ObserveAgentSharedBuffer {
   resetMainThreadBuffer() {
     this._mainThreadBuffer = null;
     this._metricsToEncode.clear();
+    // Of the batch just dropped, with the metrics in it. After a write that
+    // threw, they stayed, and the next batch written marked them delivered
+    // too: a counter's increase and a summary's window were lost unsent. A
+    // metric comes back at its next change, with its window still open.
+    this._awaitingFlushAck.clear();
     this.withheldSnapshots = 0;
     this.withheldJobs = 0;
   }

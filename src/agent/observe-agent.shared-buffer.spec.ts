@@ -1287,6 +1287,56 @@ describe("ObserveAgentSharedBuffer", () => {
       ]);
     });
 
+    it("keeps a counter's increase from a batch that failed to write until it is sent", () => {
+      const buffer = createBuffer();
+      const logins = new Counter("logins");
+      const pings = new Counter("pings");
+      logins.increment(5);
+      buffer.upsertCustomMetric(logins);
+      // What is left to throw at the write once the largest entries are
+      // dropped: metrics that are over the slot on their own.
+      const encodeToFit = vi
+        .spyOn(
+          buffer as unknown as { encodeToFit(): Uint8Array },
+          "encodeToFit",
+        )
+        .mockImplementationOnce(() => {
+          throw new Error("Payload too large");
+        });
+
+      // As the worker's flush runs it.
+      expect(() => buffer.encodeAndWrite()).toThrow("Payload too large");
+      buffer.resetMainThreadBuffer();
+      encodeToFit.mockRestore();
+      // A batch without the counter, written.
+      pings.increment();
+      buffer.upsertCustomMetric(pings);
+      buffer.encodeAndWrite();
+      buffer.resetMainThreadBuffer();
+
+      // Not delivered, so the increase is still owed.
+      expect(logins.increase).toEqual({ default: 5 });
+      logins.increment();
+      buffer.upsertCustomMetric(logins);
+      buffer.encodeAndWrite();
+      const batch = JSON.parse(
+        new TextDecoder().decode(
+          new Uint8Array(
+            buffer.sharedBuffer,
+            8,
+            new DataView(buffer.sharedBuffer, 4, 4).getUint32(0),
+          ),
+        ),
+      ) as { custom: EncodedCustomMetric[] };
+      expect(batch.custom).toEqual([
+        expect.objectContaining({
+          n: "logins",
+          v: { default: 6 },
+          iv: { default: 6 },
+        }),
+      ]);
+    });
+
     it("writes the batch without a metric that cannot be encoded", () => {
       const warn = vi
         .spyOn(Logger.prototype, "warn")
