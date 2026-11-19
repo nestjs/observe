@@ -5,7 +5,7 @@ import {
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
 import { OPERATION_STATE_KEY } from "../utils/operation-state.util.js";
-import { SHARED_ATTRIBUTES_KEY } from "../utils/shared-attributes.util.js";
+import { setThroughCopies } from "../utils/store-copy.util.js";
 import { uuidv7 } from "../utils/uuid-v7.util.js";
 
 const reportedCallbacks = new WeakSet<Function>();
@@ -151,13 +151,10 @@ export function setAttributesSafely<TArgs extends unknown[]>(
   if (!attributes) {
     return;
   }
-  // Over what `TracerService.setAttribute` set earlier in the operation as
-  // well, where it set anything: `getAttribute` reads that first, and the
-  // later write is the one it should return - GraphQL's, in a request whose
-  // middleware set the same key.
-  const shared = store.get(SHARED_ATTRIBUTES_KEY) as
-    | Map<unknown, unknown>
-    | undefined;
+  // Through to the stores this one was copied from, as `setAttribute` writes:
+  // an operation started inside a span - GraphQL's, in a request whose
+  // middleware set the same key - is the later write, and the one the rest
+  // of the request should read.
   for (const [key, value] of Object.entries(attributes)) {
     if (key === traceIdKey || AGENT_STORE_KEYS.has(key)) {
       if (!reportedReservedKeys.has(callback)) {
@@ -169,8 +166,7 @@ export function setAttributesSafely<TArgs extends unknown[]>(
       }
       continue;
     }
-    store.set(key, value);
-    shared?.set(key, value);
+    setThroughCopies(store, key, value);
   }
 }
 

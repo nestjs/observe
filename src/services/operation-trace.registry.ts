@@ -18,7 +18,7 @@ import { fitToLength } from "../utils/fit-to-length.util.js";
 import { LogRedactor } from "../utils/log-redactor.js";
 import type { TraceContext } from "../utils/trace-context.util.js";
 import { CALLER_METADATA_KEY } from "../observe.constants.js";
-import { sharedAttributesOf } from "../utils/shared-attributes.util.js";
+import { copyStore } from "../utils/store-copy.util.js";
 import {
   collapseRepeatedSpans,
   DEFAULT_SPAN_COLLAPSE,
@@ -1741,13 +1741,12 @@ export class OperationTraceRegistry {
     const delegate = new TraceSpanDelegate(newNodeId, name, tags);
     manualSpan.tags = tags;
     const store = this.als.getStore();
-    // Before the copy, as for an auto span: an attribute set in the callback
-    // is still there once the span has ended.
-    if (store) {
-      sharedAttributesOf(store);
-    }
+    // Copied as for an auto span, so an attribute set in the callback is
+    // still there once the span has ended.
     return this.als.run(
-      new Map([...(store?.entries() ?? []), [CALLER_METADATA_KEY, newNodeId]]),
+      store
+        ? copyStore(store, [CALLER_METADATA_KEY, newNodeId])
+        : new Map([[CALLER_METADATA_KEY, newNodeId]]),
       () => {
         try {
           const result = spanFunction(delegate);

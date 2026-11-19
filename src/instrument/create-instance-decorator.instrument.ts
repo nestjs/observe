@@ -9,7 +9,7 @@ import {
   CALLER_METADATA_KEY,
   TRACE_REGISTRY_KEY,
 } from "../observe.constants.js";
-import { sharedAttributesOf } from "../utils/shared-attributes.util.js";
+import { copyStore } from "../utils/store-copy.util.js";
 import { rewriteStackFrames } from "../utils/error-stack.util.js";
 import { registerRawReceiver } from "./raw-receiver.js";
 
@@ -490,11 +490,9 @@ export function createInstanceDecorator<T extends Record<string, unknown>>(
         // Everything the caller's context holds, with this span as the caller
         // of whatever it calls. A copy, so the caller's context still names
         // the caller once this call returns. Only the caller is the span's
-        // own: the attribute map is made before the copy, so both hold the
-        // same one, and an attribute set in the call is there after it.
-        sharedAttributesOf(store!);
-        const spanStore = new Map(store);
-        spanStore.set(CALLER_METADATA_KEY, newStepId);
+        // own: an attribute set in the call is written through to the
+        // caller's context too - see `copyStore`.
+        const spanStore = copyStore(store!, [CALLER_METADATA_KEY, newStepId]);
         return als.run(
           spanStore,
           callTraced,

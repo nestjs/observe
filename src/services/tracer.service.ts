@@ -15,9 +15,9 @@ import {
 import { OperationTraceRegistry } from "./operation-trace.registry.js";
 import { liveTraceId } from "../utils/operation-state.util.js";
 import {
-  SHARED_ATTRIBUTES_KEY,
-  sharedAttributesOf,
-} from "../utils/shared-attributes.util.js";
+  getThroughCopies,
+  setThroughCopies,
+} from "../utils/store-copy.util.js";
 
 /**
  * Longest operation id the collector stores, counted by code point as it
@@ -506,10 +506,9 @@ export class TracerService<
     if (!store) {
       return;
     }
-    store.set(key, value);
-    // The store may be a span's own copy, gone once the span returns. The
-    // operation's attribute map is not - see `SHARED_ATTRIBUTES_KEY`.
-    sharedAttributesOf(store).set(key, value);
+    // The store may be a span's own copy, gone once the span returns, so the
+    // stores it was copied from get the attribute too - see `copyStore`.
+    setThroughCopies(store, key, value);
   }
 
   /**
@@ -521,13 +520,12 @@ export class TracerService<
    */
   getAttribute<P extends Path<Store>>(key: P): PathValue<Store, P> | undefined {
     const store = this.als.getStore();
-    // What `setAttribute` wrote anywhere in the operation first, then what
-    // the store itself holds: the `setAttributes` options' attributes and
-    // the trace id.
-    const attributes = store?.get(SHARED_ATTRIBUTES_KEY) as
-      | Map<unknown, any>
-      | undefined;
-    return attributes?.has(key) ? attributes.get(key) : store?.get(key);
+    // The store first, so what the application wrote into it directly wins;
+    // then the stores it was copied from, for an attribute set by a span
+    // running beside this one.
+    return store
+      ? (getThroughCopies(store, key) as PathValue<Store, P> | undefined)
+      : undefined;
   }
 
   /**

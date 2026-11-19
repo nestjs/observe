@@ -314,6 +314,33 @@ describe("TracerService", () => {
       });
     });
 
+    // The store is the application's to read and write as well.
+    it("returns what the application wrote into the store after the attribute", async () => {
+      await inTrace("t1", async () => {
+        await tracer.createSpan("resolve tenant", () => {
+          tracer.setAttribute("tenantId", "acme");
+        });
+        als.getStore()!.set("tenantId", "globex");
+
+        expect(tracer.getAttribute("tenantId")).toBe("globex");
+      });
+    });
+
+    it("leaves an attribute set inside a span in the store it was copied from", async () => {
+      await inTrace("t1", async () => {
+        const store = als.getStore()!;
+        const before = [...store.keys()];
+
+        await tracer.createSpan("resolve tenant", () => {
+          tracer.setAttribute("tenantId", "acme");
+        });
+
+        expect(store.get("tenantId")).toBe("acme");
+        // Nothing of the agent's own beside it.
+        expect([...store.keys()]).toEqual([...before, "tenantId"]);
+      });
+    });
+
     it("sets nothing and reads nothing outside any async context", () => {
       // As for a request context that holds no such attribute: there is
       // none to hold it.
