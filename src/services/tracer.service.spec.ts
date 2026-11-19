@@ -657,6 +657,29 @@ describe("TracerService", () => {
       expect(gauge.getValue()).toBe(6);
     });
 
+    it("ignores a seed that is not a finite number, as a new metric does", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      tracer.counter("imported");
+      tracer.gauge("pending");
+      tracer.gauge("ratio");
+
+      // Computed from the application's data: a division by a zero total, a
+      // field of a request body that is text at run time.
+      const counter = tracer.counter("imported", { initialValue: Infinity });
+      const gauge = tracer.gauge("pending", { initialValue: Number.NaN });
+      const typed = tracer.gauge("ratio", {
+        initialValue: "5" as unknown as number,
+      });
+      counter.increment();
+      gauge.increment();
+      typed.increment();
+
+      expect(counter.getValue()).toBe(1);
+      expect(gauge.getValue()).toBe(1);
+      expect(typed.getValue()).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(3);
+    });
+
     it("returns a labelled metric again when given an initial value", () => {
       const options = { labels: ["route" as const], initialValue: 0 };
       tracer.counter("hits", options).increment({ route: "/a" });

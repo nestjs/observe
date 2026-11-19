@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "async_hooks";
 import { ObserveAgentSharedBuffer } from "../agent/observe-agent.shared-buffer.js";
 import { Gauge, GaugeKind, Summary } from "../custom-metrics/index.js";
 import { Counter } from "../custom-metrics/counter.js";
+import { admitsFinite } from "../custom-metrics/finite-value.util.js";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/index.js";
 import { TraceSpanDelegate } from "../trace-span.delegate.js";
 import { Path, PathValue } from "../types/path-value.type.js";
@@ -262,11 +263,13 @@ export class TracerService<
         overridableRef.labels = attributes.labels;
       }
       // `value` holds one reading per label, so the seed goes to the default
-      // one; a labelled metric has no unlabelled reading to seed.
+      // one; a labelled metric has no unlabelled reading to seed. A seed that
+      // is not a finite number is ignored, as the constructor ignores one.
       if (
         attributes?.initialValue !== undefined &&
         !existingRef.labels &&
-        existingRef.getValue() === 0
+        existingRef.getValue() === 0 &&
+        admitsFinite(name, attributes.initialValue, overridableRef.nonFinite)
       ) {
         overridableRef.value.default = attributes.initialValue;
       }
@@ -332,11 +335,13 @@ export class TracerService<
         overridableRef.labels = attributes.labels;
       }
       // `value` holds one reading per label, so the seed goes to the default
-      // one; a labelled metric has no unlabelled reading to seed.
+      // one; a labelled metric has no unlabelled reading to seed. A seed that
+      // is not a finite number is ignored, as the constructor ignores one.
       if (
         attributes?.initialValue !== undefined &&
         !existingRef.labels &&
-        existingRef.getValue() === 0
+        existingRef.getValue() === 0 &&
+        admitsFinite(name, attributes.initialValue, overridableRef.nonFinite)
       ) {
         overridableRef.value.default = attributes.initialValue;
       }
