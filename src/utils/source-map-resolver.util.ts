@@ -12,8 +12,8 @@ import {
   sourceContentFor,
   TraceMap,
 } from "@jridgewell/trace-mapping";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, resolve, sep } from "node:path";
 
 /**
  * A stack frame position mapped back to the source it was compiled from.
@@ -54,10 +54,32 @@ const MAX_CACHED_MAPS = 200;
 /** Parsed maps by compiled-file path; null marks "looked, found none". */
 const mapCache = new Map<string, LoadedMap | null>();
 
+/**
+ * Reads a file that is inside the working directory once links are resolved.
+ *
+ * Neither file read here is named by this package: the compiled file comes
+ * off a stack frame that was checked only as written, and its map is
+ * wherever a comment in that file says. What a map embeds ships as the code
+ * frame, so both are held to the gate `readSource` holds a source file to -
+ * the resolved path under the resolved root. Without it a link under the
+ * root, or a `sourceMappingURL` leading out of it, shipped source the
+ * application does not own.
+ *
+ * Throws for a path that leads anywhere else, which the caller reads as "no
+ * map".
+ */
+function readFileUnderRoot(path: string): string {
+  const real = realpathSync(path);
+  if (!real.startsWith(realpathSync(process.cwd()) + sep)) {
+    throw new Error(`${path} is outside the working directory`);
+  }
+  return readFileSync(real, "utf8");
+}
+
 function readMapFor(file: string): LoadedMap | null {
   let compiled: string;
   try {
-    compiled = readFileSync(file, "utf8");
+    compiled = readFileUnderRoot(file);
   } catch {
     return null;
   }
@@ -87,7 +109,7 @@ function readMapFor(file: string): LoadedMap | null {
     } else {
       const mapPath = resolve(dirname(file), url);
       mapDir = dirname(mapPath);
-      rawMap = readFileSync(mapPath, "utf8");
+      rawMap = readFileUnderRoot(mapPath);
     }
   } catch {
     return null;

@@ -106,6 +106,62 @@ describe("collectCodeFrames with source maps", () => {
     expect(frames![0].lines[0]).toBe("const embedded = true;");
   });
 
+  it("does not follow a link to a compiled file outside the working directory", () => {
+    // Linked-out code - a package linked in, a directory link - that embeds
+    // its own source in its map.
+    const dir = join(outside, "linked-build");
+    mkdirSync(dir);
+    writeFileSync(
+      join(dir, "main.js"),
+      `throw new Error("boom");\n//# sourceMappingURL=main.js.map\n`,
+    );
+    writeFileSync(
+      join(dir, "main.js.map"),
+      JSON.stringify({
+        version: 3,
+        sources: ["./refund-policy.ts"],
+        names: [],
+        mappings: "AAAA",
+        sourcesContent: ["TOP SECRET\n"],
+      }),
+    );
+    const link = join(inside, "linked-build");
+    symlinkSync(dir, link);
+
+    const frames = collectCodeFrames(stackAt(join(link, "main.js")), {
+      sourceMaps: true,
+    });
+
+    expect(JSON.stringify(frames ?? [])).not.toContain("TOP SECRET");
+  });
+
+  it("does not read a map outside the working directory", () => {
+    const map = join(outside, "elsewhere.js.map");
+    writeFileSync(
+      map,
+      JSON.stringify({
+        version: 3,
+        sources: ["./main.ts"],
+        names: [],
+        mappings: "AAAA",
+        sourcesContent: ["TOP SECRET\n"],
+      }),
+    );
+    const dir = join(inside, "map-out");
+    mkdirSync(dir);
+    const compiled = join(dir, "main.js");
+    writeFileSync(
+      compiled,
+      `throw new Error("boom");\n//# sourceMappingURL=${relative(dir, map).split("\\").join("/")}\n`,
+    );
+
+    const frames = collectCodeFrames(stackAt(compiled), { sourceMaps: true });
+
+    expect(JSON.stringify(frames ?? [])).not.toContain("TOP SECRET");
+    // The compiled file itself is still the application's, and read.
+    expect(frames?.[0].lines[0]).toBe('throw new Error("boom");');
+  });
+
   it("parses a map once, however its compiled file is spelt", () => {
     // A frame's path comes off a stack, which a driver can copy from a
     // server's reply: `/app/dist/./main.js`, `/app/dist/././main.js`, ... are
