@@ -37,6 +37,7 @@ const fakeRecorder = () => {
       };
     },
     cover: <T>(fn: () => T) => fn(),
+    isRecording: () => true,
     endWhenSettled: OutgoingSpanRecorder.prototype.endWhenSettled,
   } as unknown as OutgoingSpanRecorder;
   return { recorder, spans };
@@ -434,6 +435,144 @@ describe("patchMongodb", () => {
       statement:
         '{"find":"users","filter":{"email":"?","age":{"$gt":"?"},"tags":{"$in":["?"]}},"limit":"?"}',
     });
+  });
+
+  it("keeps a command's first value only where it names a collection", () => {
+    expect(
+      describeMongoCommand({
+        logApplicationMessage: "password reset requested for a@b.co",
+      }),
+    ).toEqual({
+      operation: "logApplicationMessage",
+      statement: '{"logApplicationMessage":"?"}',
+    });
+    expect(
+      describeMongoCommand({ createUser: "a@b.co", pwd: "s3cret", roles: [] }),
+    ).toEqual({
+      operation: "createUser",
+      statement: '{"createUser":"?","pwd":"?","roles":[]}',
+    });
+    expect(describeMongoCommand({ dropUser: "a@b.co", $db: "admin" })).toEqual({
+      operation: "dropUser",
+      statement: '{"dropUser":"?"}',
+    });
+    expect(
+      describeMongoCommand({
+        createIndexes: "users",
+        indexes: [{ name: "email_1", key: { email: 1 } }],
+      }),
+    ).toEqual({
+      operation: "createIndexes users",
+      statement:
+        '{"createIndexes":"users","indexes":[{"name":"?","key":{"email":"?"}}]}',
+    });
+  });
+
+  // A document can refer to one sub-document from many fields - a GraphQL
+  // variable used many times inside a JSON argument, a YAML alias - and is
+  // then far larger walked as a tree than it is in memory.
+  it("stops reading a command once the statement is full", () => {
+    let reads = 0;
+    const shared = new Proxy(
+      Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`k${i}`, i])),
+      {
+        get(object, key, receiver) {
+          reads += 1;
+          return Reflect.get(object, key, receiver);
+        },
+      },
+    );
+    const properties = Object.fromEntries(
+      Array.from({ length: 1000 }, (_, i) => [`p${i}`, shared]),
+    );
+
+    const { statement } = describeMongoCommand({
+      insert: "events",
+      documents: [{ properties }],
+    });
+
+    expect(statement).toHaveLength(2048);
+    expect(statement).toMatch(
+      /^\{"insert":"events","documents":\[\{"properties":\{"p0":\{"k0":"\?","k1":"\?",/,
+    );
+    expect(reads).toBeLessThan(2048);
+  });
+
+  it("looks through an array once, however many fields refer to it", () => {
+    let reads = 0;
+    const shared = new Proxy(
+      Array.from({ length: 1000 }, (_, i) => i),
+      {
+        get(array, key, receiver) {
+          reads += 1;
+          return Reflect.get(array, key, receiver);
+        },
+      },
+    );
+    const properties = Object.fromEntries(
+      Array.from({ length: 300 }, (_, i) => [`p${i}`, shared]),
+    );
+
+    const { statement } = describeMongoCommand({
+      insert: "events",
+      documents: [{ properties }],
+    });
+
+    expect(statement).toMatch(
+      /^\{"insert":"events","documents":\[\{"properties":\{"p0":\["\?"\],"p1":\["\?"\],/,
+    );
+    expect(reads).toBeLessThan(2000);
+  });
+
+  it("keeps a field named after a member of Object.prototype as a field", () => {
+    // `JSON.parse` is how such a name arrives: as an own property.
+    const document = JSON.parse(
+      '{"kind":"signup","__proto__":{"x":{"y":1}},"constructor":"Ferrari"}',
+    );
+    const { statement } = describeMongoCommand({
+      insert: "events",
+      documents: [document],
+      ...JSON.parse('{"__proto__":{"z":1}}'),
+    });
+
+    expect(statement).toBe(
+      '{"insert":"events","documents":[{"kind":"?","__proto__":{"x":{"y":"?"}},"constructor":"?"}],"__proto__":{"z":"?"}}',
+    );
+  });
+
+  it("does not describe a command nobody will record", async () => {
+    class Connection {
+      async command() {
+        return { ok: 1 };
+      }
+    }
+    const { recorder, spans } = fakeRecorder();
+    const notRecording = Object.assign(Object.create(recorder), {
+      isRecording: () => false,
+    });
+    patchMongodb({ Connection }, notRecording);
+    let reads = 0;
+    const filter = new Proxy(
+      { email: "a@b.co" },
+      {
+        get(object, key, receiver) {
+          reads += 1;
+          return Reflect.get(object, key, receiver);
+        },
+        ownKeys(object) {
+          reads += 1;
+          return Reflect.ownKeys(object);
+        },
+      },
+    );
+
+    await (new Connection().command as any)("app.$cmd", {
+      find: "users",
+      filter,
+    });
+
+    expect(spans).toHaveLength(0);
+    expect(reads).toBe(0);
   });
 
   it("settles the span with the command's promise, and leaves the promise alone", async () => {

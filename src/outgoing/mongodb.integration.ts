@@ -33,8 +33,49 @@ const DRIVER_HOUSEKEEPING = new Set([
 ]);
 
 /**
+ * Commands whose first value is the collection, or the namespace, they act
+ * on: what the driver builds for a collection's own methods, and the
+ * collection commands an application sends through `db.command()`. Only these
+ * keep that value. Anywhere else it is data like any other - the user of
+ * `createUser`, `dropUser` and `usersInfo`, the role of `createRole`, the free
+ * text of `logApplicationMessage`. A command missing from the list loses its
+ * collection from the span, and nothing else.
+ */
+const NAMES_A_COLLECTION = new Set([
+  "find",
+  "insert",
+  "update",
+  "delete",
+  "aggregate",
+  "count",
+  "distinct",
+  "findAndModify",
+  "findandmodify",
+  "mapReduce",
+  "mapreduce",
+  "create",
+  "drop",
+  "renameCollection",
+  "collMod",
+  "collStats",
+  "validate",
+  "compact",
+  "reIndex",
+  "convertToCapped",
+  "cloneCollectionAsCapped",
+  "createIndexes",
+  "dropIndexes",
+  "listIndexes",
+  "createSearchIndexes",
+  "updateSearchIndex",
+  "dropSearchIndex",
+]);
+
+/**
  * A command with its values removed: field names and operators stay, since
- * they are the query's shape, and every primitive becomes `?`.
+ * they are the query's shape, and every primitive becomes `?`. The one value
+ * kept is the collection a command names, which is to a command what the
+ * table is to a SQL statement.
  *
  * Arrays come in two kinds and are told apart by what they hold. A list of
  * values keeps one element - `$in: [1, 2, 3]` and `$in: [4]` are the same
@@ -47,7 +88,10 @@ export function describeMongoCommand(command: Record<string, unknown>): {
   statement: string;
 } {
   const [name] = Object.keys(command);
-  const target = name === undefined ? undefined : command[name];
+  const target =
+    name !== undefined && NAMES_A_COLLECTION.has(name)
+      ? command[name]
+      : undefined;
   const operation =
     name === undefined
       ? "command"
@@ -55,7 +99,26 @@ export function describeMongoCommand(command: Record<string, unknown>): {
         ? `${name} ${target}`
         : name;
 
+  // What is left of the statement to write. A command is the application's
+  // data, and often its client's: a document that refers to one sub-document
+  // from many fields - a GraphQL variable used many times over, a YAML alias -
+  // is small to hold and has no end when copied out as a tree, and the
+  // command is described before the driver's size limit can refuse it. Every
+  // value is charged one character and every field its name, never more than
+  // they take up once written, so by the time the budget is spent the walk is
+  // past the cut below and the statement is what it would have been.
+  let budget = MAX_STATEMENT_LENGTH;
+  // Telling a list of values from a list of documents means looking at every
+  // element, which the budget cannot charge for: a list of values is one `?`
+  // however long it is. So each array is looked through once, and the fields
+  // that refer to it again are answered from here.
+  const documentsOf = new Map<unknown[], unknown[]>();
+
   const scrub = (value: unknown, depth: number): unknown => {
+    budget -= 1;
+    if (budget <= 0) {
+      return "?";
+    }
     if (value === null || typeof value !== "object") {
       return "?";
     }
@@ -63,9 +126,13 @@ export function describeMongoCommand(command: Record<string, unknown>): {
       return "?";
     }
     if (Array.isArray(value)) {
-      const documents = value.filter(
-        (item) => item !== null && typeof item === "object",
-      );
+      let documents = documentsOf.get(value);
+      if (documents === undefined) {
+        documents = value.filter(
+          (item) => item !== null && typeof item === "object",
+        );
+        documentsOf.set(value, documents);
+      }
       if (documents.length === 0) {
         return value.length === 0 ? [] : ["?"];
       }
@@ -78,22 +145,17 @@ export function describeMongoCommand(command: Record<string, unknown>): {
     if (proto !== Object.prototype && proto !== null) {
       return "?";
     }
-    const out: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      out[key] = scrub(item, depth + 1);
-    }
-    return out;
+    return fields(Object.entries(value), (item) => scrub(item, depth + 1));
   };
 
-  const shape: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(command)) {
-    // Session, cluster time and read preference: driver bookkeeping.
-    if (key === "lsid" || key.startsWith("$")) {
-      continue;
-    }
-    shape[key] =
-      key === name && typeof value === "string" ? value : scrub(value, 0);
-  }
+  // Session, cluster time and read preference: driver bookkeeping.
+  const shape = fields(
+    Object.entries(command).filter(
+      ([key]) => key !== "lsid" && !key.startsWith("$"),
+    ),
+    (value, key) =>
+      key === name && typeof target === "string" ? target : scrub(value, 0),
+  );
   let statement: string;
   try {
     statement = JSON.stringify(shape).slice(0, MAX_STATEMENT_LENGTH);
@@ -101,6 +163,28 @@ export function describeMongoCommand(command: Record<string, unknown>): {
     statement = operation;
   }
   return { operation, statement };
+
+  /**
+   * The fields of a document, described one by one until the budget is spent.
+   * Defined, not assigned: the names are the application's data, and
+   * assigning one called `__proto__` or `constructor` reaches
+   * `Object.prototype` instead of making a field - an accessor that throws
+   * under `--disable-proto=throw`, a read-only property once it is frozen.
+   */
+  function fields(
+    entries: Array<[string, unknown]>,
+    describe: (value: unknown, key: string) => unknown,
+  ): Record<string, unknown> {
+    const described: Array<[string, unknown]> = [];
+    for (const [key, value] of entries) {
+      if (budget <= 0) {
+        break;
+      }
+      budget -= key.length;
+      described.push([key, describe(value, key)]);
+    }
+    return Object.fromEntries(described);
+  }
 }
 
 /**
@@ -133,7 +217,13 @@ export function patchMongodb(
           return original.apply(this, args);
         }
         const [commandName] = Object.keys(command);
-        if (commandName === undefined || DRIVER_HOUSEKEEPING.has(commandName)) {
+        // Asked before the command is described: an untraced or sampled-out
+        // call should not pay for a description nobody will read.
+        if (
+          commandName === undefined ||
+          DRIVER_HOUSEKEEPING.has(commandName) ||
+          !recorder.isRecording()
+        ) {
           return original.apply(this, args);
         }
         const { operation, statement } = describeMongoCommand(
