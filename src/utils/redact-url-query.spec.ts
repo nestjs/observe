@@ -1,5 +1,5 @@
 import { LogRedactor } from "./log-redactor.js";
-import { redactUrlQuery } from "./redact-url-query.js";
+import { redactUrlQuery, toGlobalRegExp } from "./redact-url-query.js";
 
 describe("redactUrlQuery", () => {
   it("leaves a URL with no query alone", () => {
@@ -196,5 +196,35 @@ describe("redactUrlQuery", () => {
     expect(
       redactUrlQuery("/x?tenant=acme&token=abc", null, /tenant=[^&]*/g),
     ).toEqual("/x?[REDACTED]&token=%5BREDACTED%5D");
+  });
+});
+
+describe("toGlobalRegExp", () => {
+  it("adds the global flag to a copy", () => {
+    const pattern = /tenant=\w+/i;
+
+    const global = toGlobalRegExp(pattern);
+
+    expect(global).not.toBe(pattern);
+    expect(global.flags).toBe("gi");
+    expect(pattern.global).toBe(false);
+  });
+
+  it("copies a pattern that is global already", () => {
+    // Masking with it would set the application's own lastIndex back to 0,
+    // in the middle of an exec() loop over it.
+    const pattern = /tenant=\w+/g;
+    pattern.lastIndex = 9;
+
+    const global = toGlobalRegExp(pattern);
+    "/x?tenant=acme".replaceAll(global, "[REDACTED]");
+
+    expect(global).not.toBe(pattern);
+    expect(global.flags).toBe("g");
+    expect(pattern.lastIndex).toBe(9);
+  });
+
+  it("passes no pattern through", () => {
+    expect(toGlobalRegExp(undefined)).toBeUndefined();
   });
 });

@@ -710,6 +710,25 @@ describe("LogRedactor", () => {
       expect(output).not.toContain("CUST-2");
     });
 
+    it("never moves the lastIndex of a caller's own global pattern", () => {
+      // The application may be in the middle of an exec() loop over the very
+      // object it handed in, logging a line per match.
+      const pattern = /CUST-\d+/g;
+      const custom = new LogRedactor({ patterns: [pattern] });
+      const text = "CUST-1 and CUST-2";
+
+      const found: string[] = [];
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(text)) && found.length < 3) {
+        found.push(match[0]);
+        custom.redactMessage(`matched ${match[0]}`);
+        custom.redactSource([`const id = "${match[0]}";`]);
+      }
+
+      expect(found).toEqual(["CUST-1", "CUST-2"]);
+      expect(custom.redactMessage("CUST-3")).toBe("[REDACTED]");
+    });
+
     it("can turn the defaults off entirely", () => {
       const custom = new LogRedactor({ useDefaultPatterns: false });
 

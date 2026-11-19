@@ -1,5 +1,6 @@
 import { RedactionOptions } from "../interfaces/observe-options.interface.js";
 import { stripAnsi } from "./log-line.parser.js";
+import { toGlobalRegExp } from "./redact-url-query.js";
 import {
   createSensitiveKeyMatcher,
   SensitiveKeyMatcher,
@@ -656,10 +657,12 @@ export class LogRedactor {
         : buildDefaultRules(this.matchesSensitiveKey, checkEveryKey);
     const extra: CompiledRule[] = (options.patterns ?? []).map((pattern) => ({
       // Rebuilt with the global flag: a caller-supplied pattern without /g would
-      // silently redact only the first occurrence in a line.
-      pattern: pattern.global
-        ? pattern
-        : new RegExp(pattern.source, pattern.flags + "g"),
+      // silently redact only the first occurrence in a line. And rebuilt when
+      // it has one too: every `replace` sets a global pattern's `lastIndex`
+      // back to 0, and the object is the application's - an `exec()` loop
+      // over it that logs a line per match started again from the first one
+      // on every line, and never ended.
+      pattern: toGlobalRegExp(pattern),
       replace: (replacement: string) => replacement,
     }));
 

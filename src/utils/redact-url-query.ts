@@ -89,18 +89,24 @@ export function redactUrlQuery(
 }
 
 /**
- * Rebuilds a RegExp with the global flag when it lacks one, keeping the
- * original otherwise. `replaceAll` refuses a non-global pattern outright -
- * inside a request hook, where that would answer every traced request with a
- * 500.
+ * A copy of a RegExp with the global flag. `replaceAll` refuses a non-global
+ * pattern outright - inside a request hook, where that would answer every
+ * traced request with a 500.
+ *
+ * Copied even when the flag is there already. A global pattern carries
+ * `lastIndex`, which every `replace` and `replaceAll` sets back to 0, and the
+ * object is the application's: an `exec()` loop it runs over the same
+ * pattern, recording something per match, would start again from the first
+ * match each time and never end.
  */
-export function toGlobalRegExp(
-  pattern: RegExp | undefined,
-): RegExp | undefined {
-  if (!pattern || pattern.global) {
+export function toGlobalRegExp<T extends RegExp | undefined>(pattern: T): T {
+  if (!pattern) {
     return pattern;
   }
-  return new RegExp(pattern.source, pattern.flags + "g");
+  return new RegExp(
+    pattern.source,
+    pattern.global ? pattern.flags : pattern.flags + "g",
+  ) as T;
 }
 
 function redactUrl(

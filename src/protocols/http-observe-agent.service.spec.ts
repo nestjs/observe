@@ -122,7 +122,7 @@ describe("HttpObserveAgentService", () => {
       );
     });
 
-    it("leaves a pattern that already has the global flag as-is", () => {
+    it("masks the same with a pattern that already has the global flag", () => {
       const service = createService({
         queryParamsObfuscateRegex: /internal=\w+/g,
       });

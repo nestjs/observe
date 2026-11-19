@@ -23,7 +23,9 @@ export interface RedactionOptions {
    * knows about - internal token prefixes, customer identifiers, and so on.
    *
    * Patterns are applied with the global flag whether or not you set it, so a
-   * pattern cannot silently mask just the first occurrence in a line.
+   * pattern cannot silently mask just the first occurrence in a line. Each is
+   * applied as a copy, so the `lastIndex` of a pattern your own code steps
+   * through with `exec()` is never moved.
    */
   patterns?: RegExp[];
 
