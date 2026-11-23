@@ -175,7 +175,7 @@
     "husky": "9.1.7",
     "ioredis": "6.0.0",
     "kafkajs": "2.2.4",
-    "lint-staged": "17.6.0",
+    "lint-staged": "17.6.1",
     "mongodb": "7.6.0",
     "mongoose": "9.10.1",
     "mssql": "12.7.13",
