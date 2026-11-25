@@ -74,6 +74,7 @@ const INDEPENDENT = [
   "@nestjs/graphql",
   "@nestjs/platform-node",
   "@nestjs/schedule",
+  "@nestjs/throttler",
 ];
 
 const version = process.argv[2];
