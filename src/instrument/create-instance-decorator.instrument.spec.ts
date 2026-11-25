@@ -1,6 +1,16 @@
 import * as common from "@nestjs/common";
-import { ParseFilePipe, ParseIntPipe, ValidationPipe } from "@nestjs/common";
+import {
+  ExecutionContext,
+  ParseFilePipe,
+  ParseIntPipe,
+  ValidationPipe,
+} from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
+import {
+  ThrottlerException,
+  ThrottlerGuard,
+  ThrottlerStorageService,
+} from "@nestjs/throttler";
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
 import { Cluster, Redis } from "ioredis";
@@ -1808,6 +1818,208 @@ describe("createInstanceDecorator", () => {
 
       withTrace(() => config.get("port"));
       expect(steps()).toEqual(["ConfigService.get", "ConfigService.read"]);
+    });
+  });
+
+  describe("when decorating @nestjs/throttler's guard and store", () => {
+    const steps = () =>
+      startedSteps.map((step) => `${step.className}.${step.methodName}`);
+
+    class ReportsController {}
+    function list() {
+      return [];
+    }
+
+    /** An HTTP request through `ReportsController.list`, and its response. */
+    const httpContext = () => {
+      const headers: Record<string, unknown> = {};
+      const res = {
+        header: (name: string, value: unknown) => {
+          headers[name] = value;
+        },
+      };
+      const req = { ip: "203.0.113.7", headers: { "user-agent": "probe" } };
+      const context = {
+        getHandler: () => list,
+        getClass: () => ReportsController,
+        switchToHttp: () => ({ getRequest: () => req, getResponse: () => res }),
+      } as unknown as ExecutionContext;
+      return { context, headers };
+    };
+
+    const stores: ThrottlerStorageService[] = [];
+    afterEach(() => {
+      stores.splice(0).forEach((store) => store.onApplicationShutdown());
+    });
+
+    /**
+     * What `ThrottlerModule.forRoot` provides: two named throttlers, the
+     * in-memory store and the guard, each decorated as the injector would,
+     * initialised at bootstrap and so outside any trace.
+     */
+    const throttled = async <G extends ThrottlerGuard>(
+      Guard: new (
+        ...args: ConstructorParameters<typeof ThrottlerGuard>
+      ) => G = ThrottlerGuard as never,
+      Store: new () => ThrottlerStorageService = ThrottlerStorageService,
+      limit = 10,
+    ) => {
+      const raw = new Store();
+      stores.push(raw);
+      const store = decorate(raw) as ThrottlerStorageService;
+      const guard = decorate(
+        new Guard(
+          [
+            { name: "short", ttl: 1_000, limit },
+            { name: "long", ttl: 60_000, limit: 100 },
+          ],
+          store,
+          new Reflector(),
+        ),
+      ) as G;
+      await guard.onModuleInit();
+      return guard;
+    };
+
+    it("traces only `canActivate` on the guard, and nothing on the store", async () => {
+      const guard = await throttled();
+      const { context, headers } = httpContext();
+
+      await expect(withTrace(() => guard.canActivate(context))).resolves.toBe(
+        true,
+      );
+      expect(steps()).toEqual(["ThrottlerGuard.canActivate"]);
+      // Its work still done, for both throttlers.
+      expect(headers).toMatchObject({
+        "X-RateLimit-Limit-short": 10,
+        "X-RateLimit-Remaining-short": 9,
+        "X-RateLimit-Limit-long": 100,
+        "X-RateLimit-Remaining-long": 99,
+      });
+    });
+
+    it("still refuses a request over the limit", async () => {
+      const guard = await throttled(undefined, undefined, 1);
+      await guard.canActivate(httpContext().context);
+      const { context, headers } = httpContext();
+
+      await expect(
+        withTrace(() => guard.canActivate(context)),
+      ).rejects.toBeInstanceOf(ThrottlerException);
+      expect(steps()).toEqual(["ThrottlerGuard.canActivate"]);
+      expect(headers["Retry-After-short"]).toEqual(expect.any(Number));
+    });
+
+    it("traces what a subclass overrides, and not what it inherits", async () => {
+      // The GraphQL guard of the throttler's documentation, and then some.
+      class GqlThrottlerGuard extends ThrottlerGuard {
+        protected override getRequestResponse(context: ExecutionContext) {
+          return super.getRequestResponse(context);
+        }
+
+        protected override async shouldSkip() {
+          return false;
+        }
+
+        protected override async handleRequest(
+          props: Parameters<ThrottlerGuard["handleRequest"]>[0],
+        ) {
+          return super.handleRequest(props);
+        }
+      }
+      const guard = await throttled(GqlThrottlerGuard);
+
+      await withTrace(() => guard.canActivate(httpContext().context));
+      expect(steps()).toEqual([
+        "GqlThrottlerGuard.canActivate",
+        "GqlThrottlerGuard.shouldSkip",
+        "GqlThrottlerGuard.handleRequest",
+        "GqlThrottlerGuard.getRequestResponse",
+        "GqlThrottlerGuard.handleRequest",
+        "GqlThrottlerGuard.getRequestResponse",
+      ]);
+    });
+
+    it("traces what a subclass named after the guard overrides", async () => {
+      class AppThrottlerGuard extends ThrottlerGuard {
+        protected override async getTracker(req: Record<string, any>) {
+          return `user-${req.ip}`;
+        }
+
+        protected override async throwThrottlingException(): Promise<void> {
+          throw new Error("slow down");
+        }
+      }
+      Object.defineProperty(AppThrottlerGuard, "name", {
+        value: "ThrottlerGuard",
+      });
+      const guard = await throttled(AppThrottlerGuard, undefined, 1);
+      await guard.canActivate(httpContext().context);
+
+      await expect(
+        withTrace(() => guard.canActivate(httpContext().context)),
+      ).rejects.toThrow("slow down");
+      expect(steps()).toEqual([
+        "ThrottlerGuard.canActivate",
+        "ThrottlerGuard.getTracker",
+        "ThrottlerGuard.throwThrottlingException",
+      ]);
+    });
+
+    it("traces what a store's subclass overrides", async () => {
+      class CountingStore extends ThrottlerStorageService {
+        override async increment(
+          ...args: Parameters<ThrottlerStorageService["increment"]>
+        ) {
+          return super.increment(...args);
+        }
+      }
+      const guard = await throttled(undefined, CountingStore);
+
+      await withTrace(() => guard.canActivate(httpContext().context));
+      expect(steps()).toEqual([
+        "ThrottlerGuard.canActivate",
+        "CountingStore.increment",
+        "CountingStore.increment",
+      ]);
+    });
+
+    it("traces everything on an application's own guard and store, whatever their names", async () => {
+      class OwnGuard {
+        constructor(private readonly store: OwnStore) {}
+
+        async canActivate() {
+          return this.handleRequest();
+        }
+
+        async handleRequest() {
+          return (await this.store.increment("k")).totalHits < 10;
+        }
+      }
+      class OwnStore {
+        async increment(key: string) {
+          return { totalHits: this.hits(key) };
+        }
+
+        hits(_key: string) {
+          return 1;
+        }
+      }
+      Object.defineProperty(OwnGuard, "name", { value: "ThrottlerGuard" });
+      Object.defineProperty(OwnStore, "name", {
+        value: "ThrottlerStorageService",
+      });
+      const guard = decorate(
+        new OwnGuard(decorate(new OwnStore()) as OwnStore),
+      ) as OwnGuard;
+
+      await withTrace(() => guard.canActivate());
+      expect(steps()).toEqual([
+        "ThrottlerGuard.canActivate",
+        "ThrottlerGuard.handleRequest",
+        "ThrottlerStorageService.increment",
+        "ThrottlerStorageService.hits",
+      ]);
     });
   });
 

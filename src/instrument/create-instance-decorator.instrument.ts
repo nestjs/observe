@@ -191,6 +191,21 @@ function isCryptoHandle(instance: object): boolean {
  * - `@nestjs/config`'s `ConfigService` keeps what an application calls. Each
  *   `get` made four or five more spans of its private helpers - 2.7M of its
  *   4.6M a day, in 220 projects.
+ * - `@nestjs/throttler`'s `ThrottlerGuard` keeps `canActivate`, and its
+ *   in-memory `ThrottlerStorageService` nothing. Per named throttler, every
+ *   request made 19 more spans: `resolveValue` and `toNumber` three times
+ *   each, `handleRequest`, `getRequestResponse`, `setResponseHeader` three
+ *   times, and `increment` with seven calls of the store's helpers - with
+ *   `shouldSkip`, 40 a request for two throttlers where one is kept now. They
+ *   were in 61 to 77 of 187 active projects, about 1.5M a week, and up to ~50
+ *   of the events a health-check-only app was billed for each probe.
+ *   The store is a `Map` and a timer: `increment` does no I/O, so its time is
+ *   all in the `canActivate` span already. A store that does, such as a Redis
+ *   one, is another class and keeps its own spans and its client's.
+ *
+ *   An application's subclass - a `GqlThrottlerGuard` overriding
+ *   `getRequestResponse`, a guard overriding `getTracker` or `shouldSkip` -
+ *   keeps a span for each method it overrides.
  *
  * Folding cannot reach any of them (`collapseRepeatedSpans`), because each
  * repeats only a few times under its parent.
@@ -222,6 +237,17 @@ const PARTLY_TRACED_CLASSES = new Map<
       traced: new Set(["get", "getOrThrow", "set", "setEnvFilePaths"]),
     },
   ],
+  // `throwThrottlingException` is on every ThrottlerGuard from 4.x to 6.8,
+  // and `fireHitCount` on every ThrottlerStorageService since 6.0, which
+  // covers every release that supports Nest 11 and 12.
+  [
+    "ThrottlerGuard",
+    {
+      marker: "throwThrottlingException",
+      traced: new Set(["canActivate"]),
+    },
+  ],
+  ["ThrottlerStorageService", { marker: "fireHitCount", traced: new Set() }],
 ]);
 
 /**
