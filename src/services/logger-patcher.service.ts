@@ -9,12 +9,35 @@ import {
 import { AsyncLocalStorage } from "async_hooks";
 import { ObserveModuleOptionsWithDefaults } from "../interfaces/observe-options.interface.js";
 import { OBSERVE_OPTIONS } from "../observe.constants.js";
+import { stripAnsi } from "../utils/log-line.parser.js";
 import { liveTraceId } from "../utils/operation-state.util.js";
+
+/** What precedes the trace id the text output ends its first line with. */
+const TRACE_ID_MARKER = "Trace ID:";
+
+/**
+ * The stores, and the trace id keys read from each, that `ConsoleLogger` is
+ * already patched for. Once per pair rather than once per patcher: every
+ * application booted from the same module has a patcher of its own - a test
+ * suite that boots two had every log line wrapped, and suffixed, twice - and
+ * once per process would leave a second `createObserveModule()`, with a store
+ * of its own, without ids.
+ */
+const patchedStores = new WeakMap<AsyncLocalStorage<any>, Set<string>>();
+
+/**
+ * Whether a line already ends with this trace's id, after the marker: the
+ * suffix of another patch - a second copy of this package, say - or the
+ * message's own last words. Read off the first line, without its colours,
+ * the way the stdout forwarder reads it.
+ */
+function endsWithTraceId(line: string, traceId: string): boolean {
+  return stripAnsi(line).trimEnd().endsWith(`${TRACE_ID_MARKER} ${traceId}`);
+}
 
 @Injectable()
 export class LoggerPatcherService implements OnModuleInit {
   private readonly logger = new Logger(LoggerPatcherService.name);
-  private readonly patchedWatermark = Symbol("observe:logger_patched");
 
   constructor(
     private readonly asyncLocalStorage: AsyncLocalStorage<any>,
@@ -35,17 +58,12 @@ export class LoggerPatcherService implements OnModuleInit {
       return;
     }
 
-    const isAlreadyPatched =
-      Reflect.getOwnPropertyDescriptor(
-        ConsoleLogger.prototype,
-        this.patchedWatermark,
-      )?.value === true;
-    if (isAlreadyPatched) {
-      return;
-    }
-
     const options = this.options;
     const asyncLocalStorage = this.asyncLocalStorage;
+    const patchedKeys = patchedStores.get(asyncLocalStorage) ?? new Set();
+    if (patchedKeys.has(options.traceIdKey)) {
+      return;
+    }
     const originalFormatMessage = ConsoleLogger.prototype["formatMessage"];
     const originalGetJsonLogObject =
       ConsoleLogger.prototype["getJsonLogObject"];
@@ -116,21 +134,23 @@ export class LoggerPatcherService implements OnModuleInit {
       // with the error's message - whose own last words, `Trace ID: <id>`
       // from a client's value, then named the trace the line was filed under.
       const [logLevel] = args;
-      const suffix = `   Trace ID: ${this.colorize(requestId, logLevel)}`;
       const newline = output.indexOf("\n");
-      if (newline === -1) {
-        return `${output}${suffix}`;
+      const lineEnd =
+        newline === -1
+          ? output.length
+          : output[newline - 1] === "\r"
+            ? newline - 1
+            : newline;
+      // Once per line: a line that already names this trace there needs no
+      // second suffix saying the same.
+      if (endsWithTraceId(output.slice(0, lineEnd), requestId)) {
+        return output;
       }
-      const lineEnd = output[newline - 1] === "\r" ? newline - 1 : newline;
+      const suffix = `   ${TRACE_ID_MARKER} ${this.colorize(requestId, logLevel)}`;
       return `${output.slice(0, lineEnd)}${suffix}${output.slice(lineEnd)}`;
     };
 
-    // Add watermark to flag that the logger has been patched
-    Reflect.defineProperty(ConsoleLogger.prototype, this.patchedWatermark, {
-      value: true,
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    });
+    patchedKeys.add(options.traceIdKey);
+    patchedStores.set(asyncLocalStorage, patchedKeys);
   }
 }
