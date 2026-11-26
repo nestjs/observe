@@ -482,6 +482,9 @@ export function createObserveModule<Store extends Record<string, unknown>>(
           },
         );
         return (instance: unknown) => {
+          // Proof that `instrument` reached NestFactory: the registry then
+          // stops reading an operation with no spans as its absence.
+          operationTraceRegistry.markInstrumented();
           shareHooksOfHttpAdapter(instance);
           deliverRepliesToTheirCaller(instance, asyncLocalStorage);
           propagateTraceIdThrough(
