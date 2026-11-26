@@ -14,10 +14,9 @@ const options = {
 } as ObserveModuleOptionsWithDefaults;
 
 /**
- * The patch lives on `ConsoleLogger.prototype` and is guarded by a
- * non-configurable watermark, so it is applied once per file and cannot be
- * undone. Every test shares this store for that reason: a second patcher with
- * its own store would be a no-op.
+ * The patch lives on `ConsoleLogger.prototype`, once per store and trace id
+ * key, and cannot be undone. Every test shares this store for that reason;
+ * the last describe adds patchers on top of it.
  */
 const als = new AsyncLocalStorage<Map<string, any>>();
 
@@ -112,6 +111,16 @@ describe("LoggerPatcherService", () => {
       );
 
       expect(output).toMatch(/ first\s+Trace ID: abc123\r\nsecond\n$/);
+    });
+
+    it("adds no second id to a message that already ends with it", () => {
+      const output = captureStdout(() =>
+        inTrace("abc123", () =>
+          new ConsoleLogger("Payments").log("retrying   Trace ID: abc123"),
+        ),
+      );
+
+      expect(output.match(/Trace ID:/g)).toHaveLength(1);
     });
   });
 
@@ -248,6 +257,45 @@ describe("LoggerPatcherService", () => {
         );
         expect(JSON.stringify(entries)).not.toContain("eyJzdWIi");
       }
+    });
+  });
+
+  /**
+   * Last: what it patches stays patched for the rest of the file. Every
+   * application booted from one module has a patcher of its own - a test
+   * suite that boots two had its lines wrapped, and suffixed, twice.
+   */
+  describe("with more than one patcher", () => {
+    const otherAls = new AsyncLocalStorage<Map<string, any>>();
+
+    beforeAll(() => {
+      new LoggerPatcherService(als, options).onModuleInit();
+      new LoggerPatcherService(otherAls, options).onModuleInit();
+    });
+
+    it("puts the trace id on a line once, colours on or off", () => {
+      for (const colors of [false, true]) {
+        const output = captureStdout(() =>
+          inTrace("abc123", () =>
+            new ConsoleLogger("HttpClient", { colors }).warn(
+              "POST /v1/payments failed",
+            ),
+          ),
+        );
+
+        expect(output.match(/Trace ID:/g)).toHaveLength(1);
+      }
+    });
+
+    it("still puts the id of a store of its own on the line", () => {
+      const output = captureStdout(() =>
+        otherAls.run(new Map([[TRACE_ID_KEY, "other-1"]]), () =>
+          new ConsoleLogger("Payments", { colors: false }).log("hello"),
+        ),
+      );
+
+      expect(output).toMatch(/hello\s+Trace ID: other-1\n$/);
+      expect(output.match(/Trace ID:/g)).toHaveLength(1);
     });
   });
 });

@@ -122,9 +122,81 @@ describe("OperationTraceRegistry", () => {
       startRequest("t2");
       registry.endTrace("t2");
 
-      // No spans means nothing was instrumented, so there is nothing worth
-      // shipping.
+      // No spans, and the instance decorator never ran: nothing was
+      // instrumented, so there is nothing worth shipping.
       await expect(registry.pluckSnapshot("t2")).resolves.toBeUndefined();
+    });
+
+    describe("a routed operation that recorded no spans", () => {
+      const missingInstrument = /"instrument" option/;
+
+      it("reports the missing instrument while the decorator never ran", async () => {
+        const error = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "error")
+          .mockImplementation(() => undefined);
+
+        startRequest("t2n");
+        registry.endTrace("t2n", { statusCode: 200 });
+
+        expect(error).toHaveBeenCalledTimes(1);
+        expect(String(error.mock.calls[0][0])).toMatch(missingInstrument);
+        await expect(registry.pluckSnapshot("t2n")).resolves.toBeUndefined();
+      });
+
+      it("keeps it as a failed request, unreported, once the decorator ran", async () => {
+        // A durable request-scoped provider whose constructor throws a 404:
+        // Nest fails the request while it resolves the handler's instance,
+        // before any guard or handler could record a span.
+        const error = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "error")
+          .mockImplementation(() => undefined);
+        registry.markInstrumented();
+
+        startRequest("t2i");
+        registry.endTrace("t2i", { statusCode: 404 });
+
+        expect(error).not.toHaveBeenCalled();
+        const snapshot = (await registry.pluckSnapshot(
+          "t2i",
+        )) as RequestSnapshot;
+        expect(snapshot).toMatchObject({
+          operationId: "GET /orders",
+          traces: [],
+          attributes: { statusCode: 404 },
+        });
+        expect(snapshot).not.toHaveProperty("keptWithoutSpans");
+      });
+
+      it("drops a successful one, unreported, once the decorator ran", async () => {
+        // A handler `skipInstrumentation` left alone: nothing failed, and
+        // there is nothing to show.
+        const error = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "error")
+          .mockImplementation(() => undefined);
+        registry.markInstrumented();
+
+        startRequest("t2s");
+        registry.endTrace("t2s", { statusCode: 200 });
+
+        expect(error).not.toHaveBeenCalled();
+        await expect(registry.pluckSnapshot("t2s")).resolves.toBeUndefined();
+      });
+
+      it("drops it, unreported, on a transport with no status code", async () => {
+        // A gateway event or a message pattern: kept, it would ship looking
+        // successful.
+        const error = vi
+          .spyOn((registry as unknown as { logger: Logger }).logger, "error")
+          .mockImplementation(() => undefined);
+        registry.markInstrumented();
+
+        startRequest("t2w");
+        registry.endTrace("t2w");
+
+        expect(error).not.toHaveBeenCalled();
+        await expect(registry.pluckSnapshot("t2w")).resolves.toBeUndefined();
+        expect(registry.hasTrace("t2w")).toBe(false);
+      });
     });
 
     it("holds nothing of a span-less trace it discards, whatever its logger records", async () => {

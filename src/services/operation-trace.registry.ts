@@ -526,6 +526,13 @@ export class OperationTraceRegistry {
    * would bury everything else in the log. Full text once, one line after.
    */
   private hasReportedMissingInstrumentation = false;
+  /**
+   * Set by `markInstrumented` the first time the instance decorator of the
+   * `instrument` that shares this registry runs. Until then an operation
+   * that ends with a name and no spans is a sign that `instrument` never
+   * reached NestFactory; after it, it is not - see `endTrace`.
+   */
+  private instrumented = false;
   /** See `reportSpanDepthLimit`. */
   private hasReportedSpanDepthLimit = false;
   /** See `reportCapturedErrorLimit`. */
@@ -778,11 +785,11 @@ export class OperationTraceRegistry {
     }
 
     if (snapshot.traces.length === 0) {
-      if ("operationId" in snapshot) {
-        // An operationId means a handler ran, and zero traces means nothing
-        // recorded a span for it. Both at once has one cause: the instance
-        // decorator never wrapped the providers, because `instrument` never
-        // reached NestFactory.
+      if ("operationId" in snapshot && !this.instrumented) {
+        // An operationId means the operation was routed to a handler, and
+        // zero traces means nothing recorded a span for it. With the instance
+        // decorator never run in this process, both at once has one cause:
+        // `instrument` never reached NestFactory.
         //
         // Dropped before the line is written, not after: a logger taken from
         // the container is wrapped like any provider and writes inside this
@@ -792,6 +799,25 @@ export class OperationTraceRegistry {
         this.abandonTrace(traceId);
         this.reportMissingInstrumentation(snapshot);
         return;
+      }
+
+      // Instrumented, a routed operation can still end before anything that
+      // records a span ran: a request-scoped provider whose constructor
+      // throws fails the request while Nest resolves the handler's instance,
+      // ahead of every guard, interceptor and the handler itself. A transport
+      // that reports a failed status code says how it ended, so it is kept -
+      // a 404 or a 500 with no spans under it, rather than a request missing
+      // from the traces. Any other is dropped as before: one that reports
+      // none (WS, RPC, a job) would ship looking successful, and a success
+      // with no spans - a handler `skipInstrumentation` left alone - has
+      // nothing to show.
+      if (
+        "operationId" in snapshot &&
+        "statusCode" in opts &&
+        typeof opts.statusCode === "number" &&
+        opts.statusCode >= 400
+      ) {
+        snapshot.keptWithoutSpans = true;
       }
 
       // Ignore snapshots that have no traces as that means
@@ -1392,6 +1418,15 @@ export class OperationTraceRegistry {
     this.logger.warn(
       `Trace "${snapshot.traceId}" opened ${MAX_SPANS_PER_TRACE} spans; the calls it makes after that run untraced, and the snapshot counts them under the "${UNRECORDED_SPANS_TAG}" tag. Later traces past this limit are not reported.`,
     );
+  }
+
+  /**
+   * Records that the instance decorator ran, so that a routed operation with
+   * no spans is no longer taken to mean `instrument` is missing - see
+   * `endTrace`.
+   */
+  markInstrumented(): void {
+    this.instrumented = true;
   }
 
   /**
